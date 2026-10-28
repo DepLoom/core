@@ -220,6 +220,52 @@ class DraftCandidateScopeTests(unittest.TestCase):
     def _prompt(self, ws: Path, run_id: str) -> str:
         return (ws / ".dependency-roadmap" / "artifacts" / "runs" / run_id / "draft" / "prompt.md").read_text(encoding="utf-8")
 
+    def test_required_update_reaches_published_draft_through_real_cli(self):
+        """Regression for INVALID_CURRENT_ENDPOINT on a real Draft invocation.
+
+        required is a final-assignment obligation, not a rule that the old
+        installed version must somehow already satisfy before migration.
+        Registry and OSV are hermetic localhost fixtures; no install occurs.
+        """
+        deps = [("sample-router", "1.0.0", "1.4.0")]
+        versions = {"sample-router": ["1.0.0", "1.4.0"]}
+        times = {"sample-router": {
+            "1.0.0": "2023-05-01T00:00:00Z",
+            "1.4.0": "2026-08-01T00:00:00Z",
+        }}
+        intent = {
+            "targetMode": "pinned",
+            "objective": "latest-compatible-in-approved-lines",
+            "policies": {"sample-router": "required"},
+            "mutablePackages": ["sample-router"],
+            "approvedVersionLines": {"sample-router": [1]},
+        }
+        with _MockRegistry(deps, versions, times=times) as registry:
+            workspace = self._fixture("required-cli", deps, registry=registry.url)
+            with mock.patch.dict(os.environ, {
+                "DEPLOOM_BASELINE_INTENT_JSON": json.dumps(intent),
+            }):
+                result = self._run(
+                    workspace, "required-cli",
+                    ["--run-id", "run-required-cli", "--workspace-id", "ws-required",
+                     "--project-id", "required-cli", "--mode", "draft",
+                     "--draft-deadline-seconds", "30"],
+                    osv_base=registry.url,
+                )
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        draft_dir = workspace / ".dependency-roadmap" / "artifacts" / "runs" / "run-required-cli" / "draft"
+        manifest = _read_json(draft_dir / "result.json")
+        plan = self._plan(workspace, "run-required-cli")
+        self.assertEqual("DRAFT_READY", manifest["status"], manifest)
+        self.assertEqual("PLANNING_ONLY", manifest["authority"])
+        self.assertEqual("NOT_VERIFIED", manifest["verificationStatus"])
+        self.assertEqual("pinned", plan["decisionContract"]["targetMode"])
+        row = next(r for r in plan["proposals"][0]["rows"] if r["package"] == "sample-router")
+        self.assertEqual("proposed", row["status"], row)
+        self.assertEqual("1.4.0", row["target"], row)
+        self.assertNotIn("INVALID_CURRENT_ENDPOINT", result.stderr + result.stdout)
+        self.assertTrue((draft_dir / "prompt.md").is_file())
+
     def test_draft_default_finds_theoretical_lag_target_beyond_first_three(self):
         """Default settings must NOT hide a lag target that exists in the
         locally read packument beyond the first three versions (R12)."""
