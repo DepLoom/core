@@ -1,12 +1,21 @@
 name: headless-core-ci
+# Run one matrix for PR commits; on push run only after merge to main.
+# Avoid two identical matrices per branch update.
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: core-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   focused:
     name: "core (${{ matrix.os }}, py${{ matrix.python }})"
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 12
     strategy:
       fail-fast: false
       matrix:
