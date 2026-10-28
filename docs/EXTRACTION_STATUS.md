@@ -1,31 +1,39 @@
-# Extraction boundaries
+# Extraction status
 
-**Current phase: staging branch.** The host GitHub connector can create Git
-objects and branches, but cannot provision a new repository. This branch is a
-self-contained, minimal-tree bootstrap intended for import into `DepLoom/core`.
+Core was imported into the independent `DepLoom/core` repository from
+`AlexanderLevenskikh/deploom:extract/headless-core-bootstrap-20261028`.
+The initial import commit has the **identical Git tree** to source staging
+commit `f45e50b92f22afb51335a36dad4e752251386abd`.
+The original implementation root was kept unchanged.
 
-Source: `b7f13c401e0e77906307eb2f7bd4dc61c57e2068`; imported runtime: 133 files from the pinned MCP
-Core release inventory. Added: lightweight Python package metadata, focused
-solver/intent/input-identity tests and a small CI matrix.
+## What was extracted
 
-The change to `peer_solver_transition.py` distinguishes a final-only
-`USER_BASELINE_REQUIRED_UPDATE` intent constraint from intermediate
-transition invariants. The real final Z3 model **retains** the requirement;
-peer and keep-current constraints continue to be checked. Regression tests
-cover an allowed required upgrade, mandatory peer cohort, invalid final peer
-tuple, and contradictory required/keep-current intent.
+- 133 Python/runtime resources from the already pinned MCP Core inventory
+  (including the canonical `VERSION`, config schemas and locale files).
+- A small standalone Python distribution.
+- Focused synthetic Z3, decision-contract, semantic-input and transition tests.
+- CI limited to Linux/Python 3.12+3.13 and Windows/Python 3.12.
 
-Follow-up before experiment:
-1. Import the prepared headless tree into a new repository, retaining its
-   commit hash and source bytes.
-2. Repoint the MCP pinned Core submodule and verify the exact 133-file inventory,
-   bundle wheel, stdio startup and tool response.
-3. Confirm real end-to-end planning with `required` returns a DRAFT_READY
-   blueprint (or an honest typed blocker) rather than INVALID_CURRENT_ENDPOINT.
-4. Freeze versions, registry evidence, prompts, and acceptance gates for a
-   harder **agent + MCP vs bare agent** experiment, with **no Skill** assigned
-   to either arm. Require equal task and security checks.
+No Electron app, Desktop test suite, npm installation pipeline or migration
+benchmark is part of this repository. The runtime set has not yet been pruned
+to the minimal import closure.
 
-The full old repository remains available as historical Desktop/execution
-source. This extraction is not itself proof of migration correctness, global
-freshness optimality or security of an installed dependency tree.
+## Changes compared with previous MCP-pinned Core
+
+- `peer_solver_transition.py`: `USER_BASELINE_REQUIRED_UPDATE` constraints
+  apply to the final solver decision, not to the all-current transition
+  endpoint. Real peer constraints and final mandatory update remain enforced.
+- `draft_input_identity.py`: Windows settings paths normalize to canonical
+  case-insensitive workspace identity; focused tests also handle Windows
+  pathname representation correctly.
+
+These changes were verified by the standalone headless CI on the staging branch
+and by the initial independent-repository CI.
+
+## Pending integration
+
+The MCP release inventory currently pins the historical Core SHA; it must be
+updated to `DepLoom/core` and a new exact revision **before** treating any
+MCP experiment as using this extracted Core. Do not silently mix versions.
+
+See [integration instructions](INTEGRATION.md).
