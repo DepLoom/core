@@ -1,0 +1,2484 @@
+#!/usr/bin/env python3
+"""Block X SourceSnapshot: bind proof identity to the bytes Verifier consumes.
+
+Git is provenance, not source authority. The authoritative subject is a
+sealed content tree captured from the live filesystem under one explicit
+policy. `gitignore` is deliberately ignored by this policy: ignored files
+such as .env or generated source are included unless an explicit DepLoom
+exclusion says otherwise.
+"""
+from __future__ import annotations
+
+import atexit
+import concurrent.futures
+import contextlib
+import contextvars
+import functools
+import dataclasses
+import hashlib
+import json
+import os
+import shutil
+import stat
+import subprocess
+import tempfile
+import threading
+import time
+import uuid
+from pathlib import Path
+from typing import Callable, Iterable, Optional
+
+from verification_workspace_backend import materialize_private_tree
+from prepared_workspace_fastpath import (
+    _DirectoryWatcher,
+    apply_tree_write_protection,
+)
+from io_governor import io_slot
+from cross_process_io import coordinated_io
+from reparse_materialization import ReparseMaterializationError
+from verification_observability import (
+    configured_observability_path,
+    emit_observability_event,
+    new_observability_id,
+    process_resource_snapshot,
+    suppress_observability,
+)
+from project_topology import (
+    ProjectTopologyError,
+    semantic_manifest_paths,
+)
+from storage_capacity import StorageCapacityError
+from substrate_identity import tool_build_id
+# BLOCK_Z_PROJECT_TOPOLOGY_V1
+
+# BLOCK_Y_FULL_OBSERVABILITY_V1
+
+# BLOCK_X_SOURCE_TRUTH_V1
+SOURCE_SNAPSHOT_SCHEMA = "source-snapshot-v2-tool-build-content"
+SOURCE_INPUT_POLICY_SCHEMA = "source-input-policy-v3-project-submodules"
+SOURCE_CAPTURE_RETRIES = 3
+
+# Deliberately small and explicit. In particular: dist/, build/, .next/,
+# generated source and every gitignored file are INCLUDED in X.1 because
+# excluding an input is unsound unless DepLoom has an explicit semantic
+# policy for it. node_modules is separate resolved dependency state.
+DEFAULT_EXCLUDED_DIR_NAMES = (
+    "node_modules",
+    ".dependency-roadmap",
+    ".idea",
+    ".vs",
+    ".vscode",
+    ".fleet",
+    ".claude",
+    ".codex",
+)
+DEFAULT_EXCLUDED_FILE_NAMES = (
+    ".DS_Store",
+    "Thumbs.db",
+    "desktop.ini",
+)
+
+ProgressCallback = Callable[[str], None]
+
+
+class SourceCaptureError(RuntimeError):
+    """Source capture uncertainty is infrastructure, never incompatibility."""
+
+
+@dataclasses.dataclass(frozen=True)
+class SourceInputPolicy:
+    excluded_dir_names: tuple[str, ...] = DEFAULT_EXCLUDED_DIR_NAMES
+    excluded_file_names: tuple[str, ...] = DEFAULT_EXCLUDED_FILE_NAMES
+    scope_roots: tuple[str, ...] = ()
+    excluded_relative_paths: tuple[str, ...] = ()
+    frontend_build_output_paths: tuple[str, ...] = ()
+    frontend_profile: bool = False
+
+    @functools.cached_property
+    def excluded_path_set(self):
+        return frozenset((*self.excluded_relative_paths, *self.frontend_build_output_paths))
+
+    @property
+    def key(self) -> str:
+        if self.scope_roots or self.excluded_relative_paths or self.frontend_build_output_paths or self.frontend_profile:
+            from scoped_source_policy import policy_payload
+            return _canonical_hash({"schema": SOURCE_INPUT_POLICY_SCHEMA, "scope": policy_payload(self),
+                                    "legacyPolicy": SourceInputPolicy(self.excluded_dir_names, self.excluded_file_names).key}, length=64)
+        return _canonical_hash({
+            "schema": SOURCE_INPUT_POLICY_SCHEMA,
+            "excludedDirNames": list(self.excluded_dir_names),
+            "excludedFileNames": list(self.excluded_file_names),
+            "gitAdministrativeExclusions": [".git/**/*.lock"],
+            "submoduleReadiness": "project-workspace-local-dependencies; conflicts-global",
+        }, length=64)
+
+
+@dataclasses.dataclass(frozen=True)
+class SourceTreeManifest:
+    key: str
+    entries: tuple[dict[str, object], ...]
+    file_count: int
+    directory_count: int
+    byte_count: int
+
+
+@dataclasses.dataclass(frozen=True)
+class SourceSnapshot:
+    original_project_path: Path
+    capture_root: Path
+    project_relative: Path
+    container: Path
+    root: Path
+    project_path: Path
+    key: str
+    manifest_key: str
+    policy_key: str
+    file_count: int
+    directory_count: int
+    byte_count: int
+    materialization_method: str
+    git_head: str
+    git_root: str
+    created_at: float
+    input_policy: Optional[SourceInputPolicy] = None
+    durable_recovery: bool = False
+
+
+_ACTIVE: dict[str, SourceSnapshot] = {}
+_ALL_CONTAINERS: set[Path] = set()
+# Performance-only idle subjects; context leases remove entries while in use.
+_COMPLETED_REQUEST_SNAPSHOTS: dict[str, SourceSnapshot] = {}
+_COMPLETED_REQUEST_LIMIT = 2
+# (snapshot, watcher, sealed directory-object identity at arm time)
+_ACTIVE_WATCHERS: dict[
+    str, tuple[SourceSnapshot, _DirectoryWatcher, Optional[object]]
+] = {}
+_LIVE_SOURCE_WATCHERS: dict[
+    str,
+    tuple[
+        SourceSnapshot,
+        _DirectoryWatcher,
+        Optional[tuple[int, int]],
+        Optional[tuple[int, int]],
+    ],
+] = {}
+_LOCK = threading.RLock()
+_REQUEST_SNAPSHOTS: contextvars.ContextVar[dict[str, SourceSnapshot]] = contextvars.ContextVar(
+    "verification_source_snapshots", default={}
+)
+
+
+def _snapshot_watcher_key(snapshot: SourceSnapshot) -> str:
+    key = _active_key(snapshot.original_project_path)
+    with _LOCK:
+        if _ACTIVE.get(key) is snapshot:
+            return key
+    if _REQUEST_SNAPSHOTS.get().get(key) is snapshot:
+        return f"{key}:{snapshot.container}"
+    return key
+
+
+def _tree_object_identity(path: Path) -> Optional[tuple[int, int]]:
+    """Filesystem object identity of a directory, not just its pathname.
+
+    A watched directory can be renamed away and a different directory put back
+    at the same textual path. The watcher holds a handle to the ORIGINAL object
+    and reports nothing, while `is_dir()` on the path still succeeds. Only the
+    (device, file-id) pair distinguishes the two objects.
+    """
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    if not stat.st_ino:
+        return None
+    return (stat.st_dev, stat.st_ino)
+
+
+def _snapshot_object_identity(
+    snapshot: SourceSnapshot,
+) -> Optional[tuple[Optional[tuple[int, int]], Optional[tuple[int, int]]]]:
+    root = _tree_object_identity(snapshot.root)
+    project = _tree_object_identity(snapshot.project_path)
+    if root is None or project is None:
+        return None
+    return (root, project)
+
+
+_DRAIN_MARKER_DIR = ".dependency-roadmap"
+
+
+def _content_relevant_events(
+    events: "list[tuple[int, str]]",
+) -> "list[tuple[int, str]]":
+    """Drop notifications for paths the sealed manifest does not measure.
+
+    An excluded path cannot change the content key by definition, so a write
+    there is not evidence of content mutation.
+    """
+    relevant: list[tuple[int, str]] = []
+    for action, relative in events:
+        parts = [part for part in relative.replace("\\", "/").split("/") if part]
+        if any(part in DEFAULT_EXCLUDED_DIR_NAMES for part in parts):
+            continue
+        if parts and parts[-1] in DEFAULT_EXCLUDED_FILE_NAMES:
+            continue
+        if parts and _is_ephemeral_git_admin_path(Path(*parts)):
+            continue
+        relevant.append((action, relative))
+    return relevant
+
+
+def _drain_watcher(
+    watcher: _DirectoryWatcher,
+    root: Path,
+    *,
+    timeout_seconds: float = 2.0,
+    barrier_paths: Optional[set[str]] = None,
+) -> bool:
+    """Prove every change that completed before this boundary was delivered.
+
+    ReadDirectoryChangesW reports changes for one tree in order. Writing a
+    sentinel inside the watched subtree and then waiting for that sentinel's
+    OWN notification therefore proves that every earlier change has already
+    been observed. Without this barrier a mutation that completed moments
+    before consumption could still be in flight, and the memo would report a
+    clean tree that is in fact already stale.
+
+    The sentinel lives under an excluded directory, so it can never alter the
+    sealed content key. Returns False when delivery could not be confirmed --
+    the caller must then fall back to authoritative validation rather than
+    treating silence as proof.
+    """
+    marker_directory = root / _DRAIN_MARKER_DIR
+    token = f".drain-{uuid.uuid4().hex}"
+    marker = marker_directory / token
+    created_directory = False
+    try:
+        try:
+            marker_directory.mkdir(parents=True, exist_ok=False)
+            created_directory = True
+        except FileExistsError:
+            pass
+        marker.write_text("drain", encoding="utf-8")
+        if barrier_paths is not None:
+            barrier_paths.add(marker.relative_to(root).as_posix())
+            if created_directory:
+                barrier_paths.add(_DRAIN_MARKER_DIR)
+    except OSError:
+        if created_directory:
+            with contextlib.suppress(OSError):
+                marker_directory.rmdir()
+        return False
+    deadline = time.monotonic() + max(0.05, float(timeout_seconds))
+    delivered = False
+    try:
+        while time.monotonic() < deadline:
+            if any(token in relative for _action, relative in list(watcher.events)):
+                delivered = True
+                break
+            if watcher.errors:
+                break
+            time.sleep(0.005)
+    finally:
+        try:
+            marker.unlink()
+        except OSError:
+            pass
+        if created_directory:
+            # Only remove our own empty directory; preserve pre-existing state
+            # and concurrent files. Sealed C0 must retain exact membership.
+            with contextlib.suppress(OSError):
+                marker_directory.rmdir()
+    return delivered
+
+
+def _watcher_is_clean(watcher: _DirectoryWatcher) -> bool:
+    thread = watcher._thread
+    return bool(
+        thread is not None
+        and thread.is_alive()
+        and not watcher.events
+        and not watcher.errors
+    )
+
+
+def _retire_snapshot_watcher(snapshot: SourceSnapshot) -> None:
+    # Idle request subjects have no current binding. Retire by object ownership,
+    # not a context-dependent key that could leave their qualified watcher live.
+    with _LOCK:
+        keys = [key for key, entry in _ACTIVE_WATCHERS.items() if entry[0] is snapshot]
+        watchers = [_ACTIVE_WATCHERS.pop(key)[1] for key in keys]
+    for watcher in watchers:
+        watcher.stop()
+
+
+def _apply_tree_write_protection(root: Path, *, readonly: bool) -> int:
+    """Seal or release a private source tree.
+
+    Delegates to the shared reparse-safe implementation: a naive walk would
+    follow junctions out of this tree and unprotect whatever they point at.
+    """
+    return apply_tree_write_protection(root, readonly=readonly)
+
+
+def _force_rmtree(path: Path) -> None:
+    """Remove a private tree that may be write-protected.
+
+    A sealed tree is read-only, and `shutil.rmtree(ignore_errors=True)` would
+    silently fail to remove it on Windows -- turning every sealed container
+    into a permanent orphan.
+    """
+    try:
+        _apply_tree_write_protection(path, readonly=False)
+    except OSError:
+        pass
+    shutil.rmtree(path, ignore_errors=True)
+
+
+@functools.lru_cache(maxsize=8)
+def _sealed_manifest_entries(container: str, manifest_key: str, policy_key: str):
+    from types import MappingProxyType
+    record = json.loads((Path(container) / "manifest.json").read_text(encoding="utf-8-sig"))
+    entries = record.get("entries")
+    if not isinstance(entries, list) or any(not isinstance(item, dict) or not isinstance(item.get("path"), str) for item in entries):
+        raise SourceCaptureError("SOURCE_SNAPSHOT_MANIFEST_RECORD_INVALID")
+    observed = _canonical_hash({"schema": SOURCE_SNAPSHOT_SCHEMA,
+        "toolBuildId": record.get("toolBuildId"), "policyKey": record.get("policyKey"), "entries": entries}, length=64)
+    if observed != manifest_key or record.get("policyKey") != policy_key:
+        raise SourceCaptureError("SOURCE_SNAPSHOT_MANIFEST_RECORD_MISMATCH")
+    return tuple(MappingProxyType(item) for item in entries)
+
+
+def sealed_source_manifest_entries(snapshot: SourceSnapshot):
+    """Derive identities from the existing sealed manifest, not mutable re-reads.
+
+    The bounded memo retains verified immutable metadata, not filesystem state.
+    Physical continuity still uses validate_source_snapshot before consumption.
+    """
+    return _sealed_manifest_entries(str(snapshot.container), snapshot.manifest_key, snapshot.policy_key)
+
+
+def _canonical_hash(value: object, *, length: int = 64) -> str:
+    payload = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:length]
+
+
+def _active_key(project_dir: Path) -> str:
+    return os.path.normcase(str(project_dir.expanduser().resolve()))
+
+
+def _within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve(strict=False).relative_to(root.resolve(strict=False))
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _run_git(project_dir: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            ["git", "-C", str(project_dir), *args],
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+            # Read-only Git probes must not refresh the live index while Source Truth is captured.
+            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return subprocess.CompletedProcess(["git", *args], 127, stdout="", stderr=str(exc))
+
+
+def _subject_layout(project_dir: Path, *, require_git: bool = False) -> tuple[Path, Path, str]:
+    project_dir = project_dir.expanduser().resolve()
+    # One combined read-only probe instead of two subprocesses: the first stdout
+    # line is the toplevel, the second is HEAD.  Semantics are preserved:
+    # toplevel-empty == "not a Git repository"; toplevel-present-with-failed-HEAD
+    # == SOURCE_GIT_HEAD_UNAVAILABLE. Always probe live HEAD: another process
+    # can commit or replace this repository while a reusable worker is alive.
+    result = _run_git(project_dir, ["rev-parse", "--show-toplevel", "HEAD"])
+    output_lines = result.stdout.strip().splitlines() if result.stdout.strip() else []
+    root = Path(output_lines[0]).resolve() if output_lines else None
+    if result.returncode == 0 and root is not None and len(output_lines) >= 2:
+        try:
+            relative = project_dir.relative_to(root)
+        except ValueError as exc:
+            raise SourceCaptureError(
+                f"SOURCE_PROJECT_OUTSIDE_GIT_ROOT: project={project_dir}, root={root}"
+            ) from exc
+        head = output_lines[1].strip()
+        value = (root, relative, head)
+        return value
+    if root is not None:
+        detail = (result.stderr or result.stdout or "empty HEAD").strip()
+        raise SourceCaptureError(f"SOURCE_GIT_HEAD_UNAVAILABLE: {detail}")
+    if require_git:
+        detail = (result.stderr or result.stdout or "not a Git repository").strip()
+        raise SourceCaptureError(f"SOURCE_GIT_REQUIRED: {detail}")
+    value = (project_dir, Path("."), "")
+    return value
+
+
+def _iter_source_files_without_links(
+    root: Path,
+    *,
+    policy: SourceInputPolicy = SourceInputPolicy(),
+) -> Iterable[Path]:
+    """Walk policy coverage without following symlinks or reparse directories."""
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        try:
+            with os.scandir(directory) as iterator:
+                entries = list(iterator)
+        except OSError as exc:
+            raise SourceCaptureError(
+                f"SOURCE_DIRECTORY_UNREADABLE: {directory}: {exc}"
+            ) from exc
+        for item in entries:
+            path = Path(item.path)
+            try:
+                relative = path.relative_to(root)
+            except ValueError as exc:
+                raise SourceCaptureError(
+                    f"SOURCE_ENTRY_OUTSIDE_ROOT: {path}"
+                ) from exc
+            if _excluded(relative, policy):
+                continue
+            try:
+                if item.is_symlink():
+                    continue
+                if item.is_dir(follow_symlinks=False):
+                    is_junction = getattr(path, "is_junction", None)
+                    if callable(is_junction) and is_junction():
+                        continue
+                    pending.append(path)
+                elif item.is_file(follow_symlinks=False):
+                    yield path
+            except OSError as exc:
+                raise SourceCaptureError(
+                    f"SOURCE_ENTRY_UNREADABLE: {path}: {exc}"
+                ) from exc
+
+
+def _read_git_indirection(path: Path, *, prefix: str = "") -> str:
+    try:
+        text = path.read_text(encoding="utf-8", errors="strict").strip()
+    except (OSError, UnicodeError) as exc:
+        raise SourceCaptureError(
+            f"SOURCE_GIT_INDIRECTION_UNREADABLE: {path}: {exc}"
+        ) from exc
+    if prefix and not text.lower().startswith(prefix.lower()):
+        raise SourceCaptureError(f"SOURCE_GIT_MARKER_INVALID: {path}")
+    return text.split(":", 1)[1].strip() if prefix else text
+
+
+def _require_sealed_relative_git_target(
+    *,
+    capture_root: Path,
+    marker: Path,
+    raw_target: str,
+    relative_base: Path,
+    kind: str,
+) -> None:
+    target = Path(raw_target).expanduser()
+    if target.is_absolute():
+        raise SourceCaptureError(
+            f"SOURCE_GIT_ABSOLUTE_INDIRECTION_UNSUPPORTED: {kind}: "
+            f"{marker} -> {raw_target}"
+        )
+    resolved = (relative_base / target).resolve(strict=False)
+    if not _within(resolved, capture_root):
+        raise SourceCaptureError(
+            f"SOURCE_GIT_EXTERNAL_INDIRECTION_UNSUPPORTED: {kind}: "
+            f"{marker} -> {raw_target}"
+        )
+
+
+def _validate_git_layout(
+    capture_root: Path,
+    *,
+    policy: SourceInputPolicy = SourceInputPolicy(),
+) -> None:
+    """Reject every Git metadata edge that would escape a sealed copy.
+
+    Root and nested repositories are covered. Absolute indirections are
+    rejected even when they currently resolve inside the live checkout because
+    the absolute text would still point back to that mutable checkout after
+    materialization.
+    """
+    capture_root = capture_root.resolve()
+    for path in _iter_source_files_without_links(capture_root, policy=policy):
+        if path.name == ".git":
+            target = _read_git_indirection(path, prefix="gitdir:")
+            _require_sealed_relative_git_target(
+                capture_root=capture_root,
+                marker=path,
+                raw_target=target,
+                relative_base=path.parent,
+                kind="gitdir",
+            )
+            continue
+
+        if (
+            path.name == "commondir"
+            and ".git" in path.relative_to(capture_root).parts
+        ):
+            target = _read_git_indirection(path)
+            _require_sealed_relative_git_target(
+                capture_root=capture_root,
+                marker=path,
+                raw_target=target,
+                relative_base=path.parent,
+                kind="commondir",
+            )
+            continue
+
+        if (
+            path.name == "alternates"
+            and path.parent.name == "info"
+            and path.parent.parent.name == "objects"
+        ):
+            try:
+                lines = path.read_text(
+                    encoding="utf-8", errors="strict"
+                ).splitlines()
+            except (OSError, UnicodeError) as exc:
+                raise SourceCaptureError(
+                    f"SOURCE_GIT_ALTERNATES_UNREADABLE: {path}: {exc}"
+                ) from exc
+            object_database = path.parent.parent
+            for line in lines:
+                target = line.strip()
+                if not target or target.startswith("#"):
+                    continue
+                _require_sealed_relative_git_target(
+                    capture_root=capture_root,
+                    marker=path,
+                    raw_target=target,
+                    relative_base=object_database,
+                    kind="objects/info/alternates",
+                )
+
+
+def _submodule_line_path(line: str) -> str:
+    rest = line[1:].strip()
+    parts = rest.split(None, 1)
+    if len(parts) == 2 and len(parts[0]) == 40 and all(c in "0123456789abcdefABCDEF" for c in parts[0]):
+        return parts[1].strip()
+    return parts[0]
+
+
+def _repository_incomplete_submodules(capture_root: Path) -> list[tuple[str, str]]:
+    """Incomplete (uninitialized `-` or conflicted `U`) submodule entries.
+
+    One shared helper for BOTH the cheap local readiness preflight at begin and
+    the authoritative capture-time check, so the two can never diverge. Returns
+    (state, path) pairs with the gitlink SHA stripped; `+` (checked-out commit
+    differs from the superproject gitlink) is allowed: Source Truth is the
+    actual checked-out bytes, which the canonical manifest hashes below.
+    """
+    if not (capture_root / ".gitmodules").is_file():
+        return []
+    result = _run_git(capture_root, ["submodule", "status", "--recursive"])
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or f"exit {result.returncode}").strip()
+        raise SourceCaptureError(f"SOURCE_SUBMODULE_STATUS_FAILED: {detail}")
+    issues: list[tuple[str, str]] = []
+    for line in result.stdout.splitlines():
+        if not line:
+            continue
+        state = line[0]
+        if state in ("-", "U"):
+            issues.append((state, _submodule_line_path(line)))
+    return issues
+
+
+def _submodule_input_roots(project_dir: Path, capture_root: Path) -> set[Path]:
+    """Readiness scope, not a source exclusion: the entire tree is still sealed.
+
+    Include owning workspace packages and recursively declared local inputs.
+    If topology cannot be bound, conservatively retain the repository-wide gate;
+    the authoritative verifier will separately explain unsupported topology.
+    """
+    project = project_dir.resolve()
+    try:
+        manifests = semantic_manifest_paths(project)
+    except ProjectTopologyError:
+        return {capture_root}
+    roots = {project, *(manifest.parent.resolve() for manifest in manifests)}
+    pending = list(roots)
+    visited: set[Path] = set()
+    while pending:
+        root = pending.pop()
+        if root in visited:
+            continue
+        visited.add(root)
+        _local_dependency_preflight(root, capture_root)
+        manifest_path = root / "package.json"
+        if not manifest_path.is_file():
+            continue
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError, TypeError) as exc:
+            raise SourceCaptureError(f"SOURCE_PACKAGE_JSON_UNREADABLE: {manifest_path}: {exc}") from exc
+        for section in ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies"):
+            values = manifest.get(section)
+            if not isinstance(values, dict):
+                continue
+            for spec in values.values():
+                text = str(spec or "").strip()
+                if not text.lower().startswith(("file:", "link:", "portal:")):
+                    continue
+                payload = text.split(":", 1)[1].strip()
+                if not payload:
+                    continue
+                target = Path(payload).expanduser()
+                if not target.is_absolute():
+                    target = root / target
+                target = target.resolve(strict=False)
+                roots.add(target)
+                pending.append(target)
+    return roots
+
+
+def incomplete_submodules(project_dir: Path) -> list[tuple[str, str]]:
+    """Shared readiness gate for the selected project and capture-time check.
+
+    A sibling absent gitlink is faithfully captured as absent, with its Git
+    metadata preserved. It is not a missing input unless it intersects the
+    package/workspace/local-dependency scope. Conflicts always fail closed.
+    Checks still execute against the sealed tree; no contents are fetched or
+    fabricated and no command failure is converted into a successful proof.
+    """
+    capture_root, _, _ = _subject_layout(project_dir)
+    issues = _repository_incomplete_submodules(capture_root)
+    if not issues:
+        return []
+    roots = _submodule_input_roots(project_dir, capture_root)
+    return [
+        (state, path) for state, path in issues
+        if state == "U" or any(
+            _within((capture_root / path).resolve(), root)
+            or _within(root, (capture_root / path).resolve())
+            for root in roots
+        )
+    ]
+
+
+def _submodule_preflight(project_dir: Path) -> None:
+    for state, path in incomplete_submodules(project_dir):
+        if state == "-":
+            raise SourceCaptureError(
+                f"SOURCE_SUBMODULE_INCOMPLETE: uninitialized submodule: {path}"
+            )
+        if state == "U":
+            raise SourceCaptureError(
+                f"SOURCE_SUBMODULE_INCOMPLETE: conflicted submodule: {path}"
+            )
+
+
+def _local_dependency_preflight(project_path: Path, capture_root: Path, policy: SourceInputPolicy = SourceInputPolicy()) -> None:
+    manifest_path = project_path / "package.json"
+    if not manifest_path.is_file():
+        return
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError, TypeError) as exc:
+        raise SourceCaptureError(f"SOURCE_PACKAGE_JSON_UNREADABLE: {manifest_path}: {exc}") from exc
+    for section in ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies"):
+        values = manifest.get(section)
+        if not isinstance(values, dict):
+            continue
+        for name, raw in values.items():
+            spec = str(raw or "").strip()
+            lowered = spec.lower()
+            if not lowered.startswith(("file:", "link:", "portal:")):
+                continue
+            payload = spec.split(":", 1)[1].strip()
+            if not payload:
+                continue
+            target = Path(payload).expanduser()
+            if not target.is_absolute():
+                target = project_path / target
+            target = target.resolve(strict=False)
+            if _within(target, capture_root) and _excluded(target.relative_to(capture_root), policy):
+                raise SourceCaptureError("SOURCE_REQUIRED_INPUT_EXCLUDED: local dependency " + str(name) + " targets an excluded path; use repository source scope")
+            if not _within(target, capture_root):
+                raise SourceCaptureError(
+                    "SOURCE_EXTERNAL_LOCAL_DEPENDENCY_UNSUPPORTED: "
+                    f"{name}={spec} resolves outside captured root: {target}"
+                )
+
+
+
+def _is_ephemeral_git_admin_path(relative: Path) -> bool:
+    """Git lock files coordinate writers; they are not repository/source state."""
+    return ".git" in relative.parts and relative.name.lower().endswith(".lock")
+
+
+def _remove_ephemeral_git_admin_files(root: Path) -> int:
+    """Remove copied Git lock artifacts before sealing; never follow links/junctions."""
+    removed = 0
+    pending = [(root, Path("."))]
+    while pending:
+        directory, relative_dir = pending.pop()
+        try:
+            with os.scandir(directory) as iterator:
+                items = list(iterator)
+        except OSError as exc:
+            raise SourceCaptureError(f"SOURCE_DIRECTORY_UNREADABLE: {directory}: {exc}") from exc
+        for item in items:
+            relative = relative_dir / item.name
+            path = Path(item.path)
+            try:
+                if item.is_symlink():
+                    continue
+                if item.is_dir(follow_symlinks=False):
+                    is_junction = getattr(path, "is_junction", None)
+                    if callable(is_junction) and is_junction():
+                        continue
+                    pending.append((path, relative))
+                elif item.is_file(follow_symlinks=False) and _is_ephemeral_git_admin_path(relative):
+                    try:
+                        path.unlink()
+                        removed += 1
+                    except FileNotFoundError:
+                        pass
+            except OSError as exc:
+                raise SourceCaptureError(f"SOURCE_GIT_ADMIN_CLEANUP_FAILED: {path}: {exc}") from exc
+    return removed
+
+
+def _excluded(relative: Path, policy: SourceInputPolicy) -> bool:
+    if _is_ephemeral_git_admin_path(relative):
+        return True
+    if policy.excluded_relative_paths or policy.frontend_build_output_paths:
+        names = {relative.as_posix(), *(p.as_posix() for p in relative.parents)}
+        if names.intersection(policy.excluded_path_set):
+            return True
+    if any(part in policy.excluded_dir_names for part in relative.parts):
+        return True
+    return relative.name in policy.excluded_file_names
+
+
+def _hash_regular_file(
+    path: Path,
+    *,
+    suppress_worker_observability: bool = False,
+) -> tuple[str, os.stat_result]:
+    try:
+        before = path.stat(follow_symlinks=False)
+        digest = hashlib.sha256()
+        def hash_stream() -> None:
+            with io_slot("hash", label="source-manifest"):
+                with path.open("rb") as stream:
+                    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                        digest.update(chunk)
+        if suppress_worker_observability:
+            # ContextVars do not automatically propagate into ThreadPoolExecutor
+            # workers. Re-establish suppression in the worker so an in-source
+            # telemetry sink cannot mutate the Source Truth while it is hashed.
+            with suppress_observability():
+                hash_stream()
+        else:
+            hash_stream()
+        after = path.stat(follow_symlinks=False)
+    except FileNotFoundError as exc:
+        # The walker already observed this input. Losing it before/during the
+        # read is a capture race, not permission to omit it from the manifest.
+        # Discard the entire attempt; only a fresh sealed/live match can pass.
+        raise SourceCaptureError(
+            f"SOURCE_CAPTURE_UNSTABLE: SOURCE_FILE_UNREADABLE: file disappeared while hashing: {path}: {exc}"
+        ) from exc
+    except OSError as exc:
+        raise SourceCaptureError(f"SOURCE_FILE_UNREADABLE: {path}: {exc}") from exc
+    if (
+        before.st_size != after.st_size
+        or before.st_mtime_ns != after.st_mtime_ns
+        or before.st_mode != after.st_mode
+        or int(getattr(before, "st_nlink", 1) or 1) != int(getattr(after, "st_nlink", 1) or 1)
+        or getattr(before, "st_ino", 0) != getattr(after, "st_ino", 0)
+    ):
+        raise SourceCaptureError(f"SOURCE_CAPTURE_UNSTABLE: file changed while hashing: {path}")
+    return digest.hexdigest(), after
+
+
+# Trees with no more regular files than this are hashed synchronously on the
+# caller thread: spawning an 8-thread pool and waiting on its wakeups for a
+# handful of small files is pure overhead on the CLI critical path. Larger
+# trees keep the bounded streaming pool (see _build_source_tree_manifest_impl).
+_SYNC_HASH_THRESHOLD = 256
+
+
+def _source_hash_workers() -> int:
+    raw = str(os.environ.get("DEPLOOM_SOURCE_HASH_WORKERS") or "").strip()
+    if raw:
+        try:
+            return max(1, min(32, int(raw)))
+        except ValueError:
+            pass
+    logical = max(1, int(os.cpu_count() or 4))
+    return max(2, min(8, logical // 2 or 1))
+
+
+def _directory_stability_stamp(
+    path: Path, *, relative: Path = Path("."), policy: Optional[SourceInputPolicy] = None,
+) -> tuple[object, ...]:
+    """Compare semantic membership/identities, not directory timestamp noise.
+
+    File metadata is rechecked even after its hash completed. Directory swaps,
+    additions/removals and reparse changes remain failures. Only explicit source
+    exclusions (including Git writer locks) are omitted from membership.
+    """
+    policy = policy or SourceInputPolicy()
+    try:
+        value = path.stat(follow_symlinks=False)
+        inode = int(getattr(value, "st_ino", 0))
+        identity = (int(value.st_dev), inode, stat.S_IFMT(value.st_mode),
+                    int(getattr(value, "st_reparse_tag", 0)))
+        if not inode:
+            # Without a file identity, retain the old conservative guard.
+            identity += (int(value.st_mtime_ns), int(value.st_size))
+        children = []
+        with os.scandir(path) as iterator:
+            for item in iterator:
+                if _excluded(relative / item.name, policy):
+                    continue
+                # Windows DirEntry.stat omits file IDs; query the path so
+                # directory identity does not fall back to timestamp noise.
+                child = Path(item.path).stat(follow_symlinks=False)
+                child_inode = int(getattr(child, "st_ino", 0))
+                child_identity = (int(child.st_dev), child_inode, stat.S_IFMT(child.st_mode),
+                                  int(getattr(child, "st_reparse_tag", 0)))
+                if not stat.S_ISDIR(child.st_mode) or not child_inode:
+                    child_identity += (int(child.st_size), int(child.st_mtime_ns),
+                                       int(child.st_ctime_ns), int(child.st_mode),
+                                       int(getattr(child, "st_nlink", 1)))
+                if stat.S_ISLNK(child.st_mode):
+                    child_identity += (os.readlink(item.path),)
+                children.append((item.name, child_identity))
+    except OSError as exc:
+        raise SourceCaptureError(f"SOURCE_DIRECTORY_UNREADABLE: {path}: {exc}") from exc
+    return ("semantic-membership", identity, tuple(sorted(children)))
+
+
+def _directory_stamp_change(before: tuple[object, ...], after: tuple[object, ...]) -> str:
+    if before[1] != after[1]:
+        return "directory identity changed"
+    old, new = dict(before[2]), dict(after[2])
+    added = sorted(new.keys() - old.keys())
+    removed = sorted(old.keys() - new.keys())
+    changed = sorted(name for name in old.keys() & new.keys() if old[name] != new[name])
+    return f"added={added[:5]!r}, removed={removed[:5]!r}, changed={changed[:5]!r}"
+
+
+@coordinated_io("hash", error_type=SourceCaptureError)
+def _build_source_tree_manifest_impl(
+    root: Path,
+    *,
+    policy: SourceInputPolicy = SourceInputPolicy(),
+    timeout_seconds: int = 1800,
+    progress: Optional[ProgressCallback] = None,
+    progress_label: str = "source manifest",
+    progress_interval_seconds: int = 15,
+    suppress_worker_observability: bool = False,
+    require_exclusive_links: bool = False,
+) -> SourceTreeManifest:
+    """Build a deterministic manifest with bounded parallel file hashing.
+
+    Only a small multiple of worker futures may exist at once; million-file
+    repositories therefore do not allocate a future per file. Directory stamps
+    are rechecked after hashing so add/remove/rename races fail closed.
+    """
+    root = root.resolve()
+    deadline = (float("inf") if timeout_seconds == 0
+                else time.monotonic() + max(1, int(timeout_seconds)))
+    next_progress = time.monotonic() + max(1, int(progress_interval_seconds))
+    entries: list[dict[str, object]] = []
+    files = 0
+    directories = 0
+    byte_count = 0
+    workers = _source_hash_workers()
+    max_pending = max(workers, workers * 3)
+    directory_stamps: list[tuple[Path, Path, tuple[object, ...]]] = []
+    pending: dict[concurrent.futures.Future[tuple[str, os.stat_result]], tuple[Path, str]] = {}
+
+    def tick() -> None:
+        nonlocal next_progress
+        now = time.monotonic()
+        if now > deadline:
+            raise SourceCaptureError(
+                f"SOURCE_MATERIALIZATION_TIMEOUT: {progress_label} exceeded {timeout_seconds}s"
+            )
+        if progress is not None and now >= next_progress:
+            progress(
+                f"{progress_label}: files={files}, dirs={directories}, bytes={byte_count}, workers={workers}"
+            )
+            next_progress = now + max(1, int(progress_interval_seconds))
+
+    def accept_hash(
+        path: Path,
+        relative_text: str,
+        digest: str,
+        stable: os.stat_result,
+    ) -> None:
+        nonlocal files, byte_count
+        if require_exclusive_links and int(getattr(stable, "st_nlink", 1) or 1) > 1:
+            # A sealed tree is a fresh private copy, so every file must have
+            # exactly one directory entry. A second link is an alias through
+            # which bytes can be rewritten WITHOUT any watcher notification
+            # inside the watched subtree.
+            raise SourceCaptureError(
+                "SOURCE_SNAPSHOT_LINK_TOPOLOGY_VIOLATION: "
+                f"{relative_text}: sealed file has {int(stable.st_nlink)} links; "
+                "an external alias can mutate sealed bytes unobserved"
+            )
+        files += 1
+        byte_count += int(stable.st_size)
+        entries.append({
+            "path": relative_text,
+            "kind": "file",
+            "size": int(stable.st_size),
+            "sha256": digest,
+            "executable": bool(stable.st_mode & 0o111),
+        })
+        tick()
+
+    def accept_future(future: concurrent.futures.Future[tuple[str, os.stat_result]]) -> None:
+        path, relative_text = pending.pop(future)
+        digest, stable = future.result()
+        accept_hash(path, relative_text, digest, stable)
+
+    def drain_one() -> None:
+        if not pending:
+            return
+        done, _ = concurrent.futures.wait(
+            tuple(pending), return_when=concurrent.futures.FIRST_COMPLETED
+        )
+        for future in done:
+            accept_future(future)
+
+    file_work: list[tuple[Path, str]] = []
+    executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+
+    def submit(path: Path, relative_text: str) -> None:
+        nonlocal executor
+        if executor is None:
+            executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=workers,
+                thread_name_prefix="deploom-source-hash",
+            )
+            collected, file_work[:] = file_work[:], []
+            for pending_path, pending_rel in collected:
+                future = executor.submit(
+                    _hash_regular_file,
+                    pending_path,
+                    suppress_worker_observability=suppress_worker_observability,
+                )
+                pending[future] = (pending_path, pending_rel)
+                if len(pending) >= max_pending:
+                    drain_one()
+        future = executor.submit(
+            _hash_regular_file,
+            path,
+            suppress_worker_observability=suppress_worker_observability,
+        )
+        pending[future] = (path, relative_text)
+        if len(pending) >= max_pending:
+            drain_one()
+
+    def walk(directory: Path, relative_dir: Path) -> None:
+        nonlocal directories
+        tick()
+        directory_stamps.append((directory, relative_dir, _directory_stability_stamp(directory, relative=relative_dir, policy=policy)))
+        try:
+            with os.scandir(directory) as iterator:
+                scanned = sorted(iterator, key=lambda entry: entry.name)
+        except OSError as exc:
+            raise SourceCaptureError(f"SOURCE_DIRECTORY_UNREADABLE: {directory}: {exc}") from exc
+        for item in scanned:
+            relative = relative_dir / item.name
+            if _excluded(relative, policy):
+                continue
+            path = Path(item.path)
+            tick()
+            try:
+                st = item.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise SourceCaptureError(f"SOURCE_ENTRY_UNREADABLE: {path}: {exc}") from exc
+
+            is_junction = getattr(path, "is_junction", None)
+            if callable(is_junction):
+                try:
+                    if is_junction():
+                        raise SourceCaptureError(
+                            f"SOURCE_UNSUPPORTED_REPARSE_POINT: junction: {path}"
+                        )
+                except OSError as exc:
+                    raise SourceCaptureError(
+                        f"SOURCE_ENTRY_UNREADABLE: junction probe {path}: {exc}"
+                    ) from exc
+
+            if stat.S_ISLNK(st.st_mode):
+                try:
+                    target_text = os.readlink(path)
+                except OSError as exc:
+                    raise SourceCaptureError(f"SOURCE_SYMLINK_UNREADABLE: {path}: {exc}") from exc
+                target = Path(target_text)
+                if not target.is_absolute():
+                    target = path.parent / target
+                if not _within(target, root):
+                    raise SourceCaptureError(
+                        f"SOURCE_SYMLINK_ESCAPE: {relative.as_posix()} -> {target_text}"
+                    )
+                try:
+                    target_relative = target.resolve(strict=False).relative_to(root)
+                except ValueError:
+                    target_relative = Path(".")
+                if _excluded(target_relative, policy):
+                    raise SourceCaptureError(
+                        f"SOURCE_SYMLINK_TARGET_EXCLUDED: {relative.as_posix()} -> {target_text}"
+                    )
+                entries.append({
+                    "path": relative.as_posix(),
+                    "kind": "symlink",
+                    "target": target_text.replace("\\", "/"),
+                })
+                continue
+
+            if stat.S_ISDIR(st.st_mode):
+                directories += 1
+                entries.append({"path": relative.as_posix(), "kind": "directory"})
+                walk(path, relative)
+                continue
+
+            if stat.S_ISREG(st.st_mode):
+                if int(getattr(st, "st_nlink", 1) or 1) > 1 and not (
+                    relative.parts and relative.parts[0] == ".git"
+                ):
+                    raise SourceCaptureError(
+                        f"SOURCE_HARDLINK_UNSUPPORTED: {relative.as_posix()} nlink={st.st_nlink}"
+                    )
+                if executor is None and len(file_work) < _SYNC_HASH_THRESHOLD:
+                    file_work.append((path, relative.as_posix()))
+                else:
+                    submit(path, relative.as_posix())
+                continue
+
+            raise SourceCaptureError(
+                f"SOURCE_SPECIAL_FILE_UNSUPPORTED: {relative.as_posix()} mode={oct(st.st_mode)}"
+            )
+
+    try:
+        walk(root, Path("."))
+        if executor is None:
+            for path, relative_text in sorted(file_work, key=lambda item: item[1]):
+                digest, stable = _hash_regular_file(
+                    path,
+                    suppress_worker_observability=suppress_worker_observability,
+                )
+                accept_hash(path, relative_text, digest, stable)
+        else:
+            while pending:
+                drain_one()
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=True)
+
+    for directory, relative_dir, stamp in directory_stamps:
+        observed_stamp = _directory_stability_stamp(directory, relative=relative_dir, policy=policy)
+        if observed_stamp != stamp:
+            raise SourceCaptureError(
+                f"SOURCE_CAPTURE_UNSTABLE: directory changed while hashing: {directory}; "
+                f"{_directory_stamp_change(stamp, observed_stamp)}"
+            )
+
+    entries.sort(key=lambda entry: str(entry["path"]))
+    key = _canonical_hash({
+        "schema": SOURCE_SNAPSHOT_SCHEMA,
+        "toolBuildId": tool_build_id(),
+        "policyKey": policy.key,
+        "entries": entries,
+    }, length=64)
+    if progress is not None:
+        progress(
+            f"{progress_label}: ready; files={files}, dirs={directories}, bytes={byte_count}, workers={workers}"
+        )
+    return SourceTreeManifest(
+        key=key,
+        entries=tuple(entries),
+        file_count=files,
+        directory_count=directories,
+        byte_count=byte_count,
+    )
+
+
+def _remaining(deadline: float) -> int:
+    if deadline == float("inf"):
+        return 0  # Explicit unbounded preparation, propagated to copy/hash.
+    value = int(deadline - time.monotonic())
+    if value <= 0:
+        raise SourceCaptureError("SOURCE_MATERIALIZATION_TIMEOUT: source capture deadline exhausted")
+    return max(1, value)
+
+
+def source_copy_budget():
+    """Bound unexpected conservative copies before any file data is copied."""
+    raw = os.environ.get("DEPLOOM_SOURCE_COPY_MAX_BYTES", str(8 * 1024**3))
+    try:
+        value = int(raw)
+        if value < 0:
+            raise ValueError()
+    except ValueError as exc:
+        raise SourceCaptureError("SOURCE_MATERIALIZATION_BUDGET_INVALID: expected nonnegative bytes") from exc
+    return value or None
+
+
+def _capture_once(
+    project_dir: Path,
+    *,
+    policy: Optional[SourceInputPolicy],
+    timeout_seconds: int,
+    progress: Optional[ProgressCallback],
+    progress_interval_seconds: int,
+) -> SourceSnapshot:
+    started = time.monotonic()
+    deadline = (float("inf") if timeout_seconds == 0
+                else started + max(1, int(timeout_seconds)))
+    capture_root, project_relative, git_head = _subject_layout(project_dir)
+    if policy is None:
+        from scoped_source_policy import policy_for_project
+        policy = policy_for_project(project_dir, capture_root)
+    if _excluded(project_relative / "package.json", policy):
+        raise SourceCaptureError("SOURCE_SELECTED_PROJECT_EXCLUDED: selected package is outside the source input policy; select an authoritative source root containing it")
+    project_path = (capture_root / project_relative).resolve()
+    _validate_git_layout(capture_root, policy=policy)
+    _submodule_preflight(project_path)
+    try:
+        topology_manifests = semantic_manifest_paths(project_path)
+    except ProjectTopologyError:
+        # Topology authority will reject unsupported/malformed layouts before
+        # verification. Source capture still checks the selected manifest here
+        # rather than weakening the existing standalone SourceSnapshot API.
+        topology_manifests = ((project_path / "package.json").resolve(),)
+    for manifest_path in topology_manifests:
+        if manifest_path.is_file():
+            _local_dependency_preflight(manifest_path.parent, capture_root, policy)
+
+    _reap_once()
+    from source_snapshot_storage import new_snapshot_container
+    container = new_snapshot_container(capture_root, prefix=SOURCE_SNAPSHOT_CONTAINER_PREFIX)
+    if _within(container, capture_root):
+        _force_rmtree(container)
+        raise SourceCaptureError(
+            "SOURCE_SNAPSHOT_TEMP_INSIDE_SUBJECT: "
+            f"container={container}; captureRoot={capture_root}"
+        )
+    _ALL_CONTAINERS.add(container)
+    from verification_storage_maintenance import register_trial_owner
+    register_trial_owner(container)
+    snapshot_root = container / "tree"
+    try:
+        try:
+            method = materialize_private_tree(
+                capture_root,
+                snapshot_root,
+                timeout_seconds=_remaining(deadline),
+                progress=progress,
+                progress_label="source capture materialization",
+                maximum_copy_bytes=source_copy_budget(),
+                progress_interval_seconds=progress_interval_seconds,
+                exclude_dir_names=policy.excluded_dir_names,
+                exclude_file_names=policy.excluded_file_names,
+                exclude_relative_paths=tuple(sorted(policy.excluded_path_set)),
+            )
+        except StorageCapacityError as exc:
+            raise SourceCaptureError(str(exc)) from exc
+        except ReparseMaterializationError as exc:
+            detail = str(exc)
+            if "SOURCE_MATERIALIZATION_BUDGET_EXCEEDED" in detail:
+                raise SourceCaptureError(detail) from exc
+            if os.name != "nt" and "REPARSE_EXTERNAL_TARGET_UNSUPPORTED" in detail:
+                raise SourceCaptureError(f"SOURCE_SYMLINK_ESCAPE: {detail}") from exc
+            raise SourceCaptureError(f"SOURCE_REPARSE_LAYOUT_UNSUPPORTED: {detail}") from exc
+        # Never carry a live Git writer's synchronization lock into the sealed repository.
+        removed_git_locks = _remove_ephemeral_git_admin_files(snapshot_root)
+        if removed_git_locks and progress is not None:
+            progress(f"source capture: removed {removed_git_locks} transient Git lock file(s) from private copy")
+        # Seal BEFORE hashing so the sealed manifest measures bytes that are
+        # already write-protected against every alias to the same file object.
+        _apply_tree_write_protection(snapshot_root, readonly=True)
+        captured = build_source_tree_manifest(
+            snapshot_root,
+            policy=policy,
+            timeout_seconds=_remaining(deadline),
+            progress=progress,
+            progress_label="source capture sealed-manifest",
+            progress_interval_seconds=progress_interval_seconds,
+            pass_role="sealed-snapshot",
+        )
+        post = build_source_tree_manifest(
+            capture_root,
+            policy=policy,
+            timeout_seconds=_remaining(deadline),
+            progress=progress,
+            progress_label="source capture live-final-manifest",
+            progress_interval_seconds=progress_interval_seconds,
+            pass_role="live-final",
+        )
+        if captured.key != post.key:
+            from verification_identity_diagnostics import manifest_entry_change_summary
+            changes = manifest_entry_change_summary(captured.entries, post.entries)
+            raise SourceCaptureError(
+                "SOURCE_CAPTURE_UNSTABLE: sealed/live-final content manifests differ; changedInputs="
+                + json.dumps(changes, sort_keys=True)
+            )
+
+        key = _canonical_hash({
+            "schema": SOURCE_SNAPSHOT_SCHEMA,
+            "toolBuildId": tool_build_id(),
+            "policyKey": policy.key,
+            "manifestKey": captured.key,
+            "projectRelative": project_relative.as_posix() or ".",
+        }, length=32)
+        manifest_path = container / "manifest.json"
+        manifest_path.write_text(
+            json.dumps({
+                "schemaVersion": 1,
+                "type": "deploom-source-snapshot",
+                "sourceSnapshotKey": key,
+                "toolBuildId": tool_build_id(),
+                "manifestKey": captured.key,
+                "policyKey": policy.key,
+                "inputPolicy": __import__("scoped_source_policy").policy_payload(policy),
+                "projectRelative": project_relative.as_posix() or ".",
+                "gitHead": git_head,
+                "fileCount": captured.file_count,
+                "directoryCount": captured.directory_count,
+                "byteCount": captured.byte_count,
+                "materializationMethod": method,
+                # Hashes + paths only. Never persist source contents here.
+                "entries": list(captured.entries),
+            }, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        return SourceSnapshot(
+            original_project_path=project_dir.resolve(),
+            capture_root=capture_root,
+            project_relative=project_relative,
+            container=container,
+            root=snapshot_root,
+            project_path=(snapshot_root / project_relative).resolve(),
+            key=key,
+            manifest_key=captured.key,
+            policy_key=policy.key,
+            file_count=captured.file_count,
+            directory_count=captured.directory_count,
+            byte_count=captured.byte_count,
+            materialization_method=method,
+            git_head=git_head,
+            git_root=str(capture_root) if git_head else "",
+            created_at=time.time(),
+            input_policy=policy,
+        )
+    except Exception:
+        _force_rmtree(container)
+        _ALL_CONTAINERS.discard(container)
+        raise
+
+
+def _capture_source_snapshot_impl(
+    project_dir: Path,
+    *,
+    policy: Optional[SourceInputPolicy] = None,
+    timeout_seconds: int = 1800,
+    progress: Optional[ProgressCallback] = None,
+    progress_interval_seconds: int = 15,
+) -> SourceSnapshot:
+    deadline = float("inf") if timeout_seconds == 0 else time.monotonic() + max(1, timeout_seconds)
+    last: Optional[BaseException] = None
+    for attempt in range(1, SOURCE_CAPTURE_RETRIES + 1):
+        try:
+            if progress is not None:
+                progress(f"SourceSnapshot capture attempt {attempt}/{SOURCE_CAPTURE_RETRIES}")
+            return _capture_once(
+                project_dir,
+                policy=policy,
+                timeout_seconds=_remaining(deadline),
+                progress=progress,
+                progress_interval_seconds=progress_interval_seconds,
+            )
+        except SourceCaptureError as exc:
+            last = exc
+            if "SOURCE_CAPTURE_UNSTABLE" not in str(exc) or attempt >= SOURCE_CAPTURE_RETRIES:
+                raise
+            if progress is not None:
+                progress(f"SourceSnapshot capture unstable; retrying: {exc}")
+    raise SourceCaptureError(f"SOURCE_CAPTURE_UNSTABLE: {last}")
+
+
+def activate_source_snapshot_epoch(
+    project_dir: Path,
+    *,
+    timeout_seconds: int = 1800,
+    progress: Optional[ProgressCallback] = None,
+    progress_interval_seconds: int = 15,
+    replace: bool = False,
+) -> SourceSnapshot:
+    key = _active_key(project_dir)
+    with _LOCK:
+        existing = _ACTIVE.get(key)
+        if existing is not None and not replace:
+            return existing
+        if existing is not None:
+            _ACTIVE.pop(key, None)
+            watcher_entry = _ACTIVE_WATCHERS.pop(key, None)
+            live_watcher_entry = _LIVE_SOURCE_WATCHERS.pop(key, None)
+            if watcher_entry is not None:
+                watcher_entry[1].stop()
+            if live_watcher_entry is not None:
+                live_watcher_entry[1].stop()
+            _force_rmtree(existing.container)
+            _ALL_CONTAINERS.discard(existing.container)
+        snapshot = capture_source_snapshot(
+            project_dir,
+            timeout_seconds=timeout_seconds,
+            progress=progress,
+            progress_interval_seconds=progress_interval_seconds,
+        )
+        _ACTIVE[key] = snapshot
+        return snapshot
+
+
+def active_source_snapshot(project_dir: Path) -> Optional[SourceSnapshot]:
+    key = _active_key(project_dir)
+    scoped = _REQUEST_SNAPSHOTS.get().get(key)
+    if scoped is not None:
+        return scoped
+    with _LOCK:
+        direct = _ACTIVE.get(key)
+        if direct is not None:
+            return direct
+        # Resolver context builders rebind the logical path to this sealed
+        # project path. It is the SAME selected subject, with the SAME frozen
+        # policy, not a fresh filesystem tree to inventory again.
+        return next((snapshot for snapshot in _ACTIVE.values()
+                     if _active_key(snapshot.project_path) == key), None)
+
+
+@contextlib.contextmanager
+def bind_source_snapshot(snapshot: SourceSnapshot, *, retain_watchers: bool = False):
+    """Bind logical and sealed paths for one consumer without owning its tree."""
+    existing = active_source_snapshot(snapshot.original_project_path)
+    token = _REQUEST_SNAPSHOTS.set({
+        **_REQUEST_SNAPSHOTS.get(),
+        _active_key(snapshot.original_project_path): snapshot,
+        _active_key(snapshot.project_path): snapshot,
+    })
+    try:
+        yield snapshot
+    finally:
+        # A standalone uncached consumer owns the validation memo it armed;
+        # caller-owned epochs and outer request scopes retain their watcher.
+        if existing is not snapshot and not retain_watchers:
+            _retire_snapshot_watcher(snapshot)
+        _REQUEST_SNAPSHOTS.reset(token)
+
+
+@contextlib.contextmanager
+def verification_source_snapshot_scope(
+    project_dir: Path,
+    *,
+    timeout_seconds: int = 1800,
+    progress: Optional[ProgressCallback] = None,
+    progress_interval_seconds: int = 15,
+    reuse_completed: bool = False,
+    recovery_directory: Optional[Path] = None,
+):
+    """Pin one source subject for identity, cache lookup and all attempt retries.
+
+    Reuse caller-owned epochs. Optional completed-request reuse is authorized
+    by existing sealed and live-source continuity guards, never the cache key.
+    Context-local registration prevents concurrent requests or later cohorts
+    from consuming a stale epoch belonging to another verification.
+    """
+    existing = active_source_snapshot(project_dir)
+    if existing is not None:
+        yield existing
+        return
+    source_mode = "frontend" if os.environ.get("DEPLOOM_SOURCE_SCOPE_MODE") == "frontend" else "repository"
+    cache_key = _active_key(project_dir) + ":" + tool_build_id() + ":" + source_mode
+    snapshot = None
+    if reuse_completed:
+        with _LOCK:
+            candidate = _COMPLETED_REQUEST_SNAPSHOTS.pop(cache_key, None)
+        if candidate is not None:
+            try:
+                with bind_source_snapshot(candidate, retain_watchers=True):
+                    validate_source_snapshot(candidate, timeout_seconds=timeout_seconds, progress=progress)
+                    if source_snapshot_live_source_continuity(candidate, timeout_seconds=timeout_seconds, progress=progress):
+                        snapshot = candidate
+            except (SourceCaptureError, OSError):
+                pass
+            if snapshot is None:
+                _retire_completed_request(candidate)
+    if snapshot is None:
+        if recovery_directory is not None:
+            from verification_stage_checkpoint import capture_recovery_source
+            snapshot, reused = capture_recovery_source(
+                project_dir, recovery_directory, timeout_seconds=timeout_seconds, progress=progress)
+        else:
+            snapshot = capture_source_snapshot(
+                project_dir, timeout_seconds=timeout_seconds, progress=progress,
+                progress_interval_seconds=progress_interval_seconds,
+            )
+            reused = False
+    else:
+        reused = True
+    emit_observability_event("source.request.reuse", reused=reused,
+                            snapshotKey=snapshot.key, authority="SOURCE_TRUTH_GUARD")
+    completed = False
+    try:
+        with bind_source_snapshot(snapshot, retain_watchers=reuse_completed):
+            yield snapshot
+        completed = True
+    finally:
+        # This cache contains candidates, not verification authority. The next
+        # consumer always validates BOTH sealed bytes and live continuity above.
+        # Do not hash the original tree merely to decide whether to keep a
+        # candidate that may never be consumed again.
+        retained = completed and reuse_completed
+        if retained:
+            retired = []
+            with _LOCK:
+                previous = _COMPLETED_REQUEST_SNAPSHOTS.pop(cache_key, None)
+                if previous is not None:
+                    retired.append(previous)
+                _COMPLETED_REQUEST_SNAPSHOTS[cache_key] = snapshot
+                while len(_COMPLETED_REQUEST_SNAPSHOTS) > _COMPLETED_REQUEST_LIMIT:
+                    retired.append(_COMPLETED_REQUEST_SNAPSHOTS.pop(next(iter(_COMPLETED_REQUEST_SNAPSHOTS))))
+            for candidate in retired:
+                _retire_completed_request(candidate)
+        else:
+            _retire_completed_request(snapshot)
+
+
+def _retire_completed_request(snapshot):
+    _retire_snapshot_watcher(snapshot)
+    _retire_live_source_watcher(snapshot)
+    if not snapshot.durable_recovery:
+        _force_rmtree(snapshot.container)
+    _ALL_CONTAINERS.discard(snapshot.container)
+
+
+def _retire_live_source_watcher(snapshot: SourceSnapshot) -> None:
+    key = _active_key(snapshot.original_project_path)
+    with _LOCK:
+        entry = _LIVE_SOURCE_WATCHERS.get(key)
+        if entry is not None and entry[0] is snapshot:
+            _LIVE_SOURCE_WATCHERS.pop(key, None)
+        else:
+            entry = None
+    if entry is not None:
+        entry[1].stop()
+
+
+def source_snapshot_live_source_continuity(
+    snapshot: SourceSnapshot,
+    *,
+    timeout_seconds: int = 1800,
+    progress: Optional[ProgressCallback] = None,
+) -> bool:
+    # Git HEAD is provenance only. Ignored/generated files are SourceSnapshot
+    # inputs too, so hot reuse requires continuity of all covered live bytes.
+    policy = snapshot.input_policy or SourceInputPolicy()
+    if snapshot.policy_key != policy.key:
+        return False
+
+    live_root = (
+        Path(snapshot.git_root).expanduser().resolve()
+        if snapshot.git_root
+        else snapshot.original_project_path.expanduser().resolve()
+    )
+    live_project = snapshot.original_project_path.expanduser().resolve()
+    if not live_root.is_dir() or not live_project.is_dir():
+        _retire_live_source_watcher(snapshot)
+        return False
+
+    key = _active_key(snapshot.original_project_path)
+    with _LOCK:
+        entry = _LIVE_SOURCE_WATCHERS.get(key)
+
+    if entry is not None and entry[0] is snapshot:
+        _snap, watcher, sealed_root_identity, sealed_project_identity = entry
+        thread = watcher._thread
+        delivery_and_identity_ok = bool(
+            sealed_root_identity is not None
+            and sealed_project_identity is not None
+            and _tree_object_identity(live_root) == sealed_root_identity
+            and _tree_object_identity(live_project) == sealed_project_identity
+            and thread is not None
+            and thread.is_alive()
+            and not watcher.errors
+            and _drain_watcher(watcher, live_root)
+        )
+        if not delivery_and_identity_ok:
+            emit_observability_event(
+                "source.snapshot.live-continuity",
+                snapshotKey=snapshot.key,
+                outcome="watcher-invalidated",
+                authority="SOURCE_TRUTH_GUARD",
+            )
+            _retire_live_source_watcher(snapshot)
+            return False
+
+        relevant_events = _content_relevant_events(list(watcher.events))
+        if not relevant_events:
+            emit_observability_event(
+                "source.snapshot.live-continuity",
+                snapshotKey=snapshot.key,
+                outcome="watcher-hit",
+                authority="SOURCE_TRUTH_GUARD",
+            )
+            return True
+
+        emit_observability_event(
+            "source.snapshot.live-continuity",
+            snapshotKey=snapshot.key,
+            outcome="watcher-event-strong-revalidation",
+            eventCount=len(relevant_events),
+            authority="SOURCE_TRUTH_GUARD",
+        )
+        _retire_live_source_watcher(snapshot)
+        entry = None
+
+    if entry is not None:
+        with _LOCK:
+            stale = _LIVE_SOURCE_WATCHERS.pop(key, None)
+        if stale is not None:
+            stale[1].stop()
+
+    candidate_watcher = None
+    sealed_root_identity = None
+    sealed_project_identity = None
+    if os.name == "nt":
+        candidate_watcher = _DirectoryWatcher(live_root)
+        if not candidate_watcher.start():
+            candidate_watcher.stop()
+            candidate_watcher = None
+        else:
+            sealed_root_identity = _tree_object_identity(live_root)
+            sealed_project_identity = _tree_object_identity(live_project)
+            if sealed_root_identity is None or sealed_project_identity is None:
+                candidate_watcher.stop()
+                candidate_watcher = None
+
+    try:
+        observed = build_source_tree_manifest(
+            live_root,
+            policy=policy,
+            timeout_seconds=timeout_seconds,
+            progress=progress,
+            progress_label="hot SourceSnapshot live-source continuity",
+        )
+    except SourceCaptureError:
+        if candidate_watcher is not None:
+            candidate_watcher.stop()
+        raise
+
+    if observed.key != snapshot.manifest_key:
+        if candidate_watcher is not None:
+            candidate_watcher.stop()
+        emit_observability_event(
+            "source.snapshot.live-continuity",
+            snapshotKey=snapshot.key,
+            outcome="manifest-mismatch",
+            authority="SOURCE_TRUTH_GUARD",
+        )
+        return False
+
+    if candidate_watcher is not None:
+        armed_clean = bool(
+            _tree_object_identity(live_root) == sealed_root_identity
+            and _tree_object_identity(live_project) == sealed_project_identity
+            and _drain_watcher(candidate_watcher, live_root)
+            and not candidate_watcher.errors
+            and not _content_relevant_events(list(candidate_watcher.events))
+        )
+        if not armed_clean:
+            candidate_watcher.stop()
+            return False
+        with _LOCK:
+            _LIVE_SOURCE_WATCHERS[key] = (
+                snapshot,
+                candidate_watcher,
+                sealed_root_identity,
+                sealed_project_identity,
+            )
+        outcome = "manifest-match-watcher-armed"
+    else:
+        # No proven event stream => this one continuation is authorized only by
+        # the full manifest comparison; the next continuation repeats it.
+        outcome = "manifest-match"
+
+    emit_observability_event(
+        "source.snapshot.live-continuity",
+        snapshotKey=snapshot.key,
+        outcome=outcome,
+        authority="SOURCE_TRUTH_GUARD",
+    )
+    return True
+
+
+def validate_source_snapshot(
+    snapshot: SourceSnapshot,
+    *,
+    timeout_seconds: int = 1800,
+    progress: Optional[ProgressCallback] = None,
+    progress_label: str = "active SourceSnapshot validation",
+) -> SourceSnapshot:
+    """Prove snapshot bytes once, then keep that proof live with a watcher."""
+    started = time.monotonic()
+    active_key = _snapshot_watcher_key(snapshot)
+    with _LOCK:
+        watcher_entry = _ACTIVE_WATCHERS.get(active_key)
+        usable_entry = (
+            watcher_entry is not None and watcher_entry[0] is snapshot
+        )
+        watcher = watcher_entry[1] if usable_entry else None
+        sealed_identity = watcher_entry[2] if usable_entry else None
+        is_active = active_source_snapshot(snapshot.original_project_path) is snapshot
+    # Drain BEFORE reading events: a mutation that completed just before this
+    # boundary may still be in flight, and silence would otherwise be misread
+    # as proof of an unchanged tree.
+    drain_confirmed = True
+    if watcher is not None:
+        drain_confirmed = _drain_watcher(watcher, snapshot.root)
+    watcher_events = (
+        _content_relevant_events(list(watcher.events)) if watcher is not None else []
+    )
+    watcher_errors = list(watcher.errors) if watcher is not None else []
+
+    fallback_reason = ""
+    if watcher is not None:
+        # A memo hit is only sound while the watched path still resolves to the
+        # SAME directory object that was sealed. Path identity is not object
+        # identity: a directory swap leaves `is_dir()` true and the watcher --
+        # which holds a handle to the original object -- permanently silent.
+        current_identity = _snapshot_object_identity(snapshot)
+        identity_stable = (
+            sealed_identity is not None
+            and current_identity is not None
+            and current_identity == sealed_identity
+        )
+        if not snapshot.root.is_dir() or not snapshot.project_path.is_dir():
+            fallback_reason = "root-missing"
+        elif not identity_stable:
+            fallback_reason = "directory-identity-changed"
+        elif watcher.errors:
+            fallback_reason = "watcher-failure"
+        elif not (watcher._thread is not None and watcher._thread.is_alive()):
+            fallback_reason = "watcher-thread-dead"
+        elif not drain_confirmed:
+            # Delivery could not be proven, so watcher silence proves nothing.
+            fallback_reason = "watcher-drain-unconfirmed"
+        elif watcher_events:
+            # Could be a real mutation or an attribute-only touch. The watcher
+            # cannot tell us which, so it does not get to decide the verdict.
+            fallback_reason = "watcher-event-observed"
+
+        if not fallback_reason:
+            emit_observability_event(
+                "source.snapshot.validation",
+                snapshotKey=snapshot.key, outcome="watcher-memo-hit",
+                generation=str(snapshot.created_at),
+                validationMs=max(0, int((time.monotonic() - started) * 1000)),
+            )
+            return snapshot
+
+        # Watcher uncertainty is NEVER a content mismatch and NEVER a pass.
+        # Retire the memo and let authoritative full validation decide. The
+        # snapshot stays registered so a benign event can revalidate cleanly.
+        _retire_snapshot_watcher(snapshot)
+        watcher = None
+        emit_observability_event(
+            "source.snapshot.validation",
+            snapshotKey=snapshot.key, outcome="watcher-fallback",
+            reason=fallback_reason,
+            generation=str(snapshot.created_at),
+            watcherEvents=len(watcher_events),
+            watcherErrors=list(watcher_errors),
+        )
+
+    candidate_watcher: Optional[_DirectoryWatcher] = None
+    if os.name == "nt" and is_active and snapshot.root.is_dir():
+        candidate_watcher = _DirectoryWatcher(snapshot.root)
+        if not candidate_watcher.start():
+            candidate_watcher.stop()
+            candidate_watcher = None
+
+    try:
+        observed = build_source_tree_manifest(
+            snapshot.root,
+            policy=snapshot.input_policy or SourceInputPolicy(),
+            timeout_seconds=timeout_seconds,
+            progress=progress,
+            progress_label=progress_label,
+            pass_role="active-validation",
+        )
+    except SourceCaptureError:
+        if candidate_watcher is not None:
+            candidate_watcher.stop()
+        with _LOCK:
+            if _ACTIVE.get(active_key) is snapshot:
+                _ACTIVE.pop(active_key, None)
+        emit_observability_event(
+            "source.snapshot.validation",
+            snapshotKey=snapshot.key, outcome="error",
+            generation=str(snapshot.created_at),
+            validationMs=max(0, int((time.monotonic() - started) * 1000)),
+        )
+        raise
+    if observed.key != snapshot.manifest_key:
+        if candidate_watcher is not None:
+            candidate_watcher.stop()
+        with _LOCK:
+            if _ACTIVE.get(active_key) is snapshot:
+                _ACTIVE.pop(active_key, None)
+        from verification_identity_diagnostics import source_manifest_change_summary
+        changed_inputs = source_manifest_change_summary(snapshot, observed)
+        emit_observability_event(
+            "source.snapshot.validation",
+            changedInputs=changed_inputs,
+            snapshotKey=snapshot.key, outcome="content-mismatch",
+            generation=str(snapshot.created_at),
+            validationMs=max(0, int((time.monotonic() - started) * 1000)),
+            files=observed.file_count, bytes=observed.byte_count,
+        )
+        raise SourceCaptureError(
+            "SOURCE_SNAPSHOT_CONTENT_MISMATCH: "
+            f"expected={snapshot.manifest_key}; observed={observed.key}" +
+            "; changedInputs=" + json.dumps(changed_inputs, sort_keys=True)
+        )
+    if candidate_watcher is not None and not _watcher_is_clean(candidate_watcher):
+        candidate_watcher.stop()
+        with _LOCK:
+            if _ACTIVE.get(active_key) is snapshot:
+                _ACTIVE.pop(active_key, None)
+        raise SourceCaptureError(
+            "SOURCE_SNAPSHOT_CONTENT_MISMATCH: snapshot changed during validation"
+        )
+    if candidate_watcher is not None:
+        with _LOCK:
+            if active_source_snapshot(snapshot.original_project_path) is snapshot:
+                _ACTIVE_WATCHERS[active_key] = (
+                    snapshot,
+                    candidate_watcher,
+                    _snapshot_object_identity(snapshot),
+                )
+                candidate_watcher = None
+        if candidate_watcher is not None:
+            candidate_watcher.stop()
+    emit_observability_event(
+        "source.snapshot.validation",
+        snapshotKey=snapshot.key, outcome="passed",
+        generation=str(snapshot.created_at),
+        validationMs=max(0, int((time.monotonic() - started) * 1000)),
+        files=observed.file_count, bytes=observed.byte_count,
+    )
+    return snapshot
+
+
+def proof_subject_project_dir(project_dir: Path) -> Path:
+    snapshot = active_source_snapshot(project_dir)
+    return validate_source_snapshot(snapshot).project_path if snapshot is not None else project_dir.expanduser().resolve()
+
+
+def source_snapshot_fingerprint(project_dir: Path) -> str:
+    snapshot = active_source_snapshot(project_dir)
+    if snapshot is not None:
+        return validate_source_snapshot(snapshot).key
+    root, relative, _head = _subject_layout(project_dir)
+    from scoped_source_policy import policy_for_project
+    policy = policy_for_project(project_dir, root)
+    for attempt in range(1, SOURCE_CAPTURE_RETRIES + 1):
+        try:
+            manifest = build_source_tree_manifest(root, policy=policy, timeout_seconds=0)
+            break
+        except SourceCaptureError as exc:
+            if "SOURCE_CAPTURE_UNSTABLE" not in str(exc) or attempt >= SOURCE_CAPTURE_RETRIES:
+                raise
+    return _canonical_hash({
+        "schema": SOURCE_SNAPSHOT_SCHEMA,
+        "toolBuildId": tool_build_id(),
+        "policyKey": policy.key,
+        "manifestKey": manifest.key,
+        "projectRelative": relative.as_posix() or ".",
+    }, length=32)
+
+
+def source_snapshot_provenance_head(project_dir: Path, *, require_git: bool = False) -> str:
+    snapshot = active_source_snapshot(project_dir)
+    if snapshot is not None:
+        if require_git and not snapshot.git_head:
+            raise SourceCaptureError("SOURCE_GIT_REQUIRED: active source snapshot is not a Git repository")
+        return snapshot.git_head
+    _root, _relative, head = _subject_layout(project_dir, require_git=require_git)
+    return head
+
+
+def materialize_source_for_verification(
+    project_dir: Path,
+    target: Path,
+    *,
+    timeout_seconds: int,
+    progress: Optional[ProgressCallback] = None,
+    progress_label: str = "source snapshot materialization",
+    progress_interval_seconds: int = 15,
+) -> tuple[Path, SourceSnapshot, str]:
+    snapshot = active_source_snapshot(project_dir)
+    if snapshot is None:
+        snapshot = capture_source_snapshot(
+            project_dir,
+            timeout_seconds=timeout_seconds,
+            progress=progress,
+            progress_interval_seconds=progress_interval_seconds,
+        )
+    from verification_source_closure import require_complete_source_policy
+    require_complete_source_policy(snapshot.input_policy or SourceInputPolicy())
+    budget = source_copy_budget()
+    if budget is not None and snapshot.byte_count > budget:
+        raise SourceCaptureError("SOURCE_MATERIALIZATION_BUDGET_EXCEEDED: "
+            f"observedBytes={snapshot.byte_count}; limitBytes={budget}; no source bytes copied")
+    from storage_capacity import require_capacity
+    require_capacity(target, snapshot.byte_count, "verification source materialization")
+    validate_source_snapshot(
+        snapshot,
+        timeout_seconds=timeout_seconds,
+        progress=progress,
+        progress_label=f"{progress_label} pre-consumption validation",
+    )
+    method = materialize_private_tree(
+        snapshot.root,
+        target,
+        timeout_seconds=timeout_seconds,
+        progress=progress,
+        progress_label=progress_label,
+        progress_interval_seconds=progress_interval_seconds,
+    )
+    observed = build_source_tree_manifest(
+        target,
+        policy=snapshot.input_policy or SourceInputPolicy(),
+        timeout_seconds=timeout_seconds,
+        progress=progress,
+        progress_label=f"{progress_label} post-copy validation",
+        pass_role="materialized-validation",
+    )
+    if observed.key != snapshot.manifest_key:
+        _force_rmtree(target)
+        raise SourceCaptureError(
+            "SOURCE_MATERIALIZED_CONTENT_MISMATCH: "
+            f"expected={snapshot.manifest_key}; observed={observed.key}"
+        )
+    # The sealed lower is immutable, but this materialized copy is a working
+    # tree: the package manager must be able to write into it.
+    _apply_tree_write_protection(target, readonly=False)
+    project = (target / snapshot.project_relative).resolve()
+    if not project.is_dir():
+        raise SourceCaptureError(
+            f"SOURCE_MATERIALIZED_PROJECT_MISSING: {snapshot.project_relative.as_posix()}"
+        )
+    return project, snapshot, method
+
+
+def clear_source_snapshot_epochs() -> None:
+    with _LOCK:
+        snapshots = [*list(_ACTIVE.values()), *list(_COMPLETED_REQUEST_SNAPSHOTS.values())]
+        _COMPLETED_REQUEST_SNAPSHOTS.clear()
+        watchers = [entry[1] for entry in _ACTIVE_WATCHERS.values()]
+        live_watchers = [entry[1] for entry in _LIVE_SOURCE_WATCHERS.values()]
+        _ACTIVE.clear()
+        _ACTIVE_WATCHERS.clear()
+        _LIVE_SOURCE_WATCHERS.clear()
+    for watcher in [*watchers, *live_watchers]:
+        watcher.stop()
+    for snapshot in snapshots:
+        _force_rmtree(snapshot.container)
+        _ALL_CONTAINERS.discard(snapshot.container)
+
+
+SOURCE_SNAPSHOT_CONTAINER_PREFIX = "dependency-flow-source-snapshot-"
+_REAP_MAX_AGE_SECONDS = 6 * 3600
+_REAP_MAX_CONTAINERS = 8
+_REAP_DONE = threading.Event()
+
+
+def reap_orphaned_source_snapshots(
+    *,
+    max_age_seconds: int = _REAP_MAX_AGE_SECONDS,
+    max_containers: int = _REAP_MAX_CONTAINERS,
+    additional_parents: tuple[Path, ...] = (),
+) -> dict[str, int]:
+    """Remove source snapshot containers abandoned by a crashed/killed run.
+
+    `_cleanup_all` only runs at a clean exit, so a crash, a kill or a watchdog
+    stop leaves the whole sealed tree behind forever. This reaper is bounded on
+    purpose: it does a little work per process rather than an unbounded sweep.
+
+    A successful rename does not establish liveness: directory watchers may
+    allow deletion sharing. Require a registered dead owner and reject shared
+    or linked trees before retirement. Unknown legacy containers and live
+    owners are retained. Failing to reap leaves the tree for a later run.
+    """
+    from verification_storage_maintenance import dead_trial_owner, _plain_directory, _has_links
+    reaped = skipped = failed = 0
+    from source_snapshot_storage import candidate_snapshot_parents
+    now = time.time()
+    with _LOCK:
+        owned = {os.path.normcase(str(item)) for item in _ALL_CONTAINERS}
+    candidates: list[Path] = []
+    for base in (*candidate_snapshot_parents(), *additional_parents):
+        try:
+            candidates.extend(base.glob(SOURCE_SNAPSHOT_CONTAINER_PREFIX + "*"))
+        except OSError:
+            continue
+    for container in sorted(set(candidates)):
+
+        if reaped >= max_containers:
+            break
+        if os.path.normcase(str(container)) in owned or not container.is_dir():
+            skipped += 1
+            continue
+        try:
+            if not all(_plain_directory(p) for p in [container, *container.parents]) or not dead_trial_owner(container):
+                skipped += 1
+                continue
+            age = now - container.stat().st_mtime
+        except OSError:
+            skipped += 1
+            continue
+        if age < max_age_seconds:
+            skipped += 1
+            continue
+        if _has_links(container):
+            skipped += 1
+            continue
+        trash = container.with_name(f"{container.name}.reap-{os.getpid()}")
+        try:
+            os.rename(container, trash)
+        except OSError:
+            # Still open somewhere: treat as live and leave it alone.
+            skipped += 1
+            continue
+        try:
+            # Sealed trees are write-protected, so a plain rmtree would fail
+            # and silently turn every orphan into a permanent one.
+            _force_rmtree(trash)
+            reaped += 1
+        except Exception:
+            failed += 1
+    if reaped or failed:
+        emit_observability_event(
+            "source.snapshot.reap",
+            reaped=reaped,
+            skipped=skipped,
+            failed=failed,
+            maxAgeSeconds=int(max_age_seconds),
+        )
+    return {"reaped": reaped, "skipped": skipped, "failed": failed}
+
+
+def _reap_once() -> None:
+    """Bounded, best-effort, at most once per process."""
+    if _REAP_DONE.is_set():
+        return
+    _REAP_DONE.set()
+    try:
+        reap_orphaned_source_snapshots()
+    except Exception:
+        pass
+
+
+def _cleanup_all() -> None:
+    with _LOCK:
+        _ACTIVE.clear()
+        _COMPLETED_REQUEST_SNAPSHOTS.clear()
+        watchers = [entry[1] for entry in _ACTIVE_WATCHERS.values()]
+        watchers.extend(entry[1] for entry in _LIVE_SOURCE_WATCHERS.values())
+        _ACTIVE_WATCHERS.clear()
+        _LIVE_SOURCE_WATCHERS.clear()
+        containers = list(_ALL_CONTAINERS)
+        _ALL_CONTAINERS.clear()
+    for watcher in watchers:
+        watcher.stop()
+    for container in containers:
+        _force_rmtree(container)
+
+
+atexit.register(_cleanup_all)
+
+def _observability_sink_is_source_safe(
+    root: Path,
+    policy: SourceInputPolicy,
+) -> bool:
+    sink = configured_observability_path()
+    if sink is None:
+        return True
+    root = root.resolve()
+    sink = sink.resolve()
+    try:
+        relative = sink.relative_to(root)
+    except ValueError:
+        return True
+    return _excluded(relative, policy)
+
+
+_EXCLUSIVE_LINK_PASS_ROLES = frozenset({
+    "sealed-snapshot",
+    "active-validation",
+    "materialized-validation",
+})
+
+
+def build_source_tree_manifest(
+    root: Path,
+    *,
+    policy: SourceInputPolicy = SourceInputPolicy(),
+    timeout_seconds: int = 1800,
+    progress: Optional[ProgressCallback] = None,
+    progress_label: str = "source manifest",
+    progress_interval_seconds: int = 15,
+    pass_role: str = "",
+) -> SourceTreeManifest:
+    exclusive_links = str(pass_role) in _EXCLUSIVE_LINK_PASS_ROLES
+    if not _observability_sink_is_source_safe(root, policy):
+        with suppress_observability():
+            return _build_source_tree_manifest_impl(
+                root,
+                policy=policy,
+                timeout_seconds=timeout_seconds,
+                progress=progress,
+                progress_label=progress_label,
+                progress_interval_seconds=progress_interval_seconds,
+                suppress_worker_observability=True,
+                require_exclusive_links=exclusive_links,
+            )
+
+    operation_id = new_observability_id("source-manifest")
+    started = time.monotonic()
+    before = process_resource_snapshot()
+    emit_observability_event(
+        "source.manifest.start",
+        operationId=operation_id,
+        label=progress_label,
+        passRole=str(pass_role or progress_label),
+        workers=_source_hash_workers(),
+        timeoutSeconds=int(timeout_seconds),
+        policyKey=policy.key,
+    )
+    try:
+        manifest = _build_source_tree_manifest_impl(
+            root,
+            policy=policy,
+            timeout_seconds=timeout_seconds,
+            progress=progress,
+            progress_label=progress_label,
+            progress_interval_seconds=progress_interval_seconds,
+            require_exclusive_links=exclusive_links,
+        )
+    except BaseException as exc:
+        after = process_resource_snapshot()
+        emit_observability_event(
+            "source.manifest.finish",
+            operationId=operation_id,
+            label=progress_label,
+            passRole=str(pass_role or progress_label),
+            workers=_source_hash_workers(),
+            outcome="exception",
+            durationMs=max(0, int((time.monotonic() - started) * 1000)),
+            cpuMs=max(0, after.cpu_ms - before.cpu_ms),
+            rssBytes=after.rss_bytes,
+            peakRssBytes=after.peak_rss_bytes,
+            errorType=type(exc).__name__,
+        )
+        raise
+    after = process_resource_snapshot()
+    emit_observability_event(
+        "source.manifest.finish",
+        operationId=operation_id,
+        label=progress_label,
+        passRole=str(pass_role or progress_label),
+        workers=_source_hash_workers(),
+        outcome="passed",
+        manifestKey=manifest.key,
+        fileCount=manifest.file_count,
+        directoryCount=manifest.directory_count,
+        byteCount=manifest.byte_count,
+        durationMs=max(0, int((time.monotonic() - started) * 1000)),
+        cpuMs=max(0, after.cpu_ms - before.cpu_ms),
+        rssBytes=after.rss_bytes,
+        peakRssBytes=after.peak_rss_bytes,
+    )
+    return manifest
+
+
+def capture_source_snapshot(
+    project_dir: Path,
+    *,
+    policy: Optional[SourceInputPolicy] = None,
+    timeout_seconds: int = 1800,
+    progress: Optional[ProgressCallback] = None,
+    progress_interval_seconds: int = 15,
+) -> SourceSnapshot:
+    capture_root, _project_relative, _git_head = _subject_layout(project_dir)
+    if policy is None:
+        from scoped_source_policy import policy_for_project
+        policy = policy_for_project(project_dir, capture_root)
+    if not _observability_sink_is_source_safe(capture_root, policy):
+        with suppress_observability():
+            return _capture_source_snapshot_impl(
+                project_dir,
+                policy=policy,
+                timeout_seconds=timeout_seconds,
+                progress=progress,
+                progress_interval_seconds=progress_interval_seconds,
+            )
+
+    operation_id = new_observability_id("source-capture")
+    started = time.monotonic()
+    before = process_resource_snapshot()
+    emit_observability_event(
+        "source.capture.start",
+        operationId=operation_id,
+        timeoutSeconds=int(timeout_seconds),
+        policyKey=policy.key,
+    )
+    try:
+        snapshot = _capture_source_snapshot_impl(
+            project_dir,
+            policy=policy,
+            timeout_seconds=timeout_seconds,
+            progress=progress,
+            progress_interval_seconds=progress_interval_seconds,
+        )
+    except BaseException as exc:
+        after = process_resource_snapshot()
+        emit_observability_event(
+            "source.capture.finish",
+            operationId=operation_id,
+            outcome="exception",
+            durationMs=max(0, int((time.monotonic() - started) * 1000)),
+            cpuMs=max(0, after.cpu_ms - before.cpu_ms),
+            rssBytes=after.rss_bytes,
+            peakRssBytes=after.peak_rss_bytes,
+            errorType=type(exc).__name__,
+        )
+        raise
+    after = process_resource_snapshot()
+    emit_observability_event(
+        "source.capture.finish",
+        operationId=operation_id,
+        outcome="passed",
+        sourceSnapshotKey=snapshot.key,
+        manifestKey=snapshot.manifest_key,
+        policyKey=snapshot.policy_key,
+        fileCount=snapshot.file_count,
+        directoryCount=snapshot.directory_count,
+        byteCount=snapshot.byte_count,
+        materializationMethod=snapshot.materialization_method,
+        gitHead=bool(snapshot.git_head),
+        durationMs=max(0, int((time.monotonic() - started) * 1000)),
+        cpuMs=max(0, after.cpu_ms - before.cpu_ms),
+        rssBytes=after.rss_bytes,
+        peakRssBytes=after.peak_rss_bytes,
+    )
+    return snapshot
+def open_source_snapshot(
+    container: Path,
+    *,
+    expected_key: str = "",
+    timeout_seconds: int = 1800,
+    allow_build_upgrade: bool = False,
+    progress: Optional[ProgressCallback] = None,
+) -> SourceSnapshot:
+    """Validate durable bytes; foreign-build input is opt-in, never proof."""
+    container = container.expanduser().resolve()
+    manifest_path = container / "manifest.json"
+    root = container / "tree"
+    try:
+        raw = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError, TypeError) as exc:
+        raise SourceCaptureError(
+            f"SOURCE_SNAPSHOT_MANIFEST_INVALID: {manifest_path}: {exc}"
+        ) from exc
+    if (
+        not isinstance(raw, dict)
+        or int(raw.get("schemaVersion", 0) or 0) != 1
+        or raw.get("type") != "deploom-source-snapshot"
+    ):
+        raise SourceCaptureError("SOURCE_SNAPSHOT_MANIFEST_SCHEMA_INVALID")
+
+    key = str(raw.get("sourceSnapshotKey") or "")
+    manifest_key = str(raw.get("manifestKey") or "")
+    policy_key = str(raw.get("policyKey") or "")
+    current_build_id = tool_build_id()
+    producer_build_id = raw.get("toolBuildId")
+    if not isinstance(producer_build_id, str) or not producer_build_id:
+        raise SourceCaptureError("SOURCE_SNAPSHOT_TOOL_BUILD_INVALID")
+    if producer_build_id != current_build_id and not allow_build_upgrade:
+        raise SourceCaptureError(
+            "SOURCE_SNAPSHOT_TOOL_BUILD_MISMATCH: "
+            f"expected={current_build_id}; observed={raw.get('toolBuildId')}"
+        )
+    if expected_key and key != expected_key:
+        raise SourceCaptureError(
+            "SOURCE_SNAPSHOT_KEY_MISMATCH: "
+            f"expected={expected_key}; observed={key}"
+        )
+    from scoped_source_policy import policy_from_payload
+    policy = policy_from_payload(raw.get("inputPolicy"))
+    if policy_key != policy.key:
+        raise SourceCaptureError(
+            f"SOURCE_SNAPSHOT_POLICY_UNSUPPORTED: {policy_key}"
+        )
+
+    relative_text = str(raw.get("projectRelative") or ".")
+    relative = Path(relative_text)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise SourceCaptureError(
+            f"SOURCE_SNAPSHOT_PROJECT_RELATIVE_INVALID: {relative_text}"
+        )
+    if not root.is_dir():
+        from snapshot_compaction import has_packed_source, restore
+        if has_packed_source(container):
+            try:
+                restore(container, progress=progress or (lambda path: None))
+            except StorageCapacityError:
+                raise
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                raise SourceCaptureError(f"SOURCE_SNAPSHOT_PACKED_INVALID: {container}: {exc}") from exc
+        if not root.is_dir():
+            raise SourceCaptureError(f"SOURCE_SNAPSHOT_TREE_MISSING: {root}")
+    project_path = (root / relative).resolve()
+    if not _within(project_path, root) or not project_path.is_dir():
+        raise SourceCaptureError(
+            f"SOURCE_SNAPSHOT_PROJECT_MISSING: {relative_text}"
+        )
+
+    _validate_git_layout(root, policy=policy)
+    observed = build_source_tree_manifest(
+        root,
+        policy=policy,
+        timeout_seconds=timeout_seconds,
+        progress=progress,
+        progress_label="durable source snapshot validation",
+    )
+    # Content manifests also include the producer build. Recompute that
+    # identity from freshly hashed bytes, never by replacing the stored build.
+    producer_manifest_key = _canonical_hash({
+        "schema": SOURCE_SNAPSHOT_SCHEMA, "toolBuildId": producer_build_id,
+        "policyKey": policy_key, "entries": list(observed.entries),
+    }, length=64)
+    if producer_manifest_key != manifest_key:
+        raise SourceCaptureError(
+            "SOURCE_SNAPSHOT_CONTENT_MISMATCH: "
+            f"expected={manifest_key}; observed={producer_manifest_key}"
+        )
+    recomputed_key = _canonical_hash({
+        "schema": SOURCE_SNAPSHOT_SCHEMA,
+        "toolBuildId": producer_build_id,
+        "policyKey": policy_key,
+        "manifestKey": producer_manifest_key,
+        "projectRelative": relative.as_posix() or ".",
+    }, length=32)
+    if recomputed_key != key:
+        raise SourceCaptureError(
+            "SOURCE_SNAPSHOT_IDENTITY_MISMATCH: "
+            f"expected={key}; observed={recomputed_key}"
+        )
+
+    return SourceSnapshot(
+        original_project_path=project_path,
+        capture_root=root,
+        project_relative=relative,
+        container=container,
+        root=root,
+        project_path=project_path,
+        key=key,
+        manifest_key=observed.key,
+        policy_key=policy_key,
+        file_count=observed.file_count,
+        directory_count=observed.directory_count,
+        byte_count=observed.byte_count,
+        materialization_method=str(raw.get("materializationMethod") or "durable"),
+        git_head=str(raw.get("gitHead") or ""),
+        git_root=str(root) if raw.get("gitHead") else "",
+        created_at=float(raw.get("createdAt") or manifest_path.stat().st_mtime),
+        input_policy=policy,
+    )
+
+
+def persist_source_snapshot(
+    snapshot: SourceSnapshot,
+    destination: Path,
+    *,
+    timeout_seconds: int = 1800,
+    progress: Optional[ProgressCallback] = None,
+    _consume: bool = False,
+) -> SourceSnapshot:
+    """Atomically publish an active snapshot as durable evidence.
+
+    A call-owned capture can be consumed by same-volume rename; shared active
+    snapshots retain their existing independent-copy semantics.
+    """
+    deadline = float("inf") if timeout_seconds == 0 else time.monotonic() + max(1, timeout_seconds)
+    validate_source_snapshot(snapshot, timeout_seconds=_remaining(deadline), progress=progress)
+    destination = destination.expanduser().resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        raise SourceCaptureError(
+            f"SOURCE_SNAPSHOT_DESTINATION_EXISTS: {destination}"
+        )
+    if _consume:
+        # Only capture_durable_source_snapshot owns this temporary container.
+        # Close directory handles before renaming on Windows. Full destination
+        # validation remains mandatory, including after a successful rename.
+        _retire_snapshot_watcher(snapshot)
+        _retire_live_source_watcher(snapshot)
+        try:
+            os.rename(snapshot.container, destination)
+        except OSError as exc:
+            import errno
+            if exc.errno != errno.EXDEV and getattr(exc, "winerror", None) != 17:
+                raise
+        else:
+            _ALL_CONTAINERS.discard(snapshot.container)
+            if progress:
+                progress(f"durable source snapshot: same-volume promotion; copiedFiles=0; avoidedCopyBytes={snapshot.byte_count}")
+            return open_source_snapshot(destination, expected_key=snapshot.key,
+                timeout_seconds=_remaining(deadline), progress=progress)
+    from storage_capacity import require_capacity
+    require_capacity(destination, snapshot.byte_count, "durable snapshot")
+    stage = Path(tempfile.mkdtemp(
+        prefix=f".{destination.name}.tmp-",
+        dir=str(destination.parent),
+    ))
+    try:
+        copied_files = copied_bytes = 0
+        last_report = time.monotonic()
+        def copy_with_progress(source, target):
+            nonlocal copied_files, copied_bytes, last_report
+            _remaining(deadline)
+            result = shutil.copy2(source, target)
+            _remaining(deadline)
+            copied_files += 1
+            copied_bytes += os.stat(source).st_size
+            now = time.monotonic()
+            if progress is not None and now - last_report >= 15:
+                progress(f"durable source snapshot copy: files={copied_files}, bytes={copied_bytes}")
+                last_report = now
+            return result
+        if progress:
+            progress("durable source snapshot copy: started")
+        shutil.copytree(
+            snapshot.container,
+            stage,
+            dirs_exist_ok=True,
+            symlinks=True,
+            copy_function=copy_with_progress,
+        )
+        if progress:
+            progress(f"durable source snapshot copy: ready; files={copied_files}, bytes={copied_bytes}")
+        open_source_snapshot(
+            stage,
+            expected_key=snapshot.key,
+            timeout_seconds=_remaining(deadline),
+            progress=progress,
+        )
+        os.replace(stage, destination)
+        return open_source_snapshot(
+            destination,
+            expected_key=snapshot.key,
+            timeout_seconds=_remaining(deadline),
+            progress=progress,
+        )
+    except Exception:
+        shutil.rmtree(stage, ignore_errors=True)
+        raise
+
+
+def capture_durable_source_snapshot(
+    project_dir: Path,
+    destination: Path,
+    *,
+    policy: Optional[SourceInputPolicy] = None,
+    timeout_seconds: int = 1800,
+    progress: Optional[ProgressCallback] = None,
+) -> SourceSnapshot:
+    deadline = float("inf") if timeout_seconds == 0 else time.monotonic() + max(1, timeout_seconds)
+    from source_snapshot_storage import prefer_snapshot_parent
+    destination_parent = destination.expanduser().resolve().parent
+    # Destination-local temporary captures must remain discoverable after a
+    # crash, just like verification-root temporaries. Existing dead-owner,
+    # age, link and bounded-work guards remain authoritative.
+    reap_orphaned_source_snapshots(additional_parents=(destination_parent,))
+    with prefer_snapshot_parent(destination_parent):
+        snapshot = capture_source_snapshot(
+            project_dir,
+            policy=policy,
+            timeout_seconds=_remaining(deadline),
+            progress=progress,
+        )
+    try:
+        return persist_source_snapshot(
+            snapshot, destination, timeout_seconds=_remaining(deadline), progress=progress, _consume=True,
+        )
+    finally:
+        # This capture is private to this call. The published durable copy has
+        # its own identity; keeping the temporary 4+ GiB tree until exit is waste.
+        _retire_snapshot_watcher(snapshot)
+        _force_rmtree(snapshot.container)
+        _ALL_CONTAINERS.discard(snapshot.container)
+
+
+def _main() -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="DepLoom sealed SourceSnapshot")
+    parser.add_argument("--capture-durable", metavar="PROJECT")
+    parser.add_argument("--destination")
+    parser.add_argument("--timeout-seconds", type=int, default=1800)
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args()
+    if not args.capture_durable:
+        parser.error("--capture-durable is required")
+    if not args.destination:
+        parser.error("--destination is required")
+    snapshot = capture_durable_source_snapshot(
+        Path(args.capture_durable),
+        Path(args.destination),
+        timeout_seconds=args.timeout_seconds,
+    )
+    result = {
+        "sourceSnapshotLocator": str(snapshot.container),
+        "sourceSnapshotKey": snapshot.key,
+        "toolBuildId": tool_build_id(),
+        "projectRelative": snapshot.project_relative.as_posix() or ".",
+        "manifestKey": snapshot.manifest_key,
+        "fileCount": snapshot.file_count,
+        "byteCount": snapshot.byte_count,
+    }
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

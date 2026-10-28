@@ -1,0 +1,6249 @@
+#!/usr/bin/env python3
+"""Iterative (накопительная) dependency migration coordinator core.
+
+Python owns the deterministic planner/materializer/verifier and the durable
+run/checkpoint/candidate/feedback state.  The Desktop coordinator decides WHEN
+to call each step and dispatches the repair/feedback agent; every step here is a
+bounded, idempotent CLI operation over ONE durable run directory.
+
+Identity/authority contract (shared with desktop/electron/iterative-migration.ts):
+
+  * Checkpoints are immutable and content-addressed by snapshot keys; the parent
+    chain C0 -> C1 -> ... is never rewritten.  Acceptance is an atomic pointer
+    switch (write checkpoint, then update run.json) under a single-writer lock.
+  * A candidate is an exact full assignment on top of one base checkpoint.
+    "Resolver success", agent prose, a snapshot and the absence of NEW errors are
+    NOT PROJECT_VERIFIED.  Only verify-exact's authoritative `verify_assignment`
+    run over the repaired bytes may accept a checkpoint.
+  * AgentFeedback is typed (REPAIRING / READY_FOR_VERIFY /
+    NEEDS_COHORT_EXPANSION / NEEDS_ALTERNATIVE / INCONCLUSIVE / INFRA_BLOCKED),
+    bound to run/candidate/base checkpoint/attempt identities; a stale reply is
+    rejected.  It controls scheduling, never proof.
+
+This module does NOT launch agents, does NOT wait for human dialogs and does NOT
+own the agent provider.  It reuses existing primitives (ProgressiveExtensionPlan,
+verify_assignment, durable SourceSnapshot containers, _apply_assignment,
+build_repair_request, manual_dependency_audit) instead of a second solver or a
+competing store of truth.
+"""
+from __future__ import annotations
+
+import argparse
+import contextvars
+import dataclasses
+import hashlib
+import json
+import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import time
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+
+try:  # pragma: no cover - import parity with project_runtime
+    from semantic_version import Version  # type: ignore
+except Exception:  # pragma: no cover
+    Version = None  # type: ignore
+
+from baseline_constraint_verifier import (
+    BaselineVerifyConfig,
+    BaselineVerifyResult,
+    _apply_assignment,
+    _validate_assignment_materialization,
+    _run,
+    assignment_fingerprint,
+    detect_package_manager,
+    discover_baseline_project_checks,
+    is_structural_project_failure,
+    observed_resolved_assignment,
+    observed_resolved_hash,
+    resolve_executable,
+    project_check_command_argv,
+    structural_project_failure_signatures,
+    verify_assignment,
+)
+from baseline_repair_handoff import build_repair_request
+from iterative_progress import MigrationProgress
+from migration_validation import digest as validation_digest, validate_profile, verify_initial_control, validate_baseline_reference
+from verification_proof import is_fixed_manifest_spec
+from iterative_target_deferrals import record_unavailable_targets, unavailable_targets
+from iterative_registry_metadata import NpmDiscoveryMetadata
+from iterative_registry_yarn import modern_yarn_root, normalize_yarn_packument, normalize_yarn_alternative
+from iterative_restart import TRANSACTION as RESTART_TRANSACTION, RestartArchiveError, archive_for_restart, recover_restart_archive
+from package_manager_profile import (
+    install_args_for_profile,
+    resolve_package_manager_profile,
+)
+from project_topology import ProjectTopologyError, resolve_project_topology
+from resolution_inventory import ResolutionInventory, canonical_lockfile_path, npm_lock_resolved_version
+from storage_capacity import StorageCapacityError
+from source_snapshot import (
+    SourceCaptureError,
+    SourceSnapshot,
+    bind_source_snapshot,
+    capture_durable_source_snapshot,
+    capture_source_snapshot,
+    incomplete_submodules,
+    open_source_snapshot,
+)
+from verification_workspace_backend import materialize_private_tree
+from prepared_workspace_fastpath import apply_tree_write_protection
+
+SCHEMA_VERSION = 1
+AUTHORITY = "ITERATIVE_MIGRATION_ORCHESTRATION"
+
+# Machine-readable progress event emitted on stdout (never the only transport:
+# the durable step result files are the transport, stdout is progress).
+STATUS_EVENT = "ITERATIVE_MIGRATION_STATUS_V1"
+
+FEEDBACK_KINDS = {
+    "REPAIRING",
+    "READY_FOR_VERIFY",
+    "NEEDS_COHORT_EXPANSION",
+    "NEEDS_ALTERNATIVE",
+    "INCONCLUSIVE",
+    "INFRA_BLOCKED",
+}
+
+PHASES = {
+    "BASELINING",
+    "BOOTSTRAP_REPAIR",
+    "PLANNING",
+    "MATERIALIZING",
+    "PRECHECK",
+    "REPAIRING",
+    "VERIFYING",
+    "CHECKPOINTING",
+    "READY",
+    "TERMINAL",
+}
+
+TERMINALS = {
+    "COMPLETE",
+    "PARTIAL_VERIFIED",
+    "STOPPED_WITH_CHECKPOINT",
+    "BLOCKED_BASELINE",
+    "BLOCKED_INFRA",
+    "NO_VERIFIED_UPGRADE",
+}
+
+CANDIDATE_STAGES = {
+    "PLANNED",
+    "MATERIALIZED",
+    "PRECHECKED",
+    "REPAIRING",
+    "VERIFYING",
+    "ACCEPTED",
+    "REJECTED",
+}
+
+# Files the agent may never touch in the isolated trial.  Dependency state is
+# immutable for the agent; the controller is the only writer.
+FORBIDDEN_TRIAL_RELATIVES = {
+    "package.json",
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "npm-shrinkwrap.json",
+    ".npmrc",
+    ".yarnrc",
+    ".yarnrc.yml",
+    ".pnpmfile.cjs",
+}
+
+# Declared dependency sections applied by exact assignment materialization.
+DEPENDENCY_SECTIONS = (
+    "dependencies",
+    "devDependencies",
+    "optionalDependencies",
+    "peerDependencies",
+)
+
+
+class IterativeMigrationError(RuntimeError):
+    """Base domain error with a machine-readable code."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+class StaleFeedbackError(IterativeMigrationError):
+    def __init__(self, message: str) -> None:
+        super().__init__("STALE_FEEDBACK", message)
+
+
+class InvalidInputError(IterativeMigrationError):
+    def __init__(self, message: str) -> None:
+        super().__init__("INVALID_INPUT", message)
+
+
+class ProjectUnreadyError(IterativeMigrationError):
+    """A fixable local readiness blocker found BEFORE the expensive phases.
+
+    ``code`` is the durable machine-readable blocker (e.g.
+    SOURCE_SUBMODULE_INCOMPLETE); ``command`` is the exact Git command for the
+    confirmed repository root, offered to the user but NEVER executed
+    automatically — it may touch private Git and alters the checkout.
+    """
+
+    def __init__(self, code: str, message: str, command: str = "") -> None:
+        super().__init__(code, message)
+        self.command = command
+        self.fixable = True
+
+
+class BudgetExceededError(IterativeMigrationError):
+    def __init__(self, message: str) -> None:
+        super().__init__("BUDGET_EXCEEDED", message)
+
+
+class TrialLockedError(IterativeMigrationError):
+    def __init__(self, message: str) -> None:
+        super().__init__("TRIAL_LOCKED", message)
+
+
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 256), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _stable_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _new_id(prefix: str) -> str:
+    return f"{prefix}-{uuid.uuid4().hex[:12]}"
+
+
+def _emit_status(event: Mapping[str, Any]) -> None:
+    print(f"{STATUS_EVENT} {json.dumps(dict(event), ensure_ascii=False, separators=(',', ':'))}")
+    sys_stdout_flush()
+
+
+def sys_stdout_flush() -> None:
+    try:
+        import sys
+
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+
+def _clamp_int(value: Any, default: int, low: int, high: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(low, min(parsed, high))
+
+
+# ---------------------------------------------------------------------------
+# Run directory layout and locking (one writer per project)
+# ---------------------------------------------------------------------------
+
+RUN_FILENAME = "run.json"
+LEDGER_FILENAME = "ledger.json"
+CONFIG_FILENAME = "run-config.json"
+# P1#4: the standalone "Проверить проект" verdict. Written by begin --check-only
+# (a real prep AND control verification of the CURRENT dependencies) WITHOUT a
+# run: no run.json/snapshot/checkpoint are created, so the later "Начать
+# обновление" begin is a fresh run. The status handler exposes its `ok` so the
+# UI can offer a distinct "ready → start" state instead of a single button that
+# silently starts the migration.
+PROJECT_CHECK_FILENAME = "project-check.json"
+CHECKPOINT_DIR = "checkpoints"
+SOURCE_DIR = "sources"
+TRIAL_DIR = "trial"
+TRIAL_CANDIDATE_FILENAME = "candidate.json"
+TRIAL_WORKSPACE = "workspace"
+BOOTSTRAP_DIR = "bootstrap"
+REPAIR_REQUESTS_FILENAME = "repair-requests.json"
+REPORTS_DIR = "reports"
+AUDIT_DIR = "audit"
+LOCK_FILENAME = "run.lock"
+# P1 (v0.2.163 #1/#2): the durable handoff between a finished repair run and
+# the NEXT migration. `archive-repair-run` writes it and keeps the repaired C0
+# source snapshot (sources/C0) in place; `begin --adopt-repair-source` consumes
+# it so the new migration continues from the VERIFIED FIXED bytes instead of
+# re-capturing the still-red developer checkout. The archive itself is a
+# recoverable transaction: an interrupted archive rolls back — it must never
+# leave run.json archived while a checkpoint or the source snapshot is not.
+REPAIR_HANDOFF_FILENAME = "repair-handoff.json"
+REPAIR_ARCHIVE_DIR = "repair-archive"
+REPAIR_ARCHIVE_TRANSACTION = "repair-archive-transaction.json"
+# Machine-readable result envelope for the archive step (Electron parses it).
+ARCHIVE_RESULT_EVENT = "ITERATIVE_ARCHIVE_RESULT_V1"
+
+
+def _trial_dir(run_dir: Path) -> Path:
+    return run_dir / TRIAL_DIR
+
+
+def _checkpoint_path(run_dir: Path, checkpoint_id: str) -> Path:
+    return run_dir / CHECKPOINT_DIR / f"{checkpoint_id}.json"
+
+
+def _write_json_atomic(path: Path, value: Any) -> None:
+    from iterative_state_transaction import stage_write
+    if stage_write(path, value):
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + f".tmp-{os.getpid()}-{uuid.uuid4().hex}")
+    try:
+        with tmp.open('w', encoding='utf-8', newline='\n') as stream:
+            stream.write(_stable_json(value) + '\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        for attempt in range(10):
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError as exc:
+                # Windows readers/scanners can briefly deny replacement. Never
+                # delete the old durable state or reinterpret a permanent ACL.
+                if getattr(exc, "winerror", None) not in (5, 32, 33) or attempt == 9:
+                    raise
+                time.sleep(min(0.02 * (2 ** attempt), 0.2))
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _read_json(path: Path, *, required: bool = True) -> Optional[Dict[str, Any]]:
+    from iterative_state_transaction import staged_read
+    staged, value = staged_read(path)
+    if staged:
+        return value
+    if not path.exists():
+        if required:
+            raise InvalidInputError(f"STATE_FILE_MISSING: {path}")
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError) as exc:
+        raise InvalidInputError(f"STATE_FILE_INVALID: {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise InvalidInputError(f"STATE_FILE_NOT_OBJECT: {path}")
+    return value
+
+
+def _process_owner_dead(pid: int) -> bool:
+    """Reclaim a killed writer without signalling a Windows process."""
+    if pid <= 0:
+        return False
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            pass
+        return False
+    import ctypes
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = kernel.OpenProcess(0x1000, False, pid)
+    if not handle:
+        return ctypes.get_last_error() == 87  # nonexistent PID; denied is not dead
+    try:
+        code = wintypes.DWORD()
+        return bool(kernel.GetExitCodeProcess(handle, ctypes.byref(code))) and code.value != 259
+    finally:
+        kernel.CloseHandle(handle)
+
+
+class _RunLock:
+    """Cross-process single-writer lock with stale-owner reclaim (lease)."""
+
+    def __init__(self, run_dir: Path, owner: str, stale_seconds: int = 120) -> None:
+        self.path = run_dir / LOCK_FILENAME
+        self.owner = owner
+        self.stale_seconds = stale_seconds
+
+    def acquire(self) -> None:
+        from run_writer_lock import acquire
+        try:
+            self._lease = acquire(self.path, self.owner, self._stale)
+        except TimeoutError as exc:
+            raise TrialLockedError(str(exc)) from exc
+        except OSError as exc:
+            raise IterativeMigrationError('RUN_LOCK_FILE_IO', str(exc)) from exc
+
+    def _stale(self) -> bool:
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8-sig"))
+            owner = str(payload.get("owner") or "")
+            pid = int(payload.get("pid") or 0)
+            if pid > 0:
+                # A slow living verifier still owns the lock after two minutes.
+                # Desktop restart must not archive files beneath an orphan child.
+                return _process_owner_dead(pid)
+            started = str(payload.get("startedAt") or "")
+            started_at = time.strptime(started, "%Y-%m-%dT%H:%M:%SZ")
+            age = time.time() - time.mktime(started_at)
+            return age > self.stale_seconds
+        except Exception:
+            try:
+                age = time.time() - self.path.stat().st_mtime
+                return age > self.stale_seconds
+            except OSError:
+                return False
+
+    def release(self) -> None:
+        from run_writer_lock import release
+        lease = getattr(self, '_lease', None)
+        self._lease = None
+        release(self.path, lease)
+
+
+# ---------------------------------------------------------------------------
+# Durable state objects (versioned, validated)
+# ---------------------------------------------------------------------------
+
+def _require_schema(value: Mapping[str, Any], kind: str) -> None:
+    schema = value.get("schemaVersion")
+    if int(schema or -1) != SCHEMA_VERSION:
+        raise InvalidInputError(
+            f"SCHEMA_MISMATCH_{kind}: expected schemaVersion={SCHEMA_VERSION} "
+            f"observed={schema!r}"
+        )
+
+
+def load_run(run_dir: Path) -> Dict[str, Any]:
+    run = _read_json(run_dir / RUN_FILENAME)
+    _require_schema(run, "RUN")
+    if not str(run.get("runId") or "").strip():
+        raise InvalidInputError("RUN_ID_MISSING")
+    return run
+
+
+def save_run(run_dir: Path, run: Mapping[str, Any]) -> None:
+    _write_json_atomic(run_dir / RUN_FILENAME, dict(run))
+
+
+def load_checkpoint(run_dir: Path, checkpoint_id: str) -> Dict[str, Any]:
+    value = _read_json(_checkpoint_path(run_dir, checkpoint_id))
+    _require_schema(value, "CHECKPOINT")
+    return value
+
+
+def save_checkpoint(run_dir: Path, checkpoint: Mapping[str, Any]) -> None:
+    checkpoint_id = str(checkpoint.get("checkpointId") or "")
+    if not checkpoint_id:
+        raise InvalidInputError("CHECKPOINT_ID_MISSING")
+    _write_json_atomic(_checkpoint_path(run_dir, checkpoint_id), dict(checkpoint))
+
+
+def load_ledger(run_dir: Path) -> Dict[str, Any]:
+    value = _read_json(run_dir / LEDGER_FILENAME, required=False) or {}
+    if int(value.get("schemaVersion") or 0) != SCHEMA_VERSION:
+        value = {
+            "schemaVersion": SCHEMA_VERSION,
+            "blocks": [],
+            "deferrals": [],
+            "feedback": [],
+            "counters": {},
+        }
+    return value
+
+
+def save_ledger(run_dir: Path, ledger: Mapping[str, Any]) -> None:
+    _write_json_atomic(run_dir / LEDGER_FILENAME, dict(ledger))
+
+
+def load_config(run_dir: Path) -> Dict[str, Any]:
+    value = _read_json(run_dir / CONFIG_FILENAME)
+    if int(value.get("schemaVersion") or -1) != SCHEMA_VERSION:
+        raise InvalidInputError("SCHEMA_MISMATCH_CONFIG")
+    return value
+
+
+def save_config(run_dir: Path, config: Mapping[str, Any]) -> None:
+    if int(config.get("schemaVersion") or -1) != SCHEMA_VERSION:
+        raise InvalidInputError("SCHEMA_MISMATCH_CONFIG")
+    _write_json_atomic(run_dir / CONFIG_FILENAME, dict(config))
+
+
+def load_candidate(run_dir: Path) -> Optional[Dict[str, Any]]:
+    value = _read_json(_trial_dir(run_dir) / TRIAL_CANDIDATE_FILENAME, required=False)
+    if value is None:
+        return None
+    _require_schema(value, "CANDIDATE")
+    return value
+
+
+def save_candidate(run_dir: Path, candidate: Mapping[str, Any]) -> None:
+    _write_json_atomic(_trial_dir(run_dir) / TRIAL_CANDIDATE_FILENAME, dict(candidate))
+
+
+def clear_candidate(run_dir: Path) -> None:
+    candidate_path = _trial_dir(run_dir) / TRIAL_CANDIDATE_FILENAME
+    if candidate_path.exists():
+        try:
+            os.unlink(candidate_path)
+        except OSError:
+            pass
+
+
+def trial_workspace_root(run_dir: Path) -> Path:
+    return _trial_dir(run_dir) / TRIAL_WORKSPACE
+
+
+def bootstrap_workspace_root(run_dir: Path) -> Path:
+    """Version-neutral C0 repair workspace: a private materialization of the C0
+    source snapshot (original, un-modified dependencies). The source/config
+    repair agent works HERE, never on the developer checkout."""
+    return _trial_dir(run_dir) / BOOTSTRAP_DIR
+
+
+def read_repair_requests(run_dir: Path) -> List[Dict[str, Any]]:
+    value = _read_json(run_dir / REPAIR_REQUESTS_FILENAME, required=False)
+    if not value:
+        return []
+    requests = value.get("requests")
+    if not isinstance(requests, list):
+        return []
+    return [item for item in requests if isinstance(item, dict)]
+
+
+def write_repair_requests(run_dir: Path, requests: Sequence[Mapping[str, Any]]) -> None:
+    if requests:
+        _write_json_atomic(
+            run_dir / REPAIR_REQUESTS_FILENAME, {"requests": list(requests)}
+        )
+    else:
+        path = run_dir / REPAIR_REQUESTS_FILENAME
+        if path.exists():
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
+def run_budget_ok(run_config: Mapping[str, Any], run: Mapping[str, Any]) -> bool:
+    deadline = run.get("deadlineAt")
+    if not deadline:
+        return True
+    try:
+        # _deadline_iso writes UTC ("...Z"); parse it as UTC explicitly.  Using
+        # time.mktime would interpret the UTC wall-clock as LOCAL time and shift
+        # the deadline by the host's UTC offset, expiring runs prematurely.
+        deadline_at = datetime.strptime(str(deadline), "%Y-%m-%dT%H:%M:%SZ")
+        deadline_epoch = deadline_at.replace(tzinfo=timezone.utc).timestamp()
+        return time.time() < deadline_epoch
+    except (ValueError, TypeError):
+        return True
+
+
+def touch_heartbeat(run_dir: Path, run: Mapping[str, Any]) -> Dict[str, Any]:
+    """Heartbeat records activity WITHOUT moving the deadline."""
+    updated = dict(run)
+    updated["heartbeatAt"] = _now_iso()
+    save_run(run_dir, updated)
+    return updated
+
+
+# ---------------------------------------------------------------------------
+# Project inventory helpers
+# ---------------------------------------------------------------------------
+
+def direct_dependency_assignment(project_dir: Path) -> Dict[str, str]:
+    """Current declared versions of managed direct dependencies (exact spec)."""
+    manifest = json.loads((project_dir / "package.json").read_text(encoding="utf-8-sig"))
+    if not isinstance(manifest, dict):
+        raise InvalidInputError("PROJECT_MANIFEST_INVALID")
+    assignment: Dict[str, str] = {}
+    for section in DEPENDENCY_SECTIONS:
+        deps = manifest.get(section)
+        if not isinstance(deps, dict):
+            continue
+        for name, spec in deps.items():
+            if isinstance(name, str) and isinstance(spec, str) and name not in assignment:
+                assignment[name] = spec
+    # Fixed Git/file/workspace/alias inputs stay in the captured manifest and
+    # proof identity, but must never be sent to the exact-version writer.
+    # Mixed registry/fixed declarations still reach its conflict guard.
+    fixed_only = {
+        name for name in assignment
+        if all(is_fixed_manifest_spec(str(manifest[section][name]))
+               for section in DEPENDENCY_SECTIONS
+               if isinstance(manifest.get(section), dict) and name in manifest[section])
+    }
+    return {name: spec for name, spec in sorted(assignment.items()) if name not in fixed_only}
+
+
+def manifest_and_lock_hashes(project_dir: Path) -> Tuple[str, str, Optional[str]]:
+    manifest = project_dir / "package.json"
+    if not manifest.exists():
+        raise InvalidInputError(f"PROJECT_PACKAGE_JSON_MISSING: {manifest}")
+    manifest_hash = _sha256_file(manifest)
+    # A1/B1: the lockfile that governs the project is the CANONICAL one (the
+    # workspace-shared root lockfile for a member), identical to what the
+    # inventory, topology and install use — never a strictly-local look that
+    # returns nothing for a bare member directory. Changing the root lockfile
+    # must change the identity/migration and delivery guards.
+    lock = canonical_lockfile_path(project_dir)
+    lock_hash = _sha256_file(lock) if lock is not None else ""
+    return manifest_hash, lock_hash, (str(lock) if lock is not None else None)
+
+
+def find_lockfile(project_dir: Path) -> Optional[Path]:
+    """The local lockfile recorded in a project directory, if any.
+
+    Ordered shrinkwrap-first within the npm family and npm-family-first over
+    yarn/pnpm (B2), matching ``project_topology._select_owned_lockfile`` so
+    hashing/identity and planning agree on the canonical record when several
+    lockfile names sit in one directory. This is a strictly local look (the
+    caller's directory) — the workspace-shared root lockfile of a member
+    package is a topology concern resolved where it matters (discovery,
+    ``ResolutionInventory``).
+    """
+    for name in ("npm-shrinkwrap.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml"):
+        candidate = project_dir / name
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _manager_and_install(project_dir: Path) -> Tuple[str, Optional[str], List[str]]:
+    """Return (manager, executable, install args) for the project topology root."""
+    try:
+        topology = resolve_project_topology(
+            project_dir, allow_discovery=False, require_supported=True
+        )
+    except ProjectTopologyError as exc:
+        raise IterativeMigrationError("PROJECT_TOPOLOGY", str(exc)) from exc
+    manager = topology.profile.manager
+    executable = resolve_executable(manager)
+    install = install_args_for_profile(
+        topology.profile,
+        ignore_scripts=True,
+        frozen=False,
+    )
+    return manager, executable, list(install)
+
+
+def _runtime_env(config: Mapping[str, Any]) -> Optional[Dict[str, str]]:
+    """Child env carrying the EXPLICIT project/CI Node runtime, or None when the
+    user left the setting empty (empty never claims CI compatibility)."""
+    runtime = config.get("runtime") or {}
+    node_path = str(runtime.get("nodePath") or "").strip()
+    if not node_path:
+        return None
+    from project_runtime import runtime_env_for_path
+
+    return runtime_env_for_path(node_path)
+
+
+def _runtime_contract_hash(config: Mapping[str, Any]) -> str:
+    """Durable identity of the run's runtime contract ('' when unset)."""
+    runtime = config.get("runtime") or {}
+    return str(runtime.get("contractHash") or "")
+
+
+def _assert_runtime_unchanged(config: Mapping[str, Any]) -> None:
+    """D3.4: a step must not silently continue an old run under a CHANGED
+    runtime. The requested Node is re-resolved against the current installation
+    set; if it no longer maps to the same exact executable+version (the runtime
+    was replaced, upgraded in place, or removed), the step refuses with
+    RUNTIME_CHANGED. Old checkpoints stay on disk, verified under the OLD
+    runtime — evidence is never re-labelled for the new environment."""
+    runtime = config.get("runtime") or {}
+    requested = str(runtime.get("requested") or "").strip()
+    if not requested:
+        return
+    from project_runtime import resolve_requested_node
+
+    resolution = resolve_requested_node(requested)
+    if not resolution.found:
+        raise InvalidInputError(
+            f"RUNTIME_CHANGED: requested Node {requested!r} is no longer installed; "
+            + resolution.unavailable_reason
+        )
+    same_version = resolution.effective_version == str(runtime.get("effectiveVersion") or "")
+    same_node = os.path.normcase(str(resolution.node_path)) == os.path.normcase(str(runtime.get("nodePath") or ""))
+    if not (same_version and same_node):
+        raise InvalidInputError(
+            f"RUNTIME_CHANGED: requested Node {requested!r} resolved to "
+            f"{resolution.effective_version} ({resolution.node_path}) at begin, but now to "
+            f"{resolution.effective_version} ({resolution.node_path}); restart with a new "
+            "begin — the stored checkpoints stay proven under the previous runtime"
+        )
+
+
+def _manager_runtime_identity(project_dir: Path) -> Tuple[str, str]:
+    """(manager, manager_version) for the project topology root; best-effort —
+    an unresolvable manager yields ('', '') rather than failing begin."""
+    try:
+        manager, executable, _install = _manager_and_install(project_dir)
+    except Exception:  # noqa: BLE001 - manager discovery must never block begin
+        return "", ""
+    if not executable:
+        return manager or "", ""
+    try:
+        completed = _run(
+            [executable, "--version"],
+            project_dir,
+            timeout_seconds=15,
+            env={},
+            base_env=os.environ,
+            progress_label="iterative migration manager version probe",
+        )
+    except Exception:  # noqa: BLE001 - version probe is best-effort evidence
+        return manager or "", ""
+    if completed.returncode != 0:
+        return manager or "", ""
+    first = ((completed.stdout or "").strip().splitlines() or [""])[0].strip()
+    return manager or "", first[:64]
+
+
+def _run_install(project_dir: Path, *, timeout_seconds: int, progress_label: str,
+                 runtime_env: Optional[Dict[str, str]] = None, run_deadline_at: str = "",
+                 lockfile_only: bool = False) -> subprocess.CompletedProcess[str]:
+    deadline_epoch = None
+    if run_deadline_at:
+        try:
+            deadline_epoch = datetime.strptime(run_deadline_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+        except (ValueError, TypeError):
+            pass  # Preserve run_budget_ok's legacy malformed-date behavior.
+    def remaining_run_seconds():
+        if deadline_epoch is None:
+            return None
+        remaining = deadline_epoch - time.time()
+        if remaining <= 0:
+            raise BudgetExceededError("RUN_DEADLINE_EXCEEDED")
+        return remaining
+    queue_timeout = remaining_run_seconds()
+    manager, executable, install_args = _manager_and_install(project_dir)
+    if not executable:
+        raise IterativeMigrationError(
+            "INFRA_PACKAGE_MANAGER_NOT_FOUND",
+            f"{manager} is not available in PATH",
+        )
+    env: Dict[str, str] = {
+        "CI": "1",
+        "YARN_ENABLE_IMMUTABLE_INSTALLS": "false",
+        "YARN_ENABLE_SCRIPTS": "false",
+        "npm_config_ignore_scripts": "true",
+        "NX_DAEMON": "false",
+    }
+    base_env = os.environ
+    if runtime_env:
+        base_env = {**base_env, **runtime_env}
+    with MigrationProgress(_emit_status, operation="install", message=f"{progress_label}: installing dependencies") as progress:
+        from cross_process_io import shared_io_slot
+        try:
+            with shared_io_slot("pm", progress=progress, label=progress_label, timeout_seconds=queue_timeout or 0):
+                remaining = remaining_run_seconds()
+                active_timeout = timeout_seconds
+                if remaining is not None:
+                    active_timeout = min(timeout_seconds or remaining, max(1, int(remaining)))
+                if lockfile_only:
+                    from package_manager_profile import lockfile_preflight_args
+                    profile = resolve_project_topology(project_dir, allow_discovery=False, require_supported=True).profile
+                    preflight = lockfile_preflight_args(profile)
+                    if not preflight:
+                        raise IterativeMigrationError("LOCKFILE_ONLY_UNSUPPORTED", profile.family)
+                    started = time.monotonic()
+                    progress(f"{progress_label}: resolving lockfile before dependency materialization")
+                    result = _run([executable, *preflight], project_dir, timeout_seconds=active_timeout,
+                                  env=env, base_env=base_env, progress=progress,
+                                  progress_label="lockfile-only planning (not verification)")
+                    from verification_observability import emit_observability_event
+                    emit_observability_event("planning.lockfile.finish", managerFamily=profile.family,
+                                             exitCode=result.returncode, durationMs=int((time.monotonic()-started)*1000))
+                    return result
+                return _run(
+                    [executable, *install_args],
+                    project_dir,
+                    timeout_seconds=active_timeout,
+                    env=env,
+                    base_env=base_env,
+                    progress=progress,
+                    progress_label=progress_label,
+                )
+        except TimeoutError as exc:
+            if deadline_epoch is not None:
+                raise BudgetExceededError("RUN_DEADLINE_EXCEEDED") from exc
+            raise
+
+
+def verify_config_from(mapping: Mapping[str, Any], run_dir: Path) -> BaselineVerifyConfig:
+    """BaselineVerifyConfig from the run's verifyConfig mapping.
+
+    `from_mapping` covers the numeric/typed fields; proof-cache, telemetry,
+    registry and reuse keys are applied explicitly (they participate in proof
+    identity; the trial's resolved state is shared with the coordinator).
+    """
+    resolved = dict(mapping or {})
+    try:
+        validate_baseline_reference(resolved)
+    except ValueError as exc:
+        raise ProjectUnreadyError("TEST_BASELINE_UNAVAILABLE", str(exc)) from exc
+    # Large workspace installs (especially Yarn node-modules linking on Windows)
+    # can exceed the legacy ten-minute phase cap. Keep explicit caller limits.
+    if "timeoutSeconds" not in resolved and "timeout_seconds" not in resolved:
+        resolved["timeoutSeconds"] = 3600
+    config = BaselineVerifyConfig.from_mapping(resolved)
+    proof_cache_dir = str(
+        (
+            Path(str(resolved.get("proofCacheDir") or (run_dir / "proof-cache").resolve())).expanduser().resolve()
+        )
+    )
+    telemetry_path = str(
+        (
+            Path(str(resolved.get("telemetryPath") or (run_dir / "verification-telemetry.jsonl").resolve())).expanduser().resolve()
+        )
+    )
+    return dataclasses.replace(
+        config,
+        unbounded_preparation=True,
+        project_check_timeout_seconds=(
+            config.project_check_timeout_seconds if config.project_check_timeout_seconds is not None else 0
+        ),
+        registry=str(resolved.get("registry") or ""),
+        telemetry_path=telemetry_path,
+        proof_cache_dir=proof_cache_dir,
+        publish_durable_prepared_artifact=bool(
+            resolved.get("publishDurablePreparedArtifact", True)
+        ),
+        recovery_journal_dir=str((run_dir / "v").resolve()),
+    )
+
+
+def resolve_project_relative(project_dir: Path, source: SourceSnapshot) -> Path:
+    """Return the project-relative path inside a durable snapshot container."""
+    if source.project_relative and str(source.project_relative) != ".":
+        return Path(source.project_relative)
+    try:
+        return project_dir.resolve().relative_to(source.root)
+    except ValueError:
+        return Path(".")
+
+
+# ---------------------------------------------------------------------------
+# begin: C0 «Исходный замер»
+# ---------------------------------------------------------------------------
+
+# P5: cheap LOCAL readiness checks run BEFORE the expensive registry discovery
+# and source snapshot. They share the SAME verification code as the
+# authoritative capture-time check (source_snapshot.incomplete_submodules), so
+# the preflight and capture can never diverge; the capture-time check is kept.
+def project_readiness_preflight(project_dir: Path) -> None:
+    submodule_issues = incomplete_submodules(project_dir)
+    if submodule_issues:
+        state, path = submodule_issues[0]
+        verb = "не инициализирован" if state == "-" else "в конфликтном состоянии"
+        # Git reports paths relative to its root; the project may be nested.
+        command = f'git -C "{project_dir}" submodule update --init --recursive -- ":(top){path}"'
+        raise ProjectUnreadyError(
+            "SOURCE_SUBMODULE_INCOMPLETE",
+            f"Git submodule {path} {verb}. Подготовьте submodule и повторите проверку.",
+            command=command,
+        )
+
+
+def cmd_begin(args: argparse.Namespace) -> int:
+    run_dir = Path(args.run_dir).resolve()
+    owner = args.owner or f"pid-{os.getpid()}"
+    if (run_dir / RUN_FILENAME).exists():
+        raise InvalidInputError(f"RUN_ALREADY_EXISTS: {run_dir}")
+    if getattr(args, "adopt_repair_source", False):
+        # P1 (v0.2.163 #1): the READY run adopts the terminal repair's source —
+        # this is a NORMAL migration, not the repair track; combining the two is
+        # a caller error, never a silent fallback.
+        if getattr(args, "repair_only", False) or getattr(args, "check_only", False):
+            raise InvalidInputError(
+                "ADOPT_CONFLICT: --adopt-repair-source cannot be combined with --repair-only/--check-only"
+            )
+        handoff_path = run_dir / REPAIR_HANDOFF_FILENAME
+        if not handoff_path.exists():
+            raise InvalidInputError(
+                f"REPAIR_HANDOFF_MISSING: no {REPAIR_HANDOFF_FILENAME} under {run_dir} — "
+                "запустите archive-repair-run после завершённого ремонта"
+            )
+        handoff = _read_json(handoff_path)
+        if str(handoff.get("terminal") or "") != "REPAIR_VERIFIED":
+            raise InvalidInputError(
+                "REPAIR_HANDOFF_NOT_VERIFIED: "
+                "только подтверждённый ремонт (REPAIR_VERIFIED) может стать исходником новой миграции"
+            )
+        if handoff.get("adopted"):
+            raise InvalidInputError(
+                "REPAIR_HANDOFF_ALREADY_ADOPTED: исправленные исходники уже перенесены в миграцию"
+            )
+        if handoff.get("superseded"):
+            raise InvalidInputError(
+                "REPAIR_HANDOFF_SUPERSEDED: исправленные исходники устарели — "
+                "проект был переснят заново; начните миграцию обычным begin"
+            )
+        if not handoff.get("source") or not handoff["source"].get("container") or not handoff["source"].get("key"):
+            raise InvalidInputError("REPAIR_HANDOFF_SOURCE_INVALID: handoff не содержит снимок исправленных исходников")
+        adopt = handoff
+    else:
+        adopt = None
+    if getattr(args, "repair_only", False):
+        return _cmd_begin_repair(run_dir, args, owner)
+    if getattr(args, "check_only", False):
+        return _cmd_begin_check_only(run_dir, args, owner)
+
+    lock = _RunLock(run_dir, owner)
+    lock.acquire()
+    try:
+        config = build_run_config(run_dir, args)
+        return _begin_locked(run_dir, config, args, adopt=adopt)
+    finally:
+        lock.release()
+
+
+def _cmd_begin_repair(run_dir: Path, args: argparse.Namespace, owner: str) -> int:
+    # P2 (#1): the repair launch is INDEPENDENT of the update roadmap. It fixes
+    # the CURRENT state: `discover=False` keeps targets empty and skips registry
+    # discovery, so missing roadmap targets can never block a red project from
+    # reaching the isolated repair. `_begin_locked` then captures C0 and runs the
+    # current-state control:
+    #   - a RED verdict opens the durable BOOTSTRAP_REPAIR run + bootstrap repair
+    #     request (isolated checkout -> agent -> authoritative re-verification);
+    #   - a GREEN verdict opens a READY run that the coordinator finishes as
+    #     REPAIR_VERIFIED (control passed, no migration targets in this run).
+    config = build_run_config(run_dir, args, discover=False)
+    config = {**config, "repairOnly": True}
+    lock = _RunLock(run_dir, owner)
+    lock.acquire()
+    try:
+        return _begin_locked(run_dir, config, args)
+    finally:
+        lock.release()
+
+
+# P1#4: a REAL standalone "Проверить проект". Runs the cheap readiness
+# preflight (shared with capture) AND the control verification of the CURRENT
+# dependencies — the same shared machinery begin's C0 uses — then records a
+# durable, non-run verdict (project-check.json). No registry discovery, no
+# run.json, no source snapshot, no checkpoint: the project is verified, NOT
+# migrated. A local blocker (`SOURCE_SUBMODULE_INCOMPLETE`, ...) or a failing
+# current-state control (`PROJECT_CONTROL_FAILED`) exits with the machine
+# envelope so the panel offers "Повторить проверку" after the user fixes it.
+def _cmd_begin_check_only(run_dir: Path, args: argparse.Namespace, owner: str) -> int:
+    # The preflight (inside build_run_config) runs BEFORE any lock / mkdir, so a
+    # blocked check leaves nothing behind (no run dir, no lock file).
+    config = build_run_config(run_dir, args, discover=False)
+    lock = _RunLock(run_dir, owner)
+    lock.acquire()
+    try:
+        return _begin_check_only_locked(run_dir, args, config)
+    finally:
+        lock.release()
+
+
+def _begin_check_only_locked(
+    run_dir: Path, args: argparse.Namespace, config: Optional[Mapping[str, Any]] = None,
+) -> int:
+    if config is None:
+        config = build_run_config(run_dir, args, discover=False)
+    project_dir = Path(config["projectDir"])
+    project_name = str(config["projectName"])
+    initial_assignment = direct_dependency_assignment(project_dir)
+    manifest_hash, lock_hash, _lock_path = manifest_and_lock_hashes(project_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    verify_config = verify_config_from(config["verifyConfig"], run_dir)
+    verify_config = dataclasses.replace(
+        verify_config, verification_purpose="baseline-control"
+    )
+    _emit_status(
+        {
+            "event": "begin.check",
+            "runId": "",
+            "project": project_name,
+            "managedDependencies": len(initial_assignment),
+        }
+    )
+    result = verify_initial_control(
+        project_dir, initial_assignment, run_config=config, run_dir=run_dir,
+        verify_config=verify_config, verifier=verify_assignment,
+        run_project_checks=True,
+        progress_label="iterative migration project check",
+        progress=lambda message: _emit_status({
+            "event": "begin.check-progress", "runId": "", "project": project_name,
+            "message": message,
+        }),
+        runtime_env=_runtime_env(config),
+    )
+    observed = dict(result.observed_resolved_versions or {})
+    result_kind = str(getattr(result, "kind", "") or "")
+    result_summary = str(getattr(result, "summary", "") or "")
+    result_command = str(getattr(result, "command", "") or "")
+    result_output = str(getattr(result, "output", "") or "")[-8192:]
+    failing_commands = [
+        {"command": failure.command, "exitCode": failure.exit_code}
+        for failure in result.project_failures
+    ]
+    # P1#4: this is a PRE-RUN gate, not a C0 checkpoint. Three honest verdicts:
+    #   passed       – the control verification genuinely PASSED → the project is
+    #                  ready ("Проект проверен" is only written here).
+    #   failed       – project-level failures (red current state) →
+    #                  PROJECT_CONTROL_FAILED; the panel offers the repair-agent
+    #                  path, never a false "готово".
+    #   inconclusive – infrastructure / unknown / budget / preparation /
+    #                  dependency: the check could NOT establish a definitive
+    #                  verdict. It is kept INCOMPLETE (ok:false), NEVER written
+    #                  as "Проект проверен", and the panel offers a retry — an
+    #                  infra/unknown outcome must not look like a verified green
+    #                  project just because no *project* command failed.
+    if result.ok:
+        check_ok = True
+        control_status = "passed"
+    elif result_kind == "project" or result.project_failures or is_structural_project_failure(result):
+        check_ok = False
+        control_status = "failed"
+    else:
+        check_ok = False
+        control_status = "inconclusive"
+    project_check: Dict[str, Any] = {
+        "schemaVersion": SCHEMA_VERSION,
+        "projectDir": str(project_dir),
+        "projectName": project_name,
+        "checkedAt": _now_iso(),
+        "ok": check_ok,
+        "validationProfileHash": validation_digest(config.get("validationProfile")) if config.get("validationProfile") else "",
+        "validationScope": config.get("validationScope"),
+        "managedDependencies": len(initial_assignment),
+        "manifestHash": manifest_hash,
+        "control": {
+            "status": control_status,
+            "kind": result_kind,
+            "summary": result_summary,
+            "command": result_command,
+            "output": result_output,
+            "failingCommands": failing_commands,
+            "resolvedStateKey": result.resolved_state_key or "",
+            "observedResolvedHash": result.observed_resolved_hash or observed_resolved_hash(observed),
+        },
+    }
+    _write_json_atomic(run_dir / PROJECT_CHECK_FILENAME, project_check)
+    _emit_status(
+        {
+            "event": "begin.check-done",
+            "runId": "",
+            "ok": check_ok,
+            "managedDependencies": len(initial_assignment),
+        }
+    )
+    if not check_ok:
+        if result_output:
+            _emit_status({"event": "begin.check-output", "runId": "", "project": project_name,
+                          "message": result_output})
+        failing = "; ".join(
+            f"{failure.command} (exit {failure.exit_code})"
+            for failure in result.project_failures[:3]
+        ) or "проверки проекта не проходят"
+        if control_status == "failed":
+            raise ProjectUnreadyError(
+                "PROJECT_CONTROL_FAILED",
+                f"Контроль текущих зависимостей не пройден: {failing}. ",
+                command="",
+            )
+        if "SOURCE_CAPTURE_UNSTABLE" in result_summary:
+            raise ProjectUnreadyError(
+                "SOURCE_CAPTURE_UNSTABLE",
+                "Файлы проекта меняются во время проверки. Остановите сборку или watch/dev-сервер "
+                "и повторите проверку. Проверенный результат сохранён; обновление не запускалось.",
+                command="",
+            )
+        raise ProjectUnreadyError(
+            "PROJECT_CHECK_INCONCLUSIVE",
+            f"Проверка не дала определённого результата ({result.kind}): {result.summary or 'результат неизвестен'} — обновление не запущено. Повторите проверку.",
+            command=result_command,
+        )
+    return 0
+
+
+def build_run_config(run_dir: Path, args: argparse.Namespace, discover: bool = True) -> Dict[str, Any]:
+    project_dir = Path(args.project_dir).expanduser().resolve()
+    if not (project_dir / "package.json").exists():
+        raise InvalidInputError(f"PROJECT_PACKAGE_JSON_MISSING: {project_dir}")
+    # P5: fail fast on local readiness blockers BEFORE registry discovery, the
+    # snapshot and the control verification (the real repro spent ~30s on
+    # discovery only to fail on an uninitialized submodule).
+    project_readiness_preflight(project_dir)
+    project_name = (args.project_name or project_dir.name).strip()
+    target_level = (args.target_level or "yellow").strip().lower()
+    if target_level not in ("yellow", "green"):
+        raise InvalidInputError("TARGET_LEVEL_INVALID")
+
+    verify_raw: Dict[str, Any] = {}
+    if args.verify_config:
+        verify_raw = json.loads(Path(args.verify_config).read_text(encoding="utf-8-sig"))
+        if not isinstance(verify_raw, dict):
+            raise InvalidInputError("VERIFY_CONFIG_INVALID")
+
+    validation_profile = None
+    profile_path = getattr(args, "validation_profile", "")
+    if profile_path:
+        try:
+            validation_profile = validate_profile(json.loads(Path(profile_path).read_text(encoding="utf-8-sig")))
+        except (OSError, ValueError) as exc:
+            raise InvalidInputError(f"VALIDATION_PROFILE_INVALID: {exc}") from exc
+        verify_raw["commands"] = validation_profile["commands"]
+
+    targets: Dict[str, str] = {}
+    if args.targets_file:
+        raw_targets = json.loads(Path(args.targets_file).read_text(encoding="utf-8-sig"))
+        if not isinstance(raw_targets, dict):
+            raise InvalidInputError("TARGETS_FILE_INVALID")
+        for name, version in raw_targets.items():
+            if isinstance(name, str) and isinstance(version, str) and name.strip() and version.strip():
+                targets[name] = version
+
+    intent_path = getattr(args, "intent_file", "")
+    intent = json.loads(Path(intent_path).read_text(encoding="utf-8-sig")) if intent_path else {}
+    if not isinstance(intent, dict):
+        raise InvalidInputError("INTENT_FILE_INVALID")
+    selected_policy = intent.get("acceptancePolicy") or {}
+    if not isinstance(selected_policy, dict):
+        raise InvalidInputError("ACCEPTANCE_POLICY_INVALID")
+    package_policies = intent.get("policies") or {}
+    if not isinstance(package_policies, dict) or any(v not in {"auto", "keep-current", "required"} for v in package_policies.values()):
+        raise InvalidInputError("PACKAGE_POLICIES_INVALID")
+    targets = {n: v for n, v in targets.items() if package_policies.get(n) != "keep-current"}
+
+    # D3: an explicitly requested project/CI Node runtime is resolved to ONE
+    # concrete installed executable+exact-version at begin. Empty means "not
+    # set by the user" — no CI-compatibility claim, no automatic latest; a set
+    # but unavailable version is ENVIRONMENT_UNAVAILABLE, never a PATH fallback.
+    requested_node = (args.requested_node or "").strip()
+    runtime: Dict[str, Any] = {}
+    if requested_node:
+        from project_runtime import resolve_requested_node
+
+        resolution = resolve_requested_node(requested_node)
+        if not resolution.found:
+            raise InvalidInputError(
+                f"ENVIRONMENT_UNAVAILABLE: requested Node {requested_node!r} is not installed; "
+                + resolution.unavailable_reason
+            )
+        runtime = {
+            "requested": requested_node,
+            "effectiveVersion": resolution.effective_version,
+            "nodePath": resolution.node_path,
+            "npmPath": resolution.npm_path,
+            "source": resolution.source,
+            "contractHash": resolution.contract_hash(),
+        }
+        # D3.3: the full runtime contract also pins the package manager and the
+        # executing platform. The durable contractHash covers every field of the
+        # block, so a manager swap or a different OS invalidates the identity.
+        runtime["packageManager"], runtime["packageManagerVersion"] = _manager_runtime_identity(project_dir)
+        runtime["platform"] = sys.platform
+        runtime["arch"] = platform.machine()
+        runtime["hash"] = hashlib.sha256(
+            _stable_json({k: v for k, v in runtime.items() if k != "hash"}).encode("utf-8")
+        ).hexdigest()
+        runtime["contractHash"] = runtime["hash"]
+
+    # #2/P1.2: bounded target discovery when the caller brought NO roadmap
+    # targets (no dashboard-state and no explicit targets file): derive them
+    # from the direct dependency set's registry dist-tags.latest (yellow lag
+    # policy), without the full generator/solver and without inventing a
+    # version. When the run pins a concrete Node, the choice is engine-aware:
+    # a latest known to exclude that Node triggers a bounded search for the
+    # highest COMPATIBLE version instead of a silent deferral. A saved roadmap
+    # still wins when provided.
+    target_discovery: List[Dict[str, Any]] = []
+    if not targets and discover:
+        # D3.1/postfix: the discovery probes must run UNDER the same selected
+        # runtime that install/verify will use (the resolved node's directory
+        # prepended to PATH), never the ambient PATH — otherwise npm metadata
+        # could come from a different toolchain/registry context than the one
+        # the migration actually executes with.
+        discovery_env: Optional[Dict[str, str]] = None
+        if runtime.get("nodePath"):
+            from project_runtime import runtime_env_for_path
+
+            discovery_env = runtime_env_for_path(str(runtime["nodePath"]))
+        # Desktop bring their own budget because a bounded registry discovery is
+        # still the user's explicit choice (L2: no silent 97-package sequential
+        # probe in a blocking IPC). ``getattr`` keeps legacy callers (tests, the
+        # CLI without the new flags) on the single-threaded, unlimited default.
+        discovery_parallelism = int(getattr(args, "discover_parallelism", None) or 1)
+        discovery_timeout_s = max(0, int(getattr(args, "discover_timeout_s", None) or 0))
+        discovery_max_packages = max(0, int(getattr(args, "discover_max_packages", None) or 0))
+
+        def _discovery_progress(processed: int, total: int) -> None:
+            _emit_status(
+                {
+                    "event": "begin.discovery-progress",
+                    "processed": processed,
+                    "total": total,
+                }
+            )
+
+        from iterative_discovery_checkpoint import DiscoveryCheckpoint, discovery_identity
+
+        current = {n: v for n, v in direct_dependency_assignment(project_dir).items()
+                   if package_policies.get(n) != "keep-current"}
+        checkpoint = DiscoveryCheckpoint(
+            run_dir / "preparation-discovery.json",
+            discovery_identity(project_dir, {"current": current, "runtime": runtime,
+                "environment": discovery_env, "intent": intent, "toolBuildId": args.tool_build_id}),
+        )
+        targets, target_discovery = _discover_targets(
+            project_dir,
+            current,
+            discovery_env,
+            runtime.get("effectiveVersion"),
+            parallelism=discovery_parallelism,
+            wall_budget_s=discovery_timeout_s,
+            max_packages=discovery_max_packages,
+            progress=_discovery_progress,
+            adaptive=bool(getattr(args, "adaptive_discovery", False)),
+            checkpoint=checkpoint,
+        )
+
+    commands = tuple(str(item) for item in (verify_raw.get("commands") or []))
+    if not commands:
+        commands = discover_baseline_project_checks(project_dir)
+    verify_config = dict(verify_raw)
+    verify_config["commands"] = list(commands)
+
+    manifest_hash, lock_hash, _lock = manifest_and_lock_hashes(project_dir)
+    policy_hash = _sha256_text(
+        _stable_json(
+            {
+                "targetLevel": target_level,
+                "targets": targets,
+                "commands": commands,
+                "manifestHash": manifest_hash,
+                "lockHash": lock_hash,
+                "intent": intent,
+                "auditPolicy": {key: getattr(args, key, None) for key in
+                                ("lag_months", "min_lag_ok_pct", "max_known_high", "max_known_moderate", "max_known_low")},
+            }
+        )
+    )
+    budget = {
+        "runBudgetMinutes": _clamp_int(
+            args.run_budget_minutes if args.run_budget_minutes is not None else 0,
+            0, 0, 24 * 60,
+        ),
+        "maxRepairAttemptsPerRevision": _clamp_int(
+            args.max_repair_attempts if args.max_repair_attempts is not None else 2,
+            2, 1, 8,
+        ),
+        "maxInfraRetries": _clamp_int(
+            args.max_infra_retries if args.max_infra_retries is not None else 2,
+            2, 0, 8,
+        ),
+        "phaseTimeoutSeconds": _clamp_int(
+            args.phase_timeout_seconds if args.phase_timeout_seconds is not None else 1200,
+            1200, 120, 4 * 3600,
+        ),
+    }
+    dashboard_state = (args.dashboard_state or "").strip()
+    dashboard_state_path = Path(dashboard_state).expanduser().resolve() if dashboard_state else None
+    if dashboard_state_path is not None and not dashboard_state_path.exists():
+        raise InvalidInputError(f"DASHBOARD_STATE_MISSING: {dashboard_state_path}")
+
+    if dashboard_state_path is not None:
+        dashboard_bytes = json.loads(dashboard_state_path.read_text(encoding="utf-8-sig"))
+        lag_overrides = {"packageOverrides": {project_name: ((dashboard_bytes.get("packageOverrides") or {}).get(project_name) or {})}}
+        dashboard_state_path = run_dir / "audit-policy-state.json"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        _write_json_atomic(dashboard_state_path, lag_overrides)
+        policy_hash = _sha256_text(_stable_json({"policyHash": policy_hash, "lagOverrides": lag_overrides}))
+
+    audit_policy = {
+        "lagMonths": _clamp_int(
+            args.lag_months if args.lag_months is not None else selected_policy.get("lagPolicyMonths", intent.get("lagPolicyMonths", 12)),
+            12, 1, 60,
+        ),
+        "minLagOkPct": _clamp_int(
+            args.min_lag_ok_pct if args.min_lag_ok_pct is not None else selected_policy.get("minLagOkPct", intent.get("minLagOkPct", 80)),
+            80, 0, 100,
+        ),
+        "maxKnownHigh": _clamp_int(
+            args.max_known_high if args.max_known_high is not None else selected_policy.get("maxKnownHigh", 1),
+            1, 0, 100,
+        ),
+    }
+    for arg, field in (("max_known_moderate", "maxKnownModerate"), ("max_known_low", "maxKnownLow")):
+        value = getattr(args, arg, None)
+        if value is None:
+            value = selected_policy.get(field)
+        if value is not None:
+            audit_policy[field] = _clamp_int(value, 0, 0, 99)
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "projectDir": str(project_dir),
+        "sourceScope": getattr(args, "source_scope", "repository"),
+        "projectName": project_name,
+        "workspaceId": (args.workspace_id or "").strip(),
+        "projectId": (args.project_id or project_name).strip(),
+        "targetLevel": target_level,
+        "cohortMaxPackages": int(getattr(args, "cohort_max_packages", 24) or 24),
+        "cohortInitialPackages": getattr(args, "cohort_initial_packages", None),
+        "cohortExplorationRatio": int(getattr(args, "cohort_exploration_ratio", 2) or 2),
+        "cohortSearchSteps": int(getattr(args, "cohort_search_steps", 128) or 128),
+        "cohortSchedulingStrategy": getattr(args, "cohort_scheduling_strategy", "whole-first"),
+        "targets": targets,
+        "verifyConfig": verify_config,
+        "validationProfile": validation_profile,
+        "policyHash": policy_hash,
+        "budget": budget,
+        "auditPolicy": audit_policy,
+        "dashboardState": str(dashboard_state_path) if dashboard_state_path is not None else "",
+        "requestedNode": requested_node,
+        "runtime": runtime,
+        "targetDiscovery": target_discovery,
+        "packagePolicies": package_policies,
+        "goalMode": "audit-policy" if intent_path else "exact-targets",
+        "intent": intent,
+        "createdAt": _now_iso(),
+        "toolBuildId": args.tool_build_id or "",
+        "documentLanguage": getattr(args, "lang", None) or "en",
+    }
+
+
+def _begin_locked(
+    run_dir: Path,
+    config: Mapping[str, Any],
+    args: argparse.Namespace,
+    adopt: Optional[Mapping[str, Any]] = None,
+) -> int:
+    if (run_dir / RUN_FILENAME).exists():
+        raise InvalidInputError(f'RUN_ALREADY_EXISTS: {run_dir}')
+    run_dir.mkdir(parents=True, exist_ok=True)
+    _write_json_atomic(run_dir / CONFIG_FILENAME, dict(config))
+    run_id = (args.run_id or "").strip() or _new_id("iter")
+    project_dir = Path(config["projectDir"])
+    project_name = str(config["projectName"])
+    if adopt is None:
+        # P1 (v0.2.163 #1): for an ADOPTED run these project.path reads and the
+        # "capture" signal are skipped — the source is the verified repaired
+        # snapshot, never a fresh capture of the (still red) checkout.
+        initial_assignment = direct_dependency_assignment(project_dir)
+        manifest_hash, lock_hash, lock_path = manifest_and_lock_hashes(project_dir)
+
+        _emit_status(
+            {
+                "event": "begin.capture",
+                "runId": run_id,
+                "project": project_name,
+                "managedDependencies": len(initial_assignment),
+            }
+        )
+    else:
+        initial_assignment: Dict[str, str] = {}
+        manifest_hash = lock_hash = lock_path = ""
+
+    discovery = config.get("targetDiscovery") or []
+    roadmap_targets = dict(config.get("targets") or {})
+    discovered = [
+        entry for entry in discovery
+        if entry.get("status") in ("discovered", "discovered-compatible")
+    ]
+    unavailable = [entry for entry in discovery if entry.get("status") == "registry-unavailable"]
+    incompatible_no_alt = [
+        entry for entry in discovery
+        if entry.get("status") in ("latest-incompatible-no-alternative", "no-newer-compatible")
+    ]
+    budget_skipped = [entry for entry in discovery if entry.get("status") == "discovery-budget-skipped"]
+    from collections import Counter
+    registry_diagnostics = dict(sorted(Counter(
+        str((entry.get("registryMetadata") or {}).get("errorClass") or "unspecified")
+        for entry in unavailable
+    ).items()))
+    if discovered or unavailable or incompatible_no_alt or budget_skipped:
+        _emit_status(
+            {
+                "event": "begin.discovery",
+                "runId": run_id,
+                "source": "registry dist-tags.latest (engine-aware)",
+                "discoveredTargets": sorted(str(entry.get("package") or "") for entry in discovered),
+                "registryUnavailable": sorted(str(entry.get("package") or "") for entry in unavailable),
+                "registryDiagnostics": registry_diagnostics,
+                "noCompatibleAlternative": sorted(str(entry.get("package") or "") for entry in incompatible_no_alt),
+                "budgetSkipped": sorted(str(entry.get("package") or "") for entry in budget_skipped),
+            }
+        )
+
+    # P-review: when the ONLY discovery outcomes are "registry data unavailable"
+    # or "budget exhausted", no update was actually established — the run must
+    # NOT be created as a fake success ("nothing to do"). No run, no state files
+    # to delete manually: the user simply retries the search or configures the
+    # scope. "genuinely up to date" (discovered==0, unavailable==0, budget==0)
+    # still proceeds (that IS an updates-not-needed outcome).
+    if not roadmap_targets and not discovered and (unavailable or budget_skipped):
+        raise ProjectUnreadyError(
+            "DISCOVERY_UNSETTLED",
+            "Не удалось установить доступные обновления: данные registry недоступны или бюджет поиска исчерпан. "
+            "Результат не засчитывается как завершённая миграция. "
+            f"Диагностика registry: {json.dumps(registry_diagnostics, ensure_ascii=False, sort_keys=True)}. "
+            "Проверьте registry/auth/proxy для выбранного package manager и повторите поиск; "
+            "прошедшая ранее проверка проекта остаётся отдельным результатом.",
+            command="",
+        )
+
+    if adopt is not None:
+        # P1 (v0.2.163 #1): continue the migration from the VERIFIED REPAIRED
+        # bytes, not from the still-red developer checkout.
+        return _begin_adopted_locked(run_dir, config, args, run_id, adopt)
+
+    # A fresh (non-adopt) begin after an archived repair re-captures C0 from the
+    # developer checkout. The preserved repaired snapshot (sources/C0) lives on
+    # only as a copy under the repair archive, so clearing the live leftover is
+    # safe — it is the user's explicit choice to re-capture, never silent loss.
+    # The handoff is marked SUPERSEDED so a later begin never adopts stale bytes.
+    if adopt is None and (run_dir / REPAIR_HANDOFF_FILENAME).exists():
+        stale = run_dir / SOURCE_DIR / "C0"
+        if stale.exists():
+            _force_remove_tree(stale)
+        try:
+            handoff = _read_json(run_dir / REPAIR_HANDOFF_FILENAME, required=False)
+        except InvalidInputError:
+            handoff = None
+        if handoff and not handoff.get("adopted") and not handoff.get("superseded"):
+            handoff["superseded"] = True
+            handoff["supersededBy"] = "recapture"
+            handoff["supersededAt"] = _now_iso()
+            _write_json_atomic(run_dir / REPAIR_HANDOFF_FILENAME, handoff)
+
+    snapshot_container = run_dir / SOURCE_DIR / "C0"
+    with MigrationProgress(_emit_status, operation="source-capture", run_id=run_id,
+                           message="iterative migration source capture: preparing sealed C0") as progress:
+        from verification_stage_checkpoint import capture_recovery_source
+        snapshot, _reused = capture_recovery_source(
+            project_dir, (run_dir / "preparation-source" if config.get("repairOnly") else run_dir / "v" / "sc"), preferred_destination=snapshot_container,
+            timeout_seconds=1800, progress=progress)
+    project_relative = resolve_project_relative(project_dir, snapshot)
+
+    verify_config = verify_config_from(config["verifyConfig"], run_dir)
+    verify_config = dataclasses.replace(
+        verify_config, verification_purpose="baseline-control"
+    )
+    _emit_status({"event": "begin.c0-verify", "runId": run_id})
+    # Reuse the sealed C0 bytes while retaining the original live-source guard.
+    original_root = project_dir.resolve()
+    for _part in project_relative.parts:
+        original_root = original_root.parent
+    control_source = dataclasses.replace(snapshot, original_project_path=project_dir.resolve(),
+                                         capture_root=original_root,
+                                         git_root=str(original_root) if snapshot.git_root else "")
+    with bind_source_snapshot(control_source), MigrationProgress(_emit_status, operation="control", message="iterative migration C0 control verification: preparing verification") as progress:
+        result = verify_initial_control(
+            project_dir, initial_assignment, run_config=config, run_dir=run_dir,
+            verify_config=verify_config, verifier=verify_assignment,
+            run_project_checks=True,
+            progress=progress,
+            progress_label="iterative migration C0 control verification",
+            runtime_env=_runtime_env(config),
+        )
+
+    if config.get("validationScope"):
+        save_config(run_dir, config)
+    verify_config = verify_config_from(config["verifyConfig"], run_dir)
+    observed = dict(result.observed_resolved_versions or {})
+    full_assignment = {
+        name: observed.get(name, spec)
+        for name, spec in initial_assignment.items()
+    }
+    status = "VERIFIED" if result.ok else classify_c0_result(result)
+    checkpoint: Dict[str, Any] = {
+        "schemaVersion": SCHEMA_VERSION,
+        "checkpointId": "C0",
+        "parentCheckpointId": None,
+        "seq": 0,
+        "status": status,
+        "projectName": project_name,
+        "sourceSnapshotKey": snapshot.key,
+        "sourceSnapshotContainer": str(snapshot.container),
+        "sourceHead": snapshot.git_head or "",
+        "projectRelative": str(project_relative),
+        "manifestHash": manifest_hash,
+        "lockfileHash": lock_hash or "",
+        "resolvedStateKey": result.resolved_state_key or "",
+        "observedResolvedHash": result.observed_resolved_hash or observed_resolved_hash(observed),
+        "fullAssignment": full_assignment,
+        "acceptedDelta": {"added": {}, "changed": {}, "removed": {}},
+        "cohortId": None,
+        "verification": {
+            "status": "passed" if result.ok else ("failed" if result.hard_failure else "unknown"),
+            "kind": result.kind,
+            "commands": list(verify_config.commands),
+            "scope": config.get("validationScope") or {"mode": "selected-checks", "deferredChecks": (config.get("validationProfile") or {}).get("deferredChecks", "")},
+            "failingCommands": [
+                {"command": failure.command, "exitCode": failure.exit_code}
+                for failure in result.project_failures
+            ],
+        },
+        "proofRefs": {
+            "resolvedStateKey": result.resolved_state_key or "",
+            "preparationProofKey": result.preparation_proof_key or "",
+            "commandCheckpoints": list(getattr(result, "command_checkpoint_refs", ())),
+        },
+        "runtimeContractHash": _runtime_contract_hash(config),
+        "audit": {"status": "UNKNOWN", "evidenceRef": ""},
+        "createdAt": _now_iso(),
+        "updatedAt": _now_iso(),
+        "toolBuildId": config.get("toolBuildId") or "",
+    }
+    save_checkpoint(run_dir, checkpoint)
+
+    run: Dict[str, Any] = {
+        "schemaVersion": SCHEMA_VERSION,
+        "runId": run_id,
+        "workspaceId": str(config.get("workspaceId") or ""),
+        "projectId": str(config.get("projectId") or ""),
+        "generation": 1,
+        "targetPolicyHash": str(config["policyHash"]),
+        "initialSnapshotKey": snapshot.key,
+        "activeCheckpointId": "C0",
+        "activeCandidateId": None,
+        "phase": "READY" if status == "VERIFIED" else "BOOTSTRAP_REPAIR",
+        "terminal": None,
+        "budgetLedger": {
+            "candidateAttempts": 0,
+            "repairAttempts": 0,
+            "repairAttemptsForRevision": 0,
+            "infraRetries": 0,
+            "repeatedAttempts": 0,
+        },
+        "leaseOwner": "",
+        "deadlineAt": _deadline_iso(int(config["budget"]["runBudgetMinutes"])),
+        "heartbeatAt": _now_iso(),
+        "createdAt": _now_iso(),
+        "updatedAt": _now_iso(),
+        "toolBuildId": config.get("toolBuildId") or "",
+    }
+    save_run(run_dir, run)
+    from migration_documents import write_pre_fix_report
+    write_pre_fix_report(run_dir, run, config, checkpoint)
+
+    if status != "VERIFIED":
+        _write_bootstrap_repair_request(run_dir, checkpoint, result)
+        _emit_status(
+            {
+                "event": "begin.red",
+                "runId": run_id,
+                "status": status,
+                "kind": result.kind,
+                "summary": result.summary,
+                "failingCommands": [
+                    {"command": f.command, "exitCode": f.exit_code}
+                    for f in result.project_failures
+                ],
+            }
+        )
+        return 0
+
+    _emit_status(
+        {
+            "event": "begin.done",
+            "runId": run_id,
+            "checkpointId": "C0",
+            "phase": "READY",
+            "managedDependencies": len(full_assignment),
+        }
+    )
+    return 0
+
+
+def _begin_adopted_locked(
+    run_dir: Path,
+    config: Mapping[str, Any],
+    args: argparse.Namespace,
+    run_id: str,
+    handoff: Mapping[str, Any],
+) -> int:
+    """P1 (v0.2.163 #1): a REAL migration carrying FORWARD the verified repaired
+    source. The repaired C0 snapshot (sealed by verify-bootstrap, confirmed by
+    finish's audit PASS → REPAIR_VERIFIED) becomes the new run's C0 source
+    identity; the migration therefore continues from the FIXED bytes, never from
+    a fresh capture of the still-red developer checkout.
+
+    Control is repeated in the current environment; old repair proof and audit
+    stay in the archive and never grant authority to the new runtime or policy.
+    Before adoption the snapshot is RE-OPENED and key-validated (integrity), so a moved/deleted/corrupted
+    container is a hard error, never a silent fallback to the red checkout.
+    """
+    project_name = str(config["projectName"])
+    source_refs = handoff.get("source") or {}
+    container = Path(str(source_refs.get("container") or ""))
+    key = str(source_refs.get("key") or "")
+    try:
+        source = open_source_snapshot(container, expected_key=key, timeout_seconds=0)
+    except SourceCaptureError as exc:
+        raise InvalidInputError(
+            f"REPAIR_SOURCE_INTEGRITY_FAILED: исправленный снимок недоступен/испорчен: {exc}"
+        ) from exc
+
+    full_assignment = dict(source_refs.get("fullAssignment") or {})
+    manifest_hash = str(source_refs.get("manifestHash") or "")
+    lock_hash = str(source_refs.get("lockfileHash") or "")
+    project_relative = Path(str(source_refs.get("projectRelative") or "."))
+    # Snapshot integrity is source evidence, not proof for a new runtime,
+    # command set or policy. Always control the repaired bytes afresh.
+    control_root = run_dir / f"adoption-control-{_new_id('trial')}"
+    try:
+        _materialize_trial_tree(source, control_root, 1800)
+        control_project = control_root / project_relative
+        control_project.resolve().relative_to(control_root.resolve())
+        verify_config = dataclasses.replace(
+            verify_config_from(config["verifyConfig"], run_dir), verification_purpose="baseline-control"
+        )
+        with MigrationProgress(_emit_status, operation="control", message="adopt repaired source: fresh current-environment control: preparing verification") as progress:
+            result = verify_initial_control(
+                control_project, full_assignment, run_config=config, run_dir=run_dir,
+                verify_config=verify_config, verifier=verify_assignment,
+                run_project_checks=True, runtime_env=_runtime_env(config),
+                progress=progress,
+                progress_label="adopt repaired source: fresh current-environment control",
+            )
+        if not result.ok:
+            raise ProjectUnreadyError(
+                "REPAIR_ADOPTION_CONTROL_FAILED" if result.hard_failure else "REPAIR_ADOPTION_INCONCLUSIVE",
+                f"Исправленные исходники не подтверждены в текущем окружении: {result.kind}: {result.summary}",
+                command="",
+            )
+    finally:
+        _force_remove_tree(control_root)
+    if config.get("validationScope"):
+        save_config(run_dir, config)
+    verify_config = verify_config_from(config["verifyConfig"], run_dir)
+    status = "VERIFIED"
+    checkpoint_id = "C0"
+
+    checkpoint: Dict[str, Any] = {
+        "schemaVersion": SCHEMA_VERSION,
+        "checkpointId": checkpoint_id,
+        "parentCheckpointId": None,
+        "seq": 0,
+        "status": status,
+        "projectName": project_name,
+        "sourceSnapshotKey": source.key,
+        "sourceSnapshotContainer": str(source.container),
+        "sourceHead": source.git_head or str(source_refs.get("sourceHead") or ""),
+        "projectRelative": str(project_relative),
+        "manifestHash": manifest_hash,
+        "lockfileHash": lock_hash,
+        "resolvedStateKey": result.resolved_state_key or "",
+        "observedResolvedHash": result.observed_resolved_hash or observed_resolved_hash(result.observed_resolved_versions or {}),
+        "fullAssignment": full_assignment,
+        "acceptedDelta": {"added": {}, "changed": {}, "removed": {}},
+        "cohortId": None,
+        "verification": {
+            "status": "passed",
+            "kind": result.kind,
+            "commands": list(verify_config.commands),
+            "scope": config.get("validationScope") or {"mode": "selected-checks", "deferredChecks": (config.get("validationProfile") or {}).get("deferredChecks", "")},
+            "failingCommands": [],
+        },
+        "proofRefs": {
+            "resolvedStateKey": result.resolved_state_key or "",
+            "preparationProofKey": result.preparation_proof_key or "",
+            "commandCheckpoints": list(getattr(result, "command_checkpoint_refs", ())),
+        },
+        "runtimeContractHash": _runtime_contract_hash(config),
+        "audit": {
+            "status": "UNKNOWN",
+            "evidenceRef": "",
+        },
+        "createdAt": _now_iso(),
+        "updatedAt": _now_iso(),
+        "toolBuildId": config.get("toolBuildId") or "",
+        "adoptedFromRepairRunId": str(handoff.get("repairRunId") or ""),
+        "adoptedRepairArchiveDir": str(handoff.get("evidence", {}).get("archiveDir") or ""),
+    }
+    save_checkpoint(run_dir, checkpoint)
+
+    run: Dict[str, Any] = {
+        "schemaVersion": SCHEMA_VERSION,
+        "runId": run_id,
+        "workspaceId": str(config.get("workspaceId") or ""),
+        "projectId": str(config.get("projectId") or ""),
+        "generation": 1,
+        "targetPolicyHash": str(config["policyHash"]),
+        "initialSnapshotKey": source.key,
+        "activeCheckpointId": "C0",
+        "activeCandidateId": None,
+        "phase": "READY",
+        "terminal": None,
+        "budgetLedger": {
+            "candidateAttempts": 0,
+            "repairAttempts": 0,
+            "repairAttemptsForRevision": 0,
+            "infraRetries": 0,
+            "repeatedAttempts": 0,
+        },
+        "leaseOwner": "",
+        "deadlineAt": _deadline_iso(int(config["budget"]["runBudgetMinutes"])),
+        "heartbeatAt": _now_iso(),
+        "createdAt": _now_iso(),
+        "updatedAt": _now_iso(),
+        "toolBuildId": config.get("toolBuildId") or "",
+        "adoptedFromRepairRunId": str(handoff.get("repairRunId") or ""),
+        "adoptedRepairArchiveDir": str(handoff.get("evidence", {}).get("archiveDir") or ""),
+        "adoptedAt": _now_iso(),
+    }
+    save_run(run_dir, run)
+    from migration_documents import write_pre_fix_report
+    write_pre_fix_report(run_dir, run, config, checkpoint)
+
+    # Mark the handoff adopted ONLY after the run is durable: a crash in between
+    # leaves RUN_ALREADY_EXISTS instead of silently re-capturing the red source.
+    handoff_marked = dict(handoff)
+    handoff_marked["adopted"] = True
+    handoff_marked["adoptedAt"] = _now_iso()
+    _write_json_atomic(run_dir / REPAIR_HANDOFF_FILENAME, handoff_marked)
+
+    _emit_status(
+        {
+            "event": "begin.adopted",
+            "runId": run_id,
+            "phase": "READY",
+            "repairedRunId": str(handoff.get("repairRunId") or ""),
+            "sourceSnapshotKey": source.key,
+            "managedDependencies": len(full_assignment),
+        }
+    )
+    _emit_status(
+        {
+            "event": "begin.done",
+            "runId": run_id,
+            "checkpointId": checkpoint_id,
+            "phase": "READY",
+            "managedDependencies": len(full_assignment),
+        }
+    )
+    return 0
+
+
+def classify_c0_result(result: BaselineVerifyResult) -> str:
+    if result.kind == "project" or is_structural_project_failure(result):
+        return "RED_SOURCE"
+    if result.kind in {"infrastructure", "preparation"}:
+        return "BLOCKED_INFRA"
+    if result.kind == "budget":
+        return "BUDGET"
+    return "BLOCKED_BASELINE"
+
+
+def _deadline_iso(minutes: int) -> str:
+    if minutes <= 0:
+        return ""
+    return time.strftime(
+        "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + int(minutes) * 60)
+    )
+
+
+def _write_bootstrap_repair_request(
+    run_dir: Path, checkpoint: Mapping[str, Any], result: BaselineVerifyResult
+) -> None:
+    from baseline_constraint_verifier import BaselineProjectFailure
+
+    failures = list(result.project_failures)
+    failing: Sequence[BaselineProjectFailure] = (
+        failures
+        if failures
+        else (BaselineProjectFailure(str(checkpoint["verification"]["commands"][0]), 1, result.summary),)
+        if checkpoint["verification"]["commands"]
+        else ()
+    )
+    request = build_repair_request(
+        project=str(checkpoint.get("projectName") or Path(run_dir).name),
+        mode="iterative-bootstrap",
+        assignment=checkpoint["fullAssignment"],
+        result=BaselineVerifyResult(
+            False,
+            "project" if result.kind == "project" else result.kind,
+            result.summary,
+            project_failures=tuple(failing),
+        ),
+        snapshot_identity=str(checkpoint["sourceSnapshotKey"]),
+    )
+    write_repair_requests(
+        run_dir,
+        [dict(request.to_json()) | {"bootstrap": True, "checkpointId": "C0"}],
+    )
+
+
+# ---------------------------------------------------------------------------
+# archive-repair-run: transactional archive + the durable repair handoff
+# ---------------------------------------------------------------------------
+
+# P1 (v0.2.163 #2): a FINISHED repair run must never block a real migration,
+# and freeing its slot must never be half-done. Every artifact except the
+# repaired C0 source snapshot (the fixed bytes the next run adopts) and the
+# lightweight journal moves into repair-archive/<runId>-<timestamp>/. On ANY
+# failure the already-moved entries are renamed back so the run stays exactly
+# as it was — an interrupted archive is recoverable, never corrupted.
+def _archive_metadata_bytes(path: Path, value: bytes) -> None:
+    temporary = path.with_name(path.name + f".restore-{os.getpid()}")
+    temporary.write_bytes(value)
+    os.replace(temporary, path)
+
+
+def _recover_repair_archive(run_dir: Path) -> None:
+    """Called under the run lock. A planned move is recoverable even if killed
+    between rename and recording completion; publications roll back together."""
+    journal_path = run_dir / REPAIR_ARCHIVE_TRANSACTION
+    if not journal_path.exists():
+        return
+    journal = _read_json(journal_path)
+    archive_relative = Path(str(journal["archiveRelative"]))
+    if (not archive_relative.parts or archive_relative.is_absolute()
+            or ".." in archive_relative.parts or archive_relative.parts[0] != REPAIR_ARCHIVE_DIR):
+        raise InvalidInputError("REPAIR_ARCHIVE_JOURNAL_INVALID")
+    archive_root = run_dir / archive_relative
+    if journal.get("phase") == "committed":
+        journal_path.unlink()
+        return
+    for name in reversed(journal["entries"]):
+        if Path(name).name != name or name in (".", ".."):
+            raise InvalidInputError("REPAIR_ARCHIVE_JOURNAL_INVALID")
+        source, target = run_dir / name, archive_root / name
+        if target.exists() or target.is_symlink():
+            if source.exists() or source.is_symlink():
+                raise InvalidInputError(f"REPAIR_ARCHIVE_RECOVERY_CONFLICT: {name}")
+            os.rename(target, source)
+    for name in (REPAIR_HANDOFF_FILENAME, PROJECT_CHECK_FILENAME):
+        previous = journal["metadata"][name]
+        path = run_dir / name
+        if previous is None:
+            path.unlink(missing_ok=True)
+        else:
+            _archive_metadata_bytes(path, bytes.fromhex(previous))
+    journal_path.unlink()
+
+
+def _archive_repair_run_locked(
+    run_dir: Path, run: Mapping[str, Any]
+) -> Dict[str, Any]:
+    _recover_repair_archive(run_dir)
+    config = load_config(run_dir)
+    c0 = load_checkpoint(run_dir, "C0")
+    archive_root = run_dir / REPAIR_ARCHIVE_DIR / _new_id("archive")
+    archive_root.mkdir(parents=True, exist_ok=False)
+    skip = {REPAIR_ARCHIVE_DIR, SOURCE_DIR, REPAIR_HANDOFF_FILENAME,
+            PROJECT_CHECK_FILENAME, REPAIR_ARCHIVE_TRANSACTION, LOCK_FILENAME,
+            "attempt.json", "attempt.log"}
+    entries = [entry.name for entry in sorted(run_dir.iterdir(), key=lambda p: p.name)
+               if entry.name not in skip and (entry.is_dir() or entry.is_file())]
+    journal = {
+        "phase": "moving",
+        "archiveRelative": str(archive_root.relative_to(run_dir)),
+        "entries": entries,
+        "metadata": {name: (run_dir / name).read_bytes().hex() if (run_dir / name).exists() else None
+                     for name in (REPAIR_HANDOFF_FILENAME, PROJECT_CHECK_FILENAME)},
+    }
+    journal_path = run_dir / REPAIR_ARCHIVE_TRANSACTION
+    _write_json_atomic(journal_path, journal)
+    try:
+        for name in entries:
+            os.rename(run_dir / name, archive_root / name)
+        live_snapshot = run_dir / SOURCE_DIR / "C0"
+        if live_snapshot.is_dir():
+            shutil.copytree(live_snapshot, archive_root / SOURCE_DIR / "C0", symlinks=True)
+        _verify_repair_archive(run_dir, archive_root, c0)
+        handoff = _build_repair_handoff(run, config, c0, archive_root, run_dir)
+        _write_json_atomic(run_dir / REPAIR_HANDOFF_FILENAME, handoff)
+        _write_project_check_ready(run_dir, config, handoff)
+        _write_json_atomic(journal_path, {**journal, "phase": "committed"})
+    except Exception as exc:
+        try:
+            _recover_repair_archive(run_dir)
+        except Exception as recovery_error:
+            raise InvalidInputError(f"REPAIR_ARCHIVE_RECOVERY_REQUIRED: {recovery_error}") from exc
+        raise InvalidInputError(f"REPAIR_ARCHIVE_FAILED_ROLLED_BACK: {type(exc).__name__}: {exc}") from exc
+    # Once committed, interruption during cleanup must never undo publications.
+    journal_path.unlink(missing_ok=True)
+    return {"archived": True, "runId": str(run.get("runId") or ""),
+            "archiveDir": str(archive_root), "handoffPath": str(run_dir / REPAIR_HANDOFF_FILENAME)}
+
+
+def _verify_repair_archive(run_dir: Path, archive_root: Path, c0: Mapping[str, Any]) -> None:
+    """Cheap integrity gate AFTER the move, BEFORE any handoff/verdict write:
+    the slot is proven free (no run.json in the run dir), the move landed
+    (run.json + config under the archive) and the repaired source snapshot
+    stayed reachable under the key the C0 checkpoint expects."""
+    if (run_dir / RUN_FILENAME).exists():
+        raise InvalidInputError("REPAIR_ARCHIVE_RUN_STILL_PRESENT")
+    if not (archive_root / RUN_FILENAME).exists():
+        raise InvalidInputError("REPAIR_ARCHIVE_RUN_MISSING")
+    if not (archive_root / CONFIG_FILENAME).exists():
+        raise InvalidInputError("REPAIR_ARCHIVE_CONFIG_MISSING")
+    manifest_path = run_dir / SOURCE_DIR / "C0" / "manifest.json"
+    if not manifest_path.exists():
+        raise InvalidInputError("REPAIR_ARCHIVE_SOURCE_SNAPSHOT_MISSING")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError) as exc:
+        raise InvalidInputError(f"REPAIR_ARCHIVE_SOURCE_MANIFEST_INVALID: {exc}") from exc
+    observed_key = str(manifest.get("sourceSnapshotKey") or "")
+    expected_key = str(c0.get("sourceSnapshotKey") or "")
+    if observed_key != expected_key:
+        raise InvalidInputError(
+            "REPAIR_ARCHIVE_SOURCE_KEY_MISMATCH: "
+            f"expected={expected_key}; observed={observed_key}"
+        )
+
+
+def _build_repair_handoff(
+    run: Mapping[str, Any],
+    config: Mapping[str, Any],
+    c0: Mapping[str, Any],
+    archive_root: Path,
+    run_dir: Path,
+) -> Dict[str, Any]:
+    """The single durable record the NEXT migration reads to continue from the
+    verified repaired bytes. `source` points at the fixed C0 snapshot that stays
+    at run_dir/sources/C0; `evidence` keeps WORKING references into the archive
+    so repair proof remains reachable after the slot is freed."""
+    terminal_outcome = run.get("terminalOutcome") or {}
+    verification = c0.get("verification") or {}
+    audit = c0.get("audit") or {}
+    source_head = str(c0.get("sourceHead") or "")
+    return {
+        "schemaVersion": 1,
+        "repairRunId": str(run.get("runId") or ""),
+        "projectName": str(config.get("projectName") or ""),
+        "projectDir": str(config.get("projectDir") or ""),
+        "workspaceId": str(config.get("workspaceId") or ""),
+        "terminal": "REPAIR_VERIFIED",
+        "repairedAt": str(terminal_outcome.get("finishedAt") or _now_iso()),
+        "source": {
+            "container": str(run_dir / SOURCE_DIR / "C0"),
+            "key": str(c0.get("sourceSnapshotKey") or ""),
+            "projectRelative": str(c0.get("projectRelative") or "."),
+            "sourceHead": source_head,
+            "manifestHash": str(c0.get("manifestHash") or ""),
+            "lockfileHash": str(c0.get("lockfileHash") or ""),
+            "resolvedStateKey": str(c0.get("resolvedStateKey") or ""),
+            "observedResolvedHash": str(c0.get("observedResolvedHash") or ""),
+            "fullAssignment": dict(c0.get("fullAssignment") or {}),
+        },
+        "verifiedC0": {
+            "status": str(c0.get("status") or ""),
+            "verificationStatus": str(verification.get("status") or ""),
+            "kind": str(verification.get("kind") or ""),
+            "commands": list(verification.get("commands") or []),
+            "failingCommands": list(verification.get("failingCommands") or []),
+        },
+        "audit": {
+            "status": str(audit.get("status") or ""),
+            "evidenceRef": str(audit.get("evidenceRef") or ""),
+        },
+        "evidence": {
+            "archiveDir": str(archive_root),
+            "sourceSnapshotCopy": str(archive_root / SOURCE_DIR / "C0"),
+            "repairRequestsPath": str(archive_root / REPAIR_REQUESTS_FILENAME),
+            "reportsDir": str(archive_root / REPORTS_DIR),
+        },
+        "adopted": False,
+    }
+
+
+def _write_project_check_ready(run_dir: Path, config: Mapping[str, Any], handoff: Mapping[str, Any]) -> None:
+    """The durable 'project ready' verdict the panel shows after a finished
+    repair — with WORKING references to the repair evidence, so the handoff and
+    the archived artifacts never point at a path that disappeared."""
+    _write_json_atomic(
+        run_dir / PROJECT_CHECK_FILENAME,
+        {
+            "schemaVersion": 1,
+            "projectDir": str(config.get("projectDir") or ""),
+            "projectName": str(config.get("projectName") or ""),
+            "checkedAt": _now_iso(),
+            "ok": True,
+            "managedDependencies": 0,
+            "control": {
+                "status": "passed",
+                "kind": "repair",
+                "summary": "Исходное состояние проекта исправлено и подтверждено (ремонт).",
+            },
+            "repair": {
+                "handoffPath": str(run_dir / REPAIR_HANDOFF_FILENAME),
+                "archiveDir": str(handoff.get("evidence", {}).get("archiveDir") or ""),
+                "repairRunId": str(handoff.get("repairRunId") or ""),
+            },
+        },
+    )
+
+
+def cmd_archive_run(args: argparse.Namespace) -> int:
+    run_dir = Path(args.run_dir).resolve()
+    lock = _RunLock(run_dir, args.owner or f"pid-{os.getpid()}")
+    lock.acquire()
+    try:
+        if getattr(args, 'recover_only', False):
+            recover_restart_archive(run_dir, _write_json_atomic)
+            result = {'archived': False}
+        else:
+            result = archive_for_restart(run_dir, LOCK_FILENAME, _write_json_atomic)
+        print(f"ITERATIVE_ARCHIVE_RESULT_V1 {json.dumps(result)}")
+        return 0
+    except RestartArchiveError as exc:
+        raise InvalidInputError(str(exc)) from exc
+    finally:
+        lock.release()
+
+
+def cmd_archive_repair_run(args: argparse.Namespace) -> int:
+    run_dir = Path(args.run_dir).resolve()
+    if not (run_dir / RUN_FILENAME).exists():
+        _emit_archive_result({"archived": False, "reason": "NO_RUN"})
+        return 0
+    run = load_run(run_dir)
+    terminal_outcome = run.get("terminalOutcome") or {}
+    repair_done = run.get("phase") == "TERMINAL" and (
+        terminal_outcome.get("outcome") == "REPAIR_VERIFIED"
+        or run.get("terminal") == "REPAIR_VERIFIED"
+    )
+    if not repair_done:
+        _emit_archive_result(
+            {"archived": False, "reason": "NOT_REPAIR_VERIFIED", "phase": str(run.get("phase") or "")}
+        )
+        return 0
+    lock = _RunLock(run_dir, args.owner or f"pid-{os.getpid()}")
+    lock.acquire()
+    try:
+        run = load_run(run_dir)
+        result = _archive_repair_run_locked(run_dir, run)
+        _emit_archive_result(result)
+        return 0
+    finally:
+        lock.release()
+
+
+def _emit_archive_result(result: Mapping[str, Any]) -> None:
+    print(
+        f"{ARCHIVE_RESULT_EVENT} "
+        f"{json.dumps(dict(result), ensure_ascii=False, separators=(',', ':'))}"
+    )
+    sys_stdout_flush()
+
+
+def cmd_bootstrap_materialize(args: argparse.Namespace) -> int:
+    """Materialize the version-neutral C0 repair workspace into an isolated
+    trial. The bootstrap repair agent works HERE, never on the developer
+    checkout; verify-bootstrap then re-runs the control on the repaired bytes
+    and captures a NEW C0 source snapshot."""
+    run_dir = Path(args.run_dir).resolve()
+    lock = _RunLock(run_dir, args.owner or f"pid-{os.getpid()}", stale_seconds=300)
+    lock.acquire()
+    try:
+        run = load_run(run_dir)
+        config = load_config(run_dir)
+        return _bootstrap_materialize_locked(run_dir, run, config, args)
+    finally:
+        lock.release()
+
+
+def _bootstrap_materialize_locked(
+    run_dir: Path, run: Mapping[str, Any], config: Mapping[str, Any], args: argparse.Namespace
+) -> int:
+    if run.get("phase") != "BOOTSTRAP_REPAIR":
+        raise InvalidInputError(f"PHASE_NOT_BOOTSTRAP: {run.get('phase')}")
+    if not run_budget_ok(config, run):
+        raise BudgetExceededError("RUN_DEADLINE_EXCEEDED")
+    requests = read_repair_requests(run_dir)
+    if not any(isinstance(req, dict) and req.get("bootstrap") for req in requests):
+        raise InvalidInputError("BOOTSTRAP_REQUEST_MISSING")
+    checkpoint = load_checkpoint(run_dir, "C0")
+    if checkpoint.get("status") == "VERIFIED":
+        raise InvalidInputError("C0_ALREADY_VERIFIED")
+
+    _emit_status(
+        {
+            "event": "bootstrap-materialize.start",
+            "runId": run["runId"],
+            "checkpointId": "C0",
+        }
+    )
+    snapshot = open_source_snapshot(
+        Path(str(checkpoint["sourceSnapshotContainer"])),
+        expected_key=str(checkpoint["sourceSnapshotKey"]),
+        timeout_seconds=0,
+    )
+    workspace_root = bootstrap_workspace_root(run_dir)
+    if workspace_root.exists():
+        shutil.rmtree(workspace_root, ignore_errors=True)
+    _materialize_trial_tree(snapshot, workspace_root, args.timeout_seconds)
+    project_relative = Path(str(checkpoint.get("projectRelative") or "."))
+    project_path = workspace_root / project_relative
+    install_result = _run_install(
+        project_path,
+        timeout_seconds=args.timeout_seconds,
+        progress_label="iterative migration bootstrap materialization",
+        runtime_env=_runtime_env(config), run_deadline_at=str(run.get("deadlineAt") or ""),
+    )
+    run = dict(run)
+    run["bootstrapRefs"] = {
+        "workspaceRoot": str(workspace_root),
+        "projectRelative": str(project_relative),
+        "installExitCode": install_result.returncode,
+    }
+    run["updatedAt"] = _now_iso()
+    save_run(run_dir, run)
+    _emit_status(
+        {
+            "event": "bootstrap-materialize.done",
+            "runId": run["runId"],
+            "checkpointId": "C0",
+            "installExitCode": install_result.returncode,
+            "outputTail": (install_result.stdout or install_result.stderr or "")[-2000:]
+            if install_result.returncode != 0
+            else "",
+        }
+    )
+    return 0
+
+
+def _force_remove_tree(path: Path) -> None:
+    """Remove a private tree that may be write-protected.
+
+    A sealed snapshot container is read-only, and `shutil.rmtree(ignore_errors=
+    True)` would silently fail to remove it on Windows — exactly the failure
+    `source_snapshot._force_rmtree` exists for, mirrored here via the imported
+    `apply_tree_write_protection`.
+    """
+    try:
+        apply_tree_write_protection(path, readonly=False)
+    except OSError:
+        pass
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def _replace_c0_source_snapshot(
+    run_dir: Path, project_path: Path, timeout_seconds: int = 0, *, expected_key: str = ''
+) -> SourceSnapshot:
+    """P1 (v0.2.163 #1): atomically replace the C0 source snapshot container
+    with a fresh capture of `project_path` (the repaired bootstrap trial).
+
+    The durable snapshots are immutable and `persist_source_snapshot` refuses an
+    existing destination, so the old red C0 cannot be captured over. The new
+    snapshot is staged + validated FIRST, then the old container is moved aside
+    and the staged one swapped into `sources/C0` — on any failure the old
+    container is restored, so checkpoint C0 never dangles.
+    """
+    c0_container = run_dir / SOURCE_DIR / "C0"
+    stamp = f"{os.getpid()}-{int(time.time() * 1000)}"
+    stage = run_dir / SOURCE_DIR / f"C0.stage-{stamp}"
+    old = run_dir / SOURCE_DIR / f"C0.old-{stamp}"
+    try:
+        staged = capture_durable_source_snapshot(
+            project_path, stage, timeout_seconds=timeout_seconds
+        )
+        if expected_key and staged.key != expected_key:
+            raise InvalidInputError('VERIFIED_SOURCE_IDENTITY_MISMATCH: preserve C0 and reverify the changed bootstrap trial')
+        if c0_container.is_dir():
+            os.rename(str(c0_container), str(old))
+        os.replace(str(stage), str(c0_container))
+    except Exception:
+        if not c0_container.exists() and old.is_dir():
+            try:
+                os.rename(str(old), str(c0_container))
+            except OSError:
+                pass
+        if stage.exists():
+            _force_remove_tree(stage)
+        raise
+    if old.is_dir():
+        _force_remove_tree(old)
+    # Re-open the FINAL location so the returned snapshot carries the durable
+    # container path (the staged path is gone) and re-validates the key there.
+    return open_source_snapshot(
+        c0_container, expected_key=staged.key, timeout_seconds=timeout_seconds
+    )
+
+
+def cmd_verify_bootstrap(args: argparse.Namespace) -> int:
+    """Re-run the C0 control verification on the REPAIRED bootstrap trial
+    (version-neutral). On success the trial's repaired bytes become the NEW C0
+    source snapshot: the source/config identity of checkpoint C0 is replaced by
+    a fresh sealed snapshot so every later materialization uses repaired bytes."""
+    run_dir = Path(args.run_dir).resolve()
+    lock = _RunLock(run_dir, args.owner or f"pid-{os.getpid()}")
+    lock.acquire()
+    try:
+        run = load_run(run_dir)
+        config = load_config(run_dir)
+        if run.get("phase") != "BOOTSTRAP_REPAIR":
+            raise InvalidInputError(f"PHASE_NOT_BOOTSTRAP: {run.get('phase')}")
+        if not run_budget_ok(config, run):
+            raise BudgetExceededError("RUN_DEADLINE_EXCEEDED")
+        refs = run.get("bootstrapRefs") or {}
+        if not refs.get("workspaceRoot"):
+            raise InvalidInputError(
+                "BOOTSTRAP_TRIAL_MISSING: запустите bootstrap-materialize перед verify-bootstrap"
+            )
+        workspace_root = Path(str(refs["workspaceRoot"]))
+        project_path = workspace_root / str(refs.get("projectRelative") or ".")
+        if not (project_path / "package.json").exists():
+            raise InvalidInputError(f"BOOTSTRAP_TRIAL_PROJECT_MISSING: {project_path}")
+        checkpoint = load_checkpoint(run_dir, "C0")
+        verify_config = verify_config_from(config["verifyConfig"], run_dir)
+        verify_config = dataclasses.replace(
+            verify_config, verification_purpose="baseline-control"
+        )
+        with MigrationProgress(_emit_status, operation="verify-bootstrap", message="iterative migration bootstrap re-verification: preparing verification", run_id=run["runId"], candidate_id="") as progress:
+            result = verify_assignment(
+                project_path,
+                checkpoint["fullAssignment"],
+                config=verify_config,
+                run_project_checks=True,
+                progress=progress,
+                progress_label="iterative migration bootstrap re-verification",
+                runtime_env=_runtime_env(config),
+            )
+        if result.ok:
+            # The repaired trial becomes the authoritative C0 source identity:
+            # capture a NEW durable snapshot at the SAME checkpoint slot (C0) so
+            # the source key/container point at the repaired bytes. The old
+            # (red) C0 container is swapped out TRANSACTIONALLY — a failed
+            # capture must never leave checkpoint C0 pointing at a removed
+            # container (the verify-bootstrap success path was previously
+            # unreachable: persist_source_snapshot refused the existing target).
+            if (not result.verified_source_snapshot_key or result.verified_assignment_fingerprint != assignment_fingerprint(checkpoint['fullAssignment'])):
+                raise InvalidInputError('VERIFIED_SOURCE_IDENTITY_MISMATCH: bootstrap verification receipt missing')
+            new_snapshot = _replace_c0_source_snapshot(
+                run_dir, project_path, timeout_seconds=0, expected_key=result.verified_source_snapshot_key
+            )
+            project_relative = resolve_project_relative(project_path, new_snapshot)
+            manifest_hash, lock_hash, _lock = manifest_and_lock_hashes(project_path)
+            checkpoint = dict(checkpoint)
+            checkpoint["status"] = "VERIFIED"
+            checkpoint["sourceSnapshotKey"] = new_snapshot.key
+            checkpoint["sourceSnapshotContainer"] = str(new_snapshot.container)
+            checkpoint["sourceHead"] = new_snapshot.git_head or ""
+            checkpoint["projectRelative"] = str(project_relative)
+            checkpoint["manifestHash"] = manifest_hash
+            checkpoint["lockfileHash"] = lock_hash or ""
+            checkpoint["resolvedStateKey"] = (
+                result.resolved_state_key or checkpoint.get("resolvedStateKey", "")
+            )
+            checkpoint["observedResolvedHash"] = (
+                result.observed_resolved_hash
+                or observed_resolved_hash(result.observed_resolved_versions or {})
+            )
+            checkpoint["updatedAt"] = _now_iso()
+            checkpoint["verification"] = {
+                "status": "passed",
+                "kind": result.kind,
+                "commands": list(verify_config.commands),
+                "failingCommands": [],
+            }
+            save_checkpoint(run_dir, checkpoint)
+            run = dict(run)
+            run["phase"] = "READY"
+            run.pop("bootstrapRefs", None)
+            run["updatedAt"] = _now_iso()
+            save_run(run_dir, run)
+            write_repair_requests(run_dir, [])
+            _emit_status(
+                {
+                    "event": "verify-bootstrap.pass",
+                    "runId": run["runId"],
+                    "checkpointId": "C0",
+                    "phase": "READY",
+                    "newSourceSnapshotKey": new_snapshot.key,
+                }
+            )
+            return 0
+        _emit_status(
+            {
+                "event": "verify-bootstrap.red",
+                "runId": run["runId"],
+                "kind": result.kind,
+                "summary": result.summary,
+                "failingCommands": [
+                    {"command": f.command, "exitCode": f.exit_code}
+                    for f in result.project_failures
+                ],
+            }
+        )
+        return 0
+    finally:
+        lock.release()
+
+
+# ---------------------------------------------------------------------------
+# plan-next
+# ---------------------------------------------------------------------------
+
+def cmd_resume(args: argparse.Namespace) -> int:
+    from iterative_resume import reopen_terminal_run, recover_timed_out_candidate
+    run_dir = Path(args.run_dir).resolve()
+    lock = _RunLock(run_dir, args.owner or f"pid-{os.getpid()}", stale_seconds=60)
+    lock.acquire()
+    try:
+        run, config = load_run(run_dir), load_config(run_dir)
+        _assert_runtime_unchanged(config)
+        if _recover_iteration_transition(run_dir, run, config):
+            return 0
+        recovered_publication = _recover_checkpoint_publication(run_dir, run, config)
+        if recovered_publication is not None:
+            return 0
+        if not run_budget_ok(config, run):
+            raise BudgetExceededError("RUN_DEADLINE_EXCEEDED")
+        _assert_runtime_unchanged(config)
+        checkpoint = load_checkpoint(run_dir, str(run["activeCheckpointId"]))
+        try:
+            pending = load_candidate(run_dir)
+            reopened = reopen_terminal_run(run, checkpoint, None if pending and pending.get("timeoutRecoveryCount") == 1 and pending.get("stage") == "REPAIRING" else pending)
+        except ValueError as exc:
+            raise InvalidInputError(str(exc)) from exc
+        _open_checkpoint_source(run_dir, checkpoint, config, run_id=str(run["runId"]))
+        try:
+            recovered = recover_timed_out_candidate(run_dir, run, checkpoint, load_candidate(run_dir), load_ledger(run_dir), config)
+        except ValueError as exc:
+            raise InvalidInputError(str(exc)) from exc
+        if not recovered and pending and pending.get("timeoutRecoveryCount") == 1 and pending.get("stage") == "REPAIRING":
+            recovered = pending
+        if recovered:
+            save_candidate(run_dir, recovered)
+            reopened.update(phase="REPAIRING", activeCandidateId=recovered["candidateId"])
+            _emit_status({"event": "resume.repair-restored", "runId": run["runId"], "candidateId": recovered["candidateId"],
+                          "message": "Preserved timed-out repair restored; project verification is still required"})
+        from iterative_resume import invalid_engine_deferrals
+        ledger = load_ledger(run_dir)
+        invalid = invalid_engine_deferrals(ledger, checkpoint["checkpointId"])
+        if invalid:
+            ledger["deferrals"] = [entry for entry in ledger.get("deferrals", []) if entry not in invalid]
+            ledger["invalidRegistryDeferrals"] = list(ledger.get("invalidRegistryDeferrals", [])) + invalid
+            save_ledger(run_dir, ledger)
+        save_run(run_dir, reopened)
+        _emit_status({"event": "resume.done", "runId": run["runId"], "checkpointId": checkpoint["checkpointId"]})
+        return 0
+    finally:
+        lock.release()
+
+
+def cmd_plan_next(args: argparse.Namespace) -> int:
+    run_dir = Path(args.run_dir).resolve()
+    lock = _RunLock(run_dir, args.owner or f"pid-{os.getpid()}", stale_seconds=60)
+    lock.acquire()
+    try:
+        run = load_run(run_dir)
+        config = load_config(run_dir)
+        return _plan_next_locked(run_dir, run, config, args)
+    finally:
+        lock.release()
+
+
+def _plan_next_locked(
+    run_dir: Path, run: Mapping[str, Any], config: Mapping[str, Any],
+    args: Optional[argparse.Namespace] = None,
+) -> int:
+    if not run_budget_ok(config, run):
+        raise BudgetExceededError("RUN_DEADLINE_EXCEEDED")
+    _assert_runtime_unchanged(config)
+    retry_infra = bool(getattr(args, "retry_infra", False) if args is not None else False)
+    blocked = run.get("infraBlocked") or {}
+    if retry_infra and blocked.get("operation") == "verify-exact":
+        candidate = load_candidate(run_dir)
+        if not candidate or candidate.get("candidateId") != blocked.get("candidateId") or candidate.get("stage") != "VERIFYING":
+            raise InvalidInputError("INFRA_RETRY_CANDIDATE_MISMATCH")
+        candidate = dict(candidate)
+        candidate["verifyInfraFailures"] = 0
+        save_candidate(run_dir, candidate)
+        run = dict(run)
+        run["infraBlocked"] = None
+        run["phase"] = "VERIFYING"
+        run["updatedAt"] = _now_iso()
+        save_run(run_dir, run)
+        return 0
+    if retry_infra:
+        # Explicit user continuation after the infra cause changed: clear the
+        # recoverable infra blocks for the CURRENT registry scope and the
+        # run.infraBlocked marker. A fresh attempt sequence gets a FRESH infra
+        # retry budget; the verified checkpoint is never touched.
+        ledger = dict(load_ledger(run_dir))
+        scope = availability_scope_flat(run, config)
+        ledger["infraBlocks"] = [
+            entry for entry in ledger.get("infraBlocks") or []
+            if entry.get("scopeHash") != scope
+        ]
+        save_ledger(run_dir, ledger)
+        if run.get("infraBlocked") or run.get("terminal") == "INFRA_BLOCKED":
+            run = dict(run)
+            run["infraBlocked"] = None
+            run["updatedAt"] = _now_iso()
+            save_run(run_dir, run)
+    active_candidate = load_candidate(run_dir)
+    if active_candidate is not None and active_candidate.get("stage") in {
+        "PLANNED",
+        "MATERIALIZED",
+        "PRECHECKED",
+        "REPAIRING",
+        "VERIFYING",
+    }:
+        raise InvalidInputError(
+            f"ACTIVE_CANDIDATE_IN_FLIGHT: {active_candidate.get('candidateId')} "
+            f"stage={active_candidate.get('stage')}"
+        )
+    terminal = run.get("terminal")
+    if terminal:
+        raise InvalidInputError(f"RUN_TERMINAL: {terminal}")
+
+    checkpoint_id = str(run["activeCheckpointId"])
+    checkpoint = load_checkpoint(run_dir, checkpoint_id)
+    if checkpoint.get("status") not in ("VERIFIED",):
+        raise InvalidInputError(
+            f"CHECKPOINT_NOT_VERIFIED: {checkpoint_id} status={checkpoint.get('status')}"
+        )
+
+    if _policy_satisfied(config, checkpoint):
+        _emit_status({"event": "plan-next.no-candidate", "runId": run["runId"],
+                      "checkpointId": checkpoint_id, "reason": "POLICY_SATISFIED_NEEDS_AUDIT"})
+        return 0
+    incumbent = {str(k): str(v) for k, v in (checkpoint.get("fullAssignment") or {}).items()}
+    targets = {str(k): str(v) for k, v in (config.get("targets") or {}).items()}
+    desired = {name: targets.get(name, version) for name, version in incumbent.items()}
+    from iterative_scope_expansion import prepare_expansions
+    planning_ledger = load_ledger(run_dir)
+    desired, planning_ledger, expansion_issues = prepare_expansions(
+        incumbent, desired, planning_ledger, checkpoint_id, _all_checkpoints(run_dir),
+        unavailable={(e.get("package"), e.get("target")) for e in planning_ledger.get("targetAvailabilityDeferrals", [])
+                     if e.get("scope") == availability_scope_flat(run, config)})
+    # Scope expansions cannot override an explicit keep-current instruction.
+    desired = {name: incumbent.get(name) if (config.get("packagePolicies") or {}).get(name) == "keep-current" else version
+               for name, version in desired.items()}
+    excluded = set(planning_ledger.get("userDeferredPackages", []))
+    desired = {name: incumbent.get(name) if name in excluded else version for name, version in desired.items()
+               if name in incumbent or name not in excluded}
+    planning_targets = dict(desired)
+    actionable = [name for name, version in sorted(desired.items()) if version != incumbent.get(name)]
+    if expansion_issues:
+        _emit_status({"event": "plan-next.scope-expansion-deferred", "runId": run["runId"],
+                      "issues": expansion_issues, "message": "Other cohorts continue; exact companion versions are required."})
+
+    # #6: runtime-aware candidate selection BEFORE the expensive materialize.
+    # The run's chosen Node (runtime contract effectiveVersion) is the engine
+    # the install/verification will execute under. A direct target whose
+    # registry engines.node excludes it is deferred here — never materialized,
+    # never converted into a false verification outcome. Abstention (no
+    # metadata, missing manager, probe failure) is compatibility, never a
+    # constraint. Transitive incompatibility stays install evidence.
+    engine_deferrals: List[Dict[str, Any]] = []
+    if actionable:
+        node_version = _normalize_effective_node_version(
+            (config.get("runtime") or {}).get("effectiveVersion") or ""
+        )
+        if node_version:
+            engine_requested = {name: planning_targets[name] for name in actionable}
+            effective_targets, engine_deferrals = _engine_deferred_targets(
+                Path(config.get("projectDir") or ""),
+                incumbent,
+                engine_requested,
+                node_version,
+                _runtime_env(config),
+            )
+            if engine_deferrals:
+                ledger = dict(load_ledger(run_dir))
+                _record_engine_deferrals(ledger, checkpoint_id, engine_deferrals)
+                save_ledger(run_dir, ledger)
+            desired = {
+                name: effective_targets.get(name, incumbent.get(name))
+                for name in desired
+                if name in incumbent or name in effective_targets
+            }
+            actionable = [
+                name
+                for name, version in sorted(desired.items())
+                if name in effective_targets and effective_targets[name] != incumbent.get(name)
+            ]
+            # Original target policy remains authoritative after engine filtering.
+
+    # A verified npm ETARGET defers only the named target in this bounded run
+    # and registry context. It is scheduling evidence, never a solver nogood;
+    # source repairs/new checkpoints do not make a missing version appear.
+    availability_deferred = unavailable_targets(load_ledger(run_dir), run, config)
+    actionable = [name for name in actionable if name not in availability_deferred]
+    desired = {name: incumbent.get(name) if name in availability_deferred else version
+               for name, version in desired.items() if name in incumbent or name not in availability_deferred}
+
+    if not actionable:
+        # Policy is satisfied only when EVERY requested target is present in
+        # the current checkpoint at its exact target version. A target that is
+        # deferred, blocked or not (yet) in scope keeps the policy unmet: it
+        # stays in the remainder and denominator, and the run is NOT terminal
+        # with a satisfied policy.
+        satisfied = bool(targets) and all(
+            name in incumbent and str(targets[name]) == str(incumbent[name])
+            for name in targets
+        )
+        terminal_name = "POLICY_SATISFIED_NEEDS_AUDIT" if satisfied else "NO_ACTIONABLE"
+        run = dict(run)
+        run["updatedAt"] = _now_iso()
+        if not satisfied:
+            run["terminal"] = terminal_name
+            run["phase"] = "TERMINAL"
+            save_run(run_dir, run)
+        _emit_status(
+            {
+                "event": "plan-next.no-candidate",
+                "runId": run["runId"],
+                "checkpointId": checkpoint_id,
+                "reason": terminal_name,
+                "remainingActionable": len(actionable),
+                "targets": len(targets),
+                "engineDeferred": len(engine_deferrals),
+            }
+        )
+        return 0
+
+    ledger = load_ledger(run_dir)
+    from iterative_stage_checkpoint import negative_evidence_scope
+    negative_scope = (negative_evidence_scope(run_dir, config, checkpoint_id, checkpoint=checkpoint)
+                      if any(entry.get("evidenceScope") for entry in ledger.get("blocks", [])) else None)
+    blocks = [
+        entry
+        for entry in ledger.get("blocks", [])
+        if entry.get("kind") in {"NEGATIVE_VERIFY", "NOT_ACTIONABLE"}
+        and entry.get("baseCheckpointId") == checkpoint_id
+        and negative_scope is not None and entry.get("evidenceScope") == negative_scope
+    ]
+    blocked_fingerprints = {
+        str(entry.get("assignmentFingerprint"))
+        for entry in blocks
+        if str(entry.get("assignmentFingerprint") or "").strip()
+    }
+    # Deferrals suppress repetition only for the exact assignment on the
+    # current verified base. They remain separate from incompatibility blocks.
+    blocked_fingerprints.update(
+        str(entry["assignmentFingerprint"])
+        for entry in ledger.get("deferrals", [])
+        if entry.get("baseCheckpointId") == checkpoint_id
+        and entry.get("assignmentFingerprint")
+    )
+    learned_nogoods = [
+        dict(entry.get("nogood") or {})
+        for entry in ledger.get("blocks", [])
+        if entry.get("kind") == "NEGATIVE_VERIFY"
+        and isinstance(entry.get("nogood"), dict)
+        and entry.get("nogood")
+        and entry.get("scope") == "deterministic"
+        and negative_scope is not None and entry.get("evidenceScope") == negative_scope
+    ]
+    # Recoverable, registry-scoped infra blocks: an identical install must not
+    # be silently re-proposed for the same configuration. They are scheduling
+    # blockers only — never compatibility evidence.
+    current_scope = availability_scope_flat(run, config)
+    infra_blocked_fps = {
+        str(entry.get("assignmentFingerprint"))
+        for entry in ledger.get("infraBlocks", [])
+        if entry.get("scopeHash") == current_scope
+        and entry.get("baseCheckpointId") == checkpoint_id
+        and str(entry.get("assignmentFingerprint") or "").strip()
+    }
+    blocked_fingerprints.update(infra_blocked_fps)
+    blocked_fingerprints.update(
+        str(e["assignmentFingerprint"]) for e in ledger.get("scopeExpansions", [])
+        if e.get("baseCheckpointId") == checkpoint_id and e.get("assignmentFingerprint"))
+    from cohort_action_cost import observation_scope
+    planning_ledger["schedulerObservations"] = [
+        row for row in ledger.get("schedulerObservations", [])
+        if row.get("scope") == observation_scope(run, config)]
+    from cohort_conflict_regions import region_source_key
+    region_source = region_source_key(checkpoint)
+    planning_ledger["conflictRegions"] = [r for r in ledger.get("conflictRegions", []) if region_source is not None and r.get("scope") == observation_scope(run, config) and r.get("sourceHintKey") == region_source]
+    size_state = ledger.get("cohortSizeState") or {}
+    planning_ledger["cohortSizeState"] = size_state if size_state.get("scope") == observation_scope(run, config) else {}
+    if config.get("cohortSchedulingStrategy") == "cost-aware":
+        raise InvalidInputError("COST_AWARE_EXPERIMENTAL_ONLY: use adaptive-size or whole-first for physical migrations")
+    from iterative_cohort_planner import plan_adaptive_cohort
+    plan, cohort_selection = plan_adaptive_cohort(
+        incumbent=incumbent, desired=desired, config=config, ledger=planning_ledger,
+        checkpoints=_all_checkpoints(run_dir), base_checkpoint_id=checkpoint_id,
+        blocked_fingerprints=blocked_fingerprints, learned_nogoods=learned_nogoods,
+        fingerprint_fn=assignment_fingerprint,
+    )
+    if cohort_selection.get("budgetAdapted"):
+        _emit_status({"event": "plan-next.cohort-budget-expanded", "runId": run["runId"],
+                      "configuredMaxPackages": cohort_selection["configuredMaxPackages"],
+                      "maxPackages": cohort_selection["maxPackages"],
+                      "reason": "new mandatory assignment after verified progress; hard cap 32"})
+    if cohort_selection.get("cohortAtomIssues"):
+        _emit_status({"event": "plan-next.cohort-atom-deferred", "runId": run["runId"],
+                      "issues": cohort_selection["cohortAtomIssues"],
+                      "message": "Cohort cap preserved; other independent groups continue."})
+    atomic_groups = [list(plan.packages)] if plan else []
+    if plan is None:
+        if cohort_selection.get("searchBudgetExhausted"):
+            raise BudgetExceededError(
+                "COHORT_SEARCH_BUDGET_EXHAUSTED: проверенный checkpoint сохранён. "
+                "Автоматическое расширение поиска достигло лимита 4096; "
+                "предложите точные альтернативные версии или уменьшите состав обновления.")
+        all_blocked = len(actionable) > 0
+        if all_blocked and infra_blocked_fps:
+            # Recoverable infra stop with evidence: NOT scope exhaustion and NOT
+            # a terminal. The verified checkpoint is preserved; the user retries
+            # with plan-next --retry-infra after the cause changed.
+            run = dict(run)
+            run["phase"] = "READY"
+            run["activeCandidateId"] = None
+            run["infraBlocked"] = {
+                "baseCheckpointId": checkpoint_id,
+                "scopeHash": current_scope,
+                "blockedFingerprints": sorted(infra_blocked_fps),
+                "classification": "infrastructure",
+                "reason": "materialize failed with an infrastructure cause; recoverable after the cause changes",
+                "blockedAt": _now_iso(),
+            }
+            run["updatedAt"] = _now_iso()
+            save_run(run_dir, run)
+            # The terminal-concluded candidate is left over from the exhausted
+            # materialize; clear it so the coordinator does not re-schedule or
+            # re-materialize a REJECTED candidate. Its evidence is durable in
+            # ledger.infraBlocks and run.infraBlocked.
+            if active_candidate is not None and active_candidate.get("stage") == "REJECTED":
+                clear_candidate(run_dir)
+            _emit_status(
+                {
+                    "event": "plan-next.infra-blocked",
+                    "runId": run["runId"],
+                    "checkpointId": checkpoint_id,
+                    "reason": "INFRA_BLOCKED",
+                    "blockedFingerprints": len(infra_blocked_fps),
+                }
+            )
+            return 0
+        reason = "SCOPE_EXHAUSTED" if all_blocked else "NO_ACTIONABLE"
+        run = dict(run)
+        run["terminal"] = reason
+        run["phase"] = "TERMINAL"
+        run["updatedAt"] = _now_iso()
+        save_run(run_dir, run)
+        _emit_status(
+            {
+                "event": "plan-next.no-candidate",
+                "runId": run["runId"],
+                "checkpointId": checkpoint_id,
+                "reason": reason,
+                "blockedFingerprints": len(blocked_fingerprints),
+            }
+        )
+        return 0
+
+    assignment = plan.assignment_dict
+    cohort_id = _new_id("cohort")
+    changed = {
+        name: assignment[name]
+        for name in plan.packages
+        if str(incumbent.get(name)) != str(assignment.get(name))
+    }
+    # D4.5/D4.6: separate, non-fatal diagnostics over the project manifest —
+    # resolution-pin warnings and malformed Git dependency specs are surfaced
+    # alongside the candidate, never converted into install constraints.
+    dependency_diagnostics = _dependency_diagnostics(config.get("projectDir") or "")
+    candidate: Dict[str, Any] = {
+        "schemaVersion": SCHEMA_VERSION,
+        "candidateId": _new_id("cand"),
+        "runId": run["runId"],
+        "baseCheckpointId": checkpoint_id,
+        "cohortId": cohort_id,
+        "policyHash": str(config["policyHash"]),
+        "fullAssignment": assignment,
+        "scopeExpansionAdditions": {name: version for name, version in assignment.items() if name not in incumbent},
+        "scopeExpansionVersions": {n: v for n, v in assignment.items() if v != targets.get(n) and v != incumbent.get(n)},
+        "delta": {"changed": dict(sorted(changed.items()))},
+        "atomicGroups": [list(group) for group in plan_visible_groups(atomic_groups)],
+        "cohortSelection": cohort_selection,
+        "allowedSourceScope": {
+            "mode": "source-config",
+            "forbiddenRelatives": sorted(FORBIDDEN_TRIAL_RELATIVES),
+        },
+        "stage": "PLANNED",
+        "attemptId": 0,
+        "agentSessionId": "",
+        "feedbackRevision": 0,
+        "budgetConsumed": {},
+        "materializationRefs": {},
+        "resolverContextKey": "",
+        "dependencyDiagnostics": dependency_diagnostics,
+        "createdAt": _now_iso(),
+        "updatedAt": _now_iso(),
+    }
+    save_candidate(run_dir, candidate)
+    run = dict(run)
+    run["activeCandidateId"] = candidate["candidateId"]
+    run["phase"] = "PLANNING"
+    if run.get("infraBlocked"):
+        run["infraBlocked"] = None
+        run["terminal"] = None
+    run["updatedAt"] = _now_iso()
+    save_run(run_dir, run)
+    _emit_status(
+        {
+            "event": "plan-next.candidate",
+            "runId": run["runId"],
+            "candidateId": candidate["candidateId"],
+            "baseCheckpointId": checkpoint_id,
+            "cohortPackages": sorted(changed.keys()),
+            "cohortSelection": cohort_selection,
+            "assignmentFingerprint": assignment_fingerprint(assignment),
+            "changedCount": len(changed),
+            "dependencyDiagnostics": dependency_diagnostics,
+            "engineDeferred": len(engine_deferrals),
+        }
+    )
+    return 0
+
+
+def plan_visible_groups(atomic_groups: Sequence[Sequence[str]]) -> Sequence[Sequence[str]]:
+    return atomic_groups
+
+
+def _is_git_dependency(spec: str) -> bool:
+    lowered = spec.lower()
+    return (
+        "git+" in lowered
+        or lowered.startswith("git://")
+        or "git@" in lowered
+        or lowered.startswith(("github:", "gitlab:", "bitbucket:"))
+        or ".git" in lowered
+    )
+
+
+def _git_dependency_issue(name: str, spec: str) -> Dict[str, Any]:
+    """Deterministic, local-only checks for a malformed Git dependency spec
+    (D4.6). Returns {} when the form is plausibly parseable — this is a
+    diagnostic, never an installer."""
+    lowered = spec.lower()
+    if any(ch in spec for ch in (" ", "\t", "\n", "\\", '"', "'")):
+        return {"code": "GIT_URL_WHITESPACE", "detail": "spec contains whitespace or quote characters"}
+    if "git@" in lowered and ":" not in spec:
+        return {"code": "GIT_SSH_WITHOUT_COLON", "detail": "ssh form 'git@<host><path>' must separate host and path with ':'"}
+    if "git+" in lowered and not any(
+        lowered.startswith(prefix) for prefix in ("git+ssh://", "git+https://", "git+http://", "git+file://")
+    ):
+        return {"code": "GIT_PLUS_NO_SCHEME", "detail": "'git+' must be followed by ssh://, https://, http:// or file://"}
+    for prefix in ("git+ssh://", "git+https://", "git+http://", "git://"):
+        if lowered.startswith(prefix):
+            rest = spec[len(prefix):].split("#", 1)[0]
+            if not rest or rest.split("/", 1)[0] in {"", ":", "."}:
+                return {"code": "GIT_URL_NO_HOST", "detail": f"{prefix} carries no host"}
+    return {}
+
+
+def _dependency_diagnostics(project_dir: Any) -> Dict[str, Any]:
+    """D4.5/D4.6: NON-FATAL structured diagnostics over the project manifest.
+
+    ``resolutionWarnings``: pins in `resolutions`/`overrides` that are not a
+    version-looking spec or that pin a package with no direct consumer; they
+    are surfaced separately and never become false install constraints.
+    ``gitUrlWarnings``: deterministically malformed Git dependency specs.
+    A missing/unreadable manifest yields ``manifestReadError``, never an
+    exception, so planning cannot be blocked by diagnostics.
+    """
+    result: Dict[str, Any] = {
+        "resolutionWarnings": [],
+        "gitUrlWarnings": [],
+        "manifestReadError": "",
+    }
+    manifest_path = Path(str(project_dir)) / "package.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+    except Exception as exc:  # noqa: BLE001 - diagnostics must never fail planning
+        result["manifestReadError"] = f"{exc}"
+        return result
+
+    pins: Dict[str, Any] = {}
+    for field in ("resolutions", "overrides"):
+        raw = manifest.get(field) or {}
+        if isinstance(raw, dict):
+            pins.update(raw)
+    consumers: Dict[str, Any] = {}
+    for field in ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies"):
+        raw = manifest.get(field) or {}
+        if isinstance(raw, dict):
+            consumers.update(raw)
+    consumer_names = set(consumers)
+
+    for pin_key, pin_spec in sorted(pins.items()):
+        pin_key_str = str(pin_key)
+        if pin_key_str.startswith("@"):
+            package_part = pin_key_str.split("@", 2)[1] if pin_key_str.count("@") >= 2 else pin_key_str
+        else:
+            package_part = pin_key_str.rsplit("@", 1)[0] if pin_key_str.count("@") == 1 else pin_key_str
+        if not any(ch.isdigit() for ch in str(pin_spec)):
+            result["resolutionWarnings"].append({
+                "pin": pin_key_str,
+                "spec": str(pin_spec),
+                "code": "PIN_SPEC_NOT_VERSION",
+                "detail": "pin value does not look like a version spec",
+            })
+        if not any(
+            name == package_part
+            or (name.startswith(package_part + "@"))
+            for name in consumer_names
+        ):
+            result["resolutionWarnings"].append({
+                "pin": pin_key_str,
+                "spec": str(pin_spec),
+                "code": "PIN_WITHOUT_DIRECT_CONSUMER",
+                "detail": "pin has no direct consumer in the manifest; it cannot be the source of a resolved version",
+            })
+
+    for name, spec in sorted(consumers.items()):
+        spec_str = str(spec)
+        if not _is_git_dependency(spec_str):
+            continue
+        issue = _git_dependency_issue(name, spec_str)
+        if issue:
+            result["gitUrlWarnings"].append({"package": name, "spec": spec_str, **issue})
+    return result
+
+
+# The wall-clock deadline shared by ALL registry probe threads of one
+# `_discover_targets` phase. A module-level "active phase" value is deliberate:
+# it is the mechanism that passes the discovery budget INTO every request, so
+# an in-flight probe bounds its own subprocess to the time remaining until the
+# deadline instead of running a full fixed timeout PAST it. 0.0 means "no
+# bounded discovery phase active" (the probe keeps its default timeout). It is
+# set for the duration of the probe phase only and restored in ``finally``.
+_ACTIVE_DISCOVERY_DEADLINE: float = 0.0
+
+# The parsed-lockfile inventory of the CURRENT discovery phase (C1). Set once
+# per `_discover_targets` so every `_installed_version` probe reads the
+# canonical lockfile from memory instead of re-reading and re-parsing it per
+# package — a 10k-record lockfile is parsed once, not once per direct
+# dependency. A contextvar (not a plain global) lets sequential probes read it
+# directly. It is restored in ``finally``; `_installed_version` falls back to
+# building the inventory on demand when none is active. Python 3.14 no longer
+# copies contextvars into ThreadPoolExecutor workers, so the parallel branch
+# hands the same read-only instance to every worker explicitly (each worker
+# sets the contextvar for the duration of its probe).
+_ACTIVE_INVENTORY: "contextvars.ContextVar[Optional[ResolutionInventory]]" = contextvars.ContextVar(
+    "iterative_active_resolution_inventory", default=None
+)
+
+
+def _probe_budget_timeout(default_seconds: int = 60) -> Optional[int]:
+    """Subprocess timeout for ONE registry probe under the active discovery
+    deadline.
+
+    Returns ``None`` when the budget is already exhausted — the probe is
+    SKIPPED without spawning anything (abstention, never a constraint). When a
+    deadline is active the returned timeout is the smaller of ``default_seconds``
+    and the wall time remaining until the deadline, clamped to at least 1s, so
+    a parallel probe that starts near the deadline is killed AT the deadline
+    instead of continuing a full default past it.
+    """
+    deadline = _ACTIVE_DISCOVERY_DEADLINE
+    if deadline <= 0.0:
+        return default_seconds
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return None
+    return int(max(1, min(default_seconds, remaining)))
+
+
+_ACTIVE_REGISTRY_METADATA: "contextvars.ContextVar[Optional[NpmDiscoveryMetadata]]" = contextvars.ContextVar(
+    "iterative_registry_metadata", default=None
+)
+_UNSET_YARN_DISCOVERY_ROOT = object()
+_ACTIVE_DISCOVERY_YARN_ROOT: "contextvars.ContextVar[object]" = contextvars.ContextVar(
+    "iterative_discovery_yarn_root", default=_UNSET_YARN_DISCOVERY_ROOT
+)
+
+
+def _registry_failure_class(output: str, *, timed_out: bool = False) -> str:
+    """Return a fixed diagnostic category. NEVER emit raw URLs/tokens/stderr."""
+    if timed_out:
+        return "timeout"
+    text = str(output or "").lower()
+    if any(word in text for word in ("e401", "e403", "yn0041", "yn0044", "unauthorized", "forbidden", "authentication", "invalid authentication")):
+        return "authentication"
+    if any(word in text for word in ("e404", "not found", "yn0035")):
+        return "not-found"
+    if any(word in text for word in ("enotfound", "eai_again", "econnreset", "econnrefused", "etimedout", "esockettimedout", "self_signed_cert", "certificate", "unable to verify")):
+        return "network-or-tls"
+    return "command-failed"
+
+
+def _query_discovery_metadata(project_dir: Path, args: List[str], runtime_env: Optional[Dict[str, str]]) -> Any:
+    from planning_cache import cached_query, public_cli_context
+    if _probe_budget_timeout() is None:
+        return None, False, "budget-exhausted", ""
+    context = public_cli_context(project_dir, runtime_env)
+    if context is None:
+        return _query_discovery_metadata_live(project_dir, args, runtime_env)
+    def check():
+        if _probe_budget_timeout() is None:
+            raise BudgetExceededError("DISCOVERY_DEADLINE_EXCEEDED")
+    try:
+        return cached_query(["registry-cli-v1", context, args],
+                            lambda: _query_discovery_metadata_live(project_dir, args, runtime_env), check=check)
+    except BudgetExceededError:
+        return None, False, "budget-exhausted", ""
+
+
+def _query_discovery_metadata_live(project_dir: Path, args: List[str], runtime_env: Optional[Dict[str, str]]) -> Any:
+    """Query a package's *actual* registry in a read-only planning subprocess.
+
+    Modern Yarn may use npmScopes/npmRegistries credentials in .yarnrc.yml
+    that npm view cannot read. Therefore prefer `yarn npm info` from the
+    authoritative package-manager root for Yarn Berry. Other managers retain
+    npm view. Unknown/unavailable responses never produce invented targets.
+    """
+    timeout = _probe_budget_timeout()
+    if timeout is None:
+        return None, False, "budget-exhausted", ""
+    yarn_root = _ACTIVE_DISCOVERY_YARN_ROOT.get()
+    if yarn_root is _UNSET_YARN_DISCOVERY_ROOT:
+        yarn_root = modern_yarn_root(project_dir)
+    if yarn_root is not None:
+        yarn = resolve_executable("yarn")
+        if not yarn:
+            return None, False, "yarn-cli-unavailable", "yarn-native"
+        name = str(args[1])
+        versioned_name, _, alternative_range = name.rpartition("@")
+        is_alternative = args[2:4] == ["version", "engines.node"] and bool(versioned_name)
+        versions = alternative_range.split(" || ") if is_alternative else []
+        package = versioned_name if versions else name
+        commands = (
+            [[yarn, "npm", "info", f"{package}@{version}", "--fields", "version,engines", "--json"] for version in versions]
+            if versions else [[yarn, "npm", "info", package, "--fields", "version,dist-tags,versions,engines", "--json"]]
+        )
+        rows: list[dict[str, Any]] = []
+        for query_index, command in enumerate(commands):
+            remaining = _probe_budget_timeout()
+            if remaining is None:
+                return None, bool(rows), "budget-exhausted", "yarn-native"
+            try:
+                result = _run(command, yarn_root, timeout_seconds=remaining,
+                              env=runtime_env or {}, base_env=os.environ,
+                              progress_label=f"yarn registry metadata {package}")
+            except subprocess.TimeoutExpired:
+                return None, True, "timeout", "yarn-native"
+            except Exception:
+                return None, True, "command-failed", "yarn-native"
+            if result.returncode != 0:
+                return None, True, _registry_failure_class((result.stdout or "") + (getattr(result, "stderr", "") or "")), "yarn-native"
+            if versions:
+                row = normalize_yarn_alternative(result.stdout or "", versions[query_index])
+                if row is not None:
+                    rows.append(row)
+            else:
+                parsed = normalize_yarn_packument(result.stdout or "", package)
+                return parsed, True, "" if parsed is not None else "metadata-invalid", "yarn-native"
+        return rows, len(commands), "", "yarn-native"
+
+    manager = resolve_executable("npm")
+    if not manager:
+        return None, False, "npm-cli-unavailable", "npm-cli"
+    # Run from the canonical manager directory: a selected nested workspace
+    # package might otherwise hide the root .npmrc registry configuration.
+    inventory = _ACTIVE_INVENTORY.get()
+    lockfile = (inventory.lock_path if inventory is not None and inventory.belongs_to(project_dir)
+                else canonical_lockfile_path(project_dir))
+    query_root = lockfile.parent if lockfile is not None else project_dir
+    try:
+        result = _run([manager, *args], query_root, timeout_seconds=timeout,
+                      env=runtime_env or {}, base_env=os.environ,
+                      progress_label=f"registry metadata {args[1]}")
+    except subprocess.TimeoutExpired:
+        return None, True, "timeout", "npm-cli"
+    except Exception:
+        return None, True, "command-failed", "npm-cli"
+    if result.returncode != 0:
+        return None, True, _registry_failure_class((result.stdout or "") + (getattr(result, "stderr", "") or "")), "npm-cli"
+    try:
+        from iterative_registry_metadata import registry_json
+        return registry_json(result.stdout), True, "", "npm-cli"
+    except (ValueError, TypeError):
+        return None, True, "metadata-invalid", "npm-cli"
+
+
+def _normalize_effective_node_version(value: Any) -> str:
+    """x.y.z from an effective Node version string (v-prefix/build tolerated)."""
+    text = str(value or "").strip().lstrip("vV").split("+", 1)[0]
+    parts = text.split(".")
+    if len(parts) >= 3 and all(part.isdigit() for part in parts[:3]):
+        return ".".join(parts[:3])
+    return text
+
+
+def _npm_engines_node(
+    project_dir: Path,
+    name: str,
+    version: str,
+    runtime_env: Optional[Dict[str, str]],
+) -> str:
+    """Best-effort registry ``engines.node`` of ``name@version``.
+
+    Deliberately evidence-light and safe: a missing manager, a failed probe or
+    an unparsable answer returns '' — an abstention that is treated as
+    COMPATIBLE, never as a false incompatibility constraint. Only an actual
+    engines.node range from the registry may defer a target.
+    """
+    metadata = _ACTIVE_REGISTRY_METADATA.get()
+    if metadata is not None and metadata.name == name:
+        return metadata.engines(version)
+    data, *_ = _query_discovery_metadata(project_dir,
+        ["view", f"{name}@{version}", "version", "engines.node", "--json"], runtime_env)
+    from iterative_registry_metadata import _engine
+    for row in data if isinstance(data, list) else [data]:
+        if isinstance(row, dict) and str(row.get("version", "")).lstrip("vV") == version.lstrip("vV"):
+            return _engine(row)
+    return ""
+
+
+def _npm_latest_version(
+    project_dir: Path,
+    name: str,
+    runtime_env: Optional[Dict[str, str]],
+) -> str:
+    """Exact registry ``dist-tags.latest`` of a package ('' = no evidence)."""
+    metadata = _ACTIVE_REGISTRY_METADATA.get()
+    if metadata is not None and metadata.name == name:
+        return metadata.latest()
+    manager = resolve_executable("npm")
+    if not manager:
+        return ""
+    probe_timeout = _probe_budget_timeout()
+    if probe_timeout is None:
+        return ""
+    try:
+        completed = _run(
+            [manager, "view", name, "dist-tags.latest", "--json"],
+            project_dir,
+            timeout_seconds=probe_timeout,
+            env=runtime_env or {},
+            base_env=os.environ,
+            progress_label=f"target discovery {name}",
+        )
+    except Exception:  # noqa: BLE001 - a probe failure is abstention, never a constraint
+        return ""
+    if completed.returncode != 0:
+        return ""
+    text = (completed.stdout or "").strip()
+    if not text or text in ("{}", "null", "undefined"):
+        return ""
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        parsed = text
+    if isinstance(parsed, dict):
+        parsed = parsed.get("latest")
+    return str(parsed or "").strip()[:128]
+
+
+def _npm_versions(
+    project_dir: Path,
+    name: str,
+    runtime_env: Optional[Dict[str, str]],
+    top: int = 12,
+) -> List[str]:
+    """Registry version list of a package, newest-first, bounded ([] = none).
+
+    Best-effort, evidence-light and safe: any probe failure returns an empty
+    list — abstention, never a constraint. The bound keeps engine-affinity
+    discovery cheap even for packages with thousands of published versions.
+    """
+    metadata = _ACTIVE_REGISTRY_METADATA.get()
+    if metadata is not None and metadata.name == name:
+        return metadata.versions(top, _version_sort_key)
+    manager = resolve_executable("npm")
+    if not manager:
+        return []
+    probe_timeout = _probe_budget_timeout()
+    if probe_timeout is None:
+        return []
+    try:
+        completed = _run(
+            [manager, "view", name, "versions", "--json"],
+            project_dir,
+            timeout_seconds=probe_timeout,
+            env=runtime_env or {},
+            base_env=os.environ,
+            progress_label=f"version discovery {name}",
+        )
+    except Exception:  # noqa: BLE001 - a probe failure is abstention, never a constraint
+        return []
+    if completed.returncode != 0:
+        return []
+    text = (completed.stdout or "").strip()
+    if not text or text in ("{}", "null", "undefined"):
+        return []
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        parsed = text
+    if not isinstance(parsed, list):
+        parsed = [parsed] if isinstance(parsed, str) else []
+    versions = [str(item).strip()[:128] for item in parsed if isinstance(item, str) and item.strip()]
+    return sorted(versions, key=_version_sort_key, reverse=True)[:top]
+
+
+def _version_sort_key(value: str) -> Tuple[int, ...]:
+    """Best-effort descending version key (x.y.z, prerelease/beta tolerated)."""
+    key: List[int] = []
+    for part in str(value).lstrip("vV").split("."):
+        try:
+            key.append(int(part.split("-")[0]))
+        except ValueError:
+            key.append(0)
+    return tuple(key)
+
+
+def _exact_version(value: str) -> Optional["Version"]:
+    """Strict npm-semver parse of an exact published version ('' on failure)."""
+    if Version is None:
+        return None
+    text = str(value or "").strip().lstrip("vV")
+    if not text:
+        return None
+    try:
+        return Version(text)
+    except ValueError:
+        return None
+
+
+def _declared_floor(spec: str) -> Optional["Version"]:
+    """Lowest version the declared spec admits, or None when undecidable.
+
+    The "never downgrade" guard of target discovery: a candidate may be
+    proposed ONLY when it is provably strictly newer than this floor, so a
+    migration can never silently downgrade a package below its declared range.
+    Conservative by construction: an undecidable floor (upper-bound-only or
+    negative spec) yields None, which refuses any alternative — keeping the
+    current version instead of risking a downgrade. ``||`` takes the smallest
+    clause floor; bare ``*``/``x`` admits every version, so its floor is 0.0.0.
+    """
+    if Version is None:
+        return None
+    text = str(spec or "").strip()
+    if not text:
+        return None
+    if "||" in text:
+        floors = [f for f in (_declared_floor(part) for part in text.split("||")) if f is not None]
+        return min(floors) if floors else None
+    if " - " in text:
+        return _declared_floor(text.split(" - ", 1)[0].strip())
+    candidate = text
+    for op in ("^", "~", ">=", "<=", ">", "<", "=", "!"):
+        if candidate.startswith(op):
+            if op in ("<", "<=", "!"):
+                return None  # upper-bound/negative-only ranges have no floor
+            candidate = candidate[len(op):].strip()
+            break
+    if candidate in ("", "*", "x", "X"):
+        if str(spec).strip() in ("*", "x", "X"):
+            return Version("0.0.0")
+        return None
+    match = re.fullmatch(r"(\d+)(?:\.(\d+))?(?:\.(\d+))?", candidate)
+    if match:
+        major, minor, patch = match.groups()
+        return Version(".".join([major, minor or "0", patch or "0"]))
+    return _exact_version(candidate)
+
+
+def _strictly_newer(candidate: str, declared_spec: str) -> bool:
+    """True ONLY when ``candidate`` is provably newer than the declared floor.
+
+    An undecidable floor or an unparsable candidate refuses the proposal
+    (returns False) — a discovery that cannot prove an upgrade is an upgrade
+    must keep the current version rather than downgrade or invent anything.
+    """
+    floor = _declared_floor(declared_spec)
+    if floor is None:
+        return False
+    parsed = _exact_version(candidate)
+    if parsed is None:
+        return False
+    return parsed > floor
+
+
+def _installed_version(project_dir: Path, package_name: str, declared_spec: Optional[str] = None) -> Optional[str]:
+    """The exact version of a direct dependency RESOLVED by the canonical
+    lockfile — the real installed version the never-downgrade guard compares a
+    candidate against.
+
+    Background: the declared spec in package.json is a RANGE (``^8.0.0``), not
+    an installed version; the project is actually installed at whatever the
+    lockfile resolved (say 8.5.0). Comparing a candidate with the range floor
+    would accept 8.1.0 as an "upgrade" and silently downgrade the installed
+    package. The lockfile is the reliable source of what is installed. For
+    yarn.lock the DECLARED spec of the direct dependency is needed to select
+    the direct resolution among several selectors of the same package name
+    (see ``_yarn_lock_installed_version``). For a workspace member the
+    canonical lockfile is the SHARED root lockfile of the manager package, and
+    the member-local record is what proves the member's own resolution (see
+    ``ResolutionInventory``). ``None`` means the installed version cannot be
+    proven reliably (no canonical lockfile, unreadable file, ambiguous
+    resolution) — the caller MUST abstain for the package instead of choosing
+    against a guess.
+
+    The active discovery-phase inventory (C1) is consulted first so the
+    lockfile is parsed once per phase, not once per package; outside an active
+    phase (direct helper/tests) the inventory is built on demand.
+    """
+    name = str(package_name)
+    inventory = _ACTIVE_INVENTORY.get()
+    if inventory is None or not inventory.belongs_to(project_dir):
+        inventory = ResolutionInventory.for_project(project_dir)
+    if inventory is None:
+        return None
+    return inventory.installed_version(name, declared_spec)
+
+
+def _yarn_direct_selectors(package_name: str, declared_spec: Optional[str]) -> List[str]:
+    """The yarn.lock block-key selector(s) that identify the DIRECT dependency.
+
+    Yarn v1 keys a direct dependency by its verbatim declared spec
+    (``sample@^8.0.0``), possibly routed through an explicit ``npm:``
+    protocol. Empty when the declared spec is unknown — the caller then falls
+    back to a unique resolution across every selector of the package.
+    """
+    if not declared_spec:
+        return []
+    name = str(package_name)
+    spec = str(declared_spec).strip()
+    raw = spec[len("npm:"):].strip() if spec.startswith("npm:") else spec
+    return [f"{name}@{raw}", f"{name}@npm:{raw}"]
+
+
+def _npm_lock_installed_version(lock_path: Path, package_name: str) -> Optional[str]:
+    """package-lock.json / npm-shrinkwrap.json exact direct resolution.
+
+    Root-only (no workspace member context): for a workspace member use
+    ``ResolutionInventory``, which reads the SHARED root lockfile with the
+    member-local record (A1). The lookup itself is shared with the inventory
+    (``npm_lock_resolved_version``).
+    """
+    try:
+        data = json.loads(lock_path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return npm_lock_resolved_version(
+        data.get("packages") if isinstance(data.get("packages"), dict) else None,
+        data.get("dependencies") if isinstance(data.get("dependencies"), dict) else None,
+        package_name,
+        "",
+    )
+
+
+def _split_yarn_selectors(value: str) -> List[str]:
+    """Split a yarn.lock block key (one or more selectors separated by commas,
+    each optionall quoted) into individual selectors."""
+    parts: List[str] = []
+    buf: List[str] = []
+    quote = ""
+    for ch in str(value or ""):
+        if ch in ('"', "'"):
+            if not quote:
+                quote = ch
+            elif quote == ch:
+                quote = ""
+            else:
+                buf.append(ch)
+            continue
+        if ch == "," and not quote:
+            if "".join(buf).strip():
+                parts.append("".join(buf).strip())
+            buf = []
+        else:
+            buf.append(ch)
+    if "".join(buf).strip():
+        parts.append("".join(buf).strip())
+    return parts
+
+
+def _yarn_selector_for(selector: str, package_name: str) -> bool:
+    """True when a yarn selector names this package (``name@range``,
+    ``@scope/name@range``, with or without an explicit ``npm:`` protocol)."""
+    text = str(selector).strip().strip('"')
+    return text == package_name or text.startswith(f"{package_name}@")
+
+
+def _yarn_lock_installed_version(lock_path: Path, package_name: str, declared_spec: Optional[str] = None) -> Optional[str]:
+    """yarn.lock (v1) exact direct resolution by selector-key matching.
+
+    A block key joins one or more selectors; a DIRECT dependency resolves to
+    one version. When the DIRECT spec is known (``declared_spec`` from
+    package.json) the matching selector is ``<name>@<declared>`` — yarn v1 keys
+    the direct dependency by its verbatim declared spec — and only blocks with
+    that selector are counted, so a TRANSITIVE resolution of the same package
+    name (e.g. ``sample@^7.0.0`` under a direct ``sample@^8.0.0``) can never
+    shadow or merge with the direct one and silently unmount the project's
+    installed version. If NO block carries the declared selector the DIRECT
+    resolution is not proven and None is returned (abstention — a transitive
+    version is never mistaken for the installed direct one). Several DIFFERENT
+    resolutions for the same selector are ambiguous and yield None (abstention,
+    never a guess). Without a declared spec (pure helper use) a single
+    resolution across all selectors of the package is accepted.
+    """
+    from yarn_berry import is_berry_lock, lock_mapping
+    if is_berry_lock(lock_path):
+        mapping = lock_mapping(lock_path)
+        if declared_spec is not None:
+            return mapping.get(f"{package_name}@{declared_spec}") or mapping.get(f"{package_name}@npm:{declared_spec}")
+        versions = {version for selector, version in mapping.items() if _yarn_selector_for(selector, str(package_name))}
+        return versions.pop() if len(versions) == 1 else None
+    try:
+        lines = lock_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    name = str(package_name)
+    selectors = _yarn_direct_selectors(name, declared_spec)
+    blocks: List[Tuple[List[str], str]] = []
+    keys: List[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if not line.startswith(" "):
+            # A block header: a line ending with ':' carries the selectors;
+            # other top-level lines (e.g. "# yarn lockfile v1") start a keyless
+            # region that can not record a version.
+            keys = _split_yarn_selectors(stripped[:-1]) if stripped.endswith(":") else []
+            continue
+        match = re.match(r'\s*version\s+"([^"]+)"', line)
+        if match and keys and any(_yarn_selector_for(key, name) for key in keys):
+            blocks.append((list(keys), match.group(1)))
+    if selectors:
+        # Review re-check P1: a TRANSITIVE resolution of the same package name
+        # (e.g. `sample@^7.0.0` -> 7.2.0) must never be mixed into the DIRECT
+        # dependency's installed version (`sample@^8.0.0` -> 8.5.0): that
+        # ambiguity made the whole project abstain and lose every target. Pick
+        # only the block(s) whose selector names the DIRECT declared spec.
+        direct_versions: set = set()
+        for block_keys, version in blocks:
+            if any(key in selectors for key in block_keys):
+                direct_versions.add(version)
+        if direct_versions:
+            return direct_versions.pop() if len(direct_versions) == 1 else None
+        # Review P1 (latest round): the DIRECT resolution is NOT proven when no
+        # block carries the declared selector (e.g. the lockfile only has the
+        # transitive `sample@^7.0.0` -> 7.2.0). Taking the transitive version as
+        # the INSTALLED direct one would let discovery plan an "upgrade" on top
+        # of a version the project never directly resolved — abstain instead.
+        return None
+    # No declared spec (pure helper call outside discovery): accept a single
+    # resolution across every selector of the package, abstain on ambiguity.
+    versions: set = set()
+    for _block_keys, version in blocks:
+        versions.add(version)
+    return versions.pop() if len(versions) == 1 else None
+
+
+def _pnpm_importer_direct_version(lines: Sequence[str], package_name: str) -> Optional[str]:
+    """The resolved version of a DIRECT dependency from the pnpm importer.
+
+    pnpm v9 (lockfileFormat 9.0) records the exact resolved version of every
+    direct dependency in the root importer (see the pnpm lockfile spec)::
+
+        importers:
+          .:
+            dependencies:
+              sample:
+                specifier: ^8.0.0
+                version: 8.5.0
+
+    The importer record IS the direct resolution (unique, no ambiguity with
+    transitive copies), so it wins over the packages snapshot. A version with a
+    peer-dependency suffix (``8.5.0(react@18.0.0)``) is reduced to the bare
+    version. Workspace/link entries (no version, or a ``link:`` value) yield
+    None — abstention, never a guess.
+    """
+    in_importers = False
+    in_root = False
+    in_deps = False
+    pending: Optional[str] = None
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        if indent == 0:
+            in_importers = stripped == "importers:"
+            in_root = False
+            in_deps = False
+            pending = None
+            continue
+        if not in_importers:
+            continue
+        if indent == 2:
+            # Importer key: '.' is the root project itself; other keys are
+            # workspace members and are NOT this project's direct dependencies.
+            in_root = stripped.startswith(".") and not stripped.startswith("..")
+            in_deps = False
+            pending = None
+            continue
+        if not in_root:
+            continue
+        if indent == 4 and stripped in ("dependencies:", "devDependencies:", "optionalDependencies:"):
+            in_deps = True
+            pending = None
+            continue
+        if not in_deps:
+            continue
+        if indent == 6 and stripped.endswith(":"):
+            pending = stripped[:-1]
+            continue
+        if indent == 8 and pending == str(package_name) and stripped.startswith("version:"):
+            raw = stripped[len("version:"):].strip().strip('"').strip("'")
+            match = re.match(r"^[^()]+", raw)
+            return match.group(0).strip() if match and match.group(0).strip() else None
+    return None
+
+
+def _pnpm_lock_installed_version(lock_path: Path, package_name: str) -> Optional[str]:
+    """pnpm-lock.yaml exact DIRECT resolution (best-effort textual parse).
+
+    pnpm v9 (lockfileFormat 9.0) records the resolved version of every direct
+    dependency in the importer section (``importers: ... .: dependencies:
+    <name>: version: 8.5.0``) and keys the packages snapshot WITHOUT a leading
+    slash (``sample@8.5.0``); v6-style lockfiles key it WITH one
+    (``/sample@8.5.0``). The importer record is authoritative (the direct
+    resolution), so it is read first; the packages snapshot is the fallback for
+    older files and accepts a single resolution of the package name — any
+    ambiguity yields None, never a guess.
+    """
+    try:
+        lines = lock_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    importer_version = _pnpm_importer_direct_version(lines, package_name)
+    if importer_version is not None:
+        return importer_version
+    pattern = re.compile(rf"^\s*/?({re.escape(str(package_name))})@([^:()]+)")
+    versions: set = set()
+    for line in lines:
+        match = pattern.match(line.rstrip())
+        if match:
+            versions.add(match.group(2))
+    return versions.pop() if len(versions) == 1 else None
+
+
+def _newer_than_installed(candidate: str, installed: str) -> bool:
+    """True ONLY when ``candidate`` is provably strictly newer than the EXACT
+    installed version. An unparsable candidate or baseline refuses the
+    proposal (False) — a discovery that cannot prove an upgrade is an upgrade
+    keeps the current version rather than downgrading or inventing anything."""
+    parsed = _exact_version(candidate)
+    base = _exact_version(installed)
+    return parsed is not None and base is not None and parsed > base
+
+
+def _discover_one_target(
+    project_dir: Path,
+    name: str,
+    declared: str,
+    runtime_env: Optional[Dict[str, str]],
+    node_version: Optional[str],
+) -> Tuple[Optional[str], Dict[str, Any]]:
+    metadata = NpmDiscoveryMetadata(name, lambda args: _query_discovery_metadata(project_dir, args, runtime_env))
+    token = _ACTIVE_REGISTRY_METADATA.set(metadata)
+    try:
+        target, evidence = _discover_one_target_impl(project_dir, name, declared, runtime_env, node_version)
+        if metadata.queries or (metadata.failure_class and metadata.failure_class != "budget-exhausted"):
+            evidence["registryMetadata"] = {
+                "source": metadata.source, "queries": metadata.queries, "scope": "planning-only",
+                **({"errorClass": metadata.failure_class} if metadata.failure_class else {}),
+            }
+        return target, evidence
+    finally:
+        _ACTIVE_REGISTRY_METADATA.reset(token)
+
+
+def _discover_one_target_impl(
+    project_dir: Path,
+    name: str,
+    declared: str,
+    runtime_env: Optional[Dict[str, str]],
+    node_version: Optional[str],
+) -> Tuple[Optional[str], Dict[str, Any]]:
+    """Probe ONE direct dependency for a bounded target (see ``_discover_targets``).
+
+    Returns ``(target_version_or_None, evidence_row)``. A target is produced
+    only when the registry proves a STRICTLY NEWER version that is compatible
+    with the run's chosen Node (or when no Node is pinned and the choice is
+    engine-unchecked). Abstractions are evidence rows, never targets.
+    """
+    installed = _installed_version(project_dir, name, declared)
+    if installed is None:
+        return None, {
+            "package": name, "declared": declared,
+            "status": "installed-version-unknown",
+            "reason": (
+                f"the exact installed version of {name} cannot be read "
+                "from the canonical lockfile; the never-downgrade guard "
+                "abstains instead of choosing a target against an "
+                "unverifiable baseline"
+            ),
+        }
+    latest = _npm_latest_version(project_dir, name, runtime_env)
+    if not latest:
+        return None, {
+            "package": name, "declared": declared, "installed": installed,
+            "latest": "", "status": "registry-unavailable",
+            "reason": (
+                f"the registry metadata for {name} is unavailable; the upgrade "
+                "cannot be assessed, so no lag is claimed"
+            ),
+        }
+    if latest == installed:
+        return None, {
+            "package": name, "declared": declared, "installed": installed,
+            "latest": latest, "status": "up-to-date",
+        }
+    # Review re-check P1: NEVER accept the registry `latest` until it is
+    # provably STRICTLY newer than the INSTALLED version. This guard runs
+    # BEFORE every direct acceptance of `latest` (both the unpinned-Node and
+    # the pinned-Node/engine-compatible shortcuts): a dist-tag that lags the
+    # installed version (installed 8.5.0, latest 8.1.0) would otherwise be
+    # proposed as a target and roll the package back. When `latest` is not an
+    # upgrade nothing is proposed — the bounded search below (which applies
+    # the same guard per candidate) is the only remaining way a strictly
+    # newer verified version can be chosen — and the unfulfilled intent is
+    # recorded as no-newer-compatible instead of a false completion.
+    if not _newer_than_installed(latest, installed):
+        return None, {
+            "package": name, "declared": declared, "installed": installed,
+            "latest": latest, "status": "no-newer-compatible",
+            "rejected": [
+                {"version": latest, "nodeSpec": "", "status": "not-newer-than-current"}
+            ],
+            "reason": (
+                f"registry latest {latest} is not strictly newer than the "
+                f"INSTALLED {installed}; accepting it would roll the package "
+                "back, so the current version is kept"
+            ),
+        }
+    if not node_version:
+        return latest, {
+            "package": name, "declared": declared, "installed": installed,
+            "latest": latest,
+            "status": "discovered", "engineUnchecked": True,
+        }
+    from project_runtime import node_range_satisfied
+
+    latest_spec = _npm_engines_node(project_dir, name, latest, runtime_env)
+    if not latest_spec or node_range_satisfied(latest_spec, node_version):
+        return latest, {
+            "package": name, "declared": declared, "installed": installed,
+            "latest": latest, "nodeVersion": node_version, "latestNodeSpec": latest_spec,
+            "status": "discovered",
+            **({"enginesUnknown": True} if not latest_spec else {}),
+        }
+    chosen: Optional[str] = None
+    chosen_spec = ""
+    rejected: List[Dict[str, Any]] = []
+    for candidate in _npm_versions(project_dir, name, runtime_env, top=12):
+        if candidate == latest:
+            continue
+        if candidate == installed or not _newer_than_installed(candidate, installed):
+            # Postfix-review P1: never downgrade. A candidate at or below
+            # the INSTALLED version (lockfile-exact) cannot be an upgrade,
+            # whatever its engines — the declared range floor alone would
+            # accept a lower-than-installed version (e.g. 8.1.0 under
+            # ^8.0.0 with 8.5.0 installed) and roll the package back.
+            rejected.append({"version": candidate, "nodeSpec": "", "status": "not-newer-than-current"})
+            continue
+        candidate_spec = _npm_engines_node(project_dir, name, candidate, runtime_env)
+        if not candidate_spec:
+            rejected.append({"version": candidate, "nodeSpec": "", "status": "engines-unknown"})
+            continue
+        if node_range_satisfied(candidate_spec, node_version):
+            chosen = candidate
+            chosen_spec = candidate_spec
+            break
+        rejected.append({"version": candidate, "nodeSpec": candidate_spec, "status": "engines-incompatible"})
+    if chosen:
+        return chosen, {
+            "package": name, "declared": declared, "installed": installed,
+            "latest": latest, "latestNodeSpec": latest_spec, "nodeVersion": node_version,
+            "target": chosen, "targetNodeSpec": chosen_spec,
+            "rejected": rejected, "status": "discovered-compatible",
+        }
+    # No strictly-newer verified-compatible alternative in the bounded
+    # window: KEEP the installed version (no downgrade, no false plan entry)
+    # and record the unfulfilled upgrade intent with an honest reason. The
+    # deferred/blocked package stays visible in the discovery evidence, in
+    # the begin.discovery event and in the task remainder (via the task
+    # builder's no-newer-compatible intents); it is never an invented
+    # completion and never silently dropped to "0 of 0" in the task.
+    return None, {
+        "package": name, "declared": declared, "installed": installed,
+        "latest": latest, "latestNodeSpec": latest_spec, "nodeVersion": node_version,
+        "rejected": rejected, "status": "no-newer-compatible",
+        "reason": (
+            f"latest {latest} requires node {latest_spec}, but the run's "
+            f"chosen Node is {node_version}; no verified-compatible version "
+            f"strictly newer than the INSTALLED {installed} exists within the "
+            "bounded window — keeping the current version"
+        ),
+    }
+
+
+def _discover_targets(
+    project_dir: Path,
+    current: Mapping[str, str],
+    runtime_env: Optional[Dict[str, str]],
+    node_version: Optional[str] = None,
+    parallelism: int = 1,
+    wall_budget_s: int = 0,
+    max_packages: int = 0,
+    progress: Optional[Callable[[int, int], None]] = None,
+    adaptive: bool = False,
+    checkpoint: Any = None,
+) -> Tuple[Dict[str, str], List[Dict[str, Any]]]:
+    """#2/P1.2 bounded target discovery for begin when no roadmap targets exist.
+
+    Yellow lag policy applied WITHOUT the legacy generator or solver: for every
+    direct managed dependency, the registry ``dist-tags.latest`` is the target,
+    unless the run pins a concrete Node and the registry KNOWS latest excludes
+    it. In that case a bounded search over the newest published versions picks
+    the highest VERIFIED-compatible version that is STRICTLY NEWER than the
+    INSTALLED version (lockfile-exact, see ``_installed_version``) and that
+    version becomes the target — the user gets an upgrade that actually
+    installs under the chosen Node instead of a stale deferral. The declared
+    spec alone is never the baseline: a range floor (``^8.0.0``) would accept
+    8.1.0 as an "upgrade" while 8.5.0 is installed, silently downgrading the
+    package. A version is never invented, and a package whose latest cannot be
+    established is skipped as evidence. Downgrades are refused: a candidate may
+    only be proposed when npm-semver proves it newer than the installed
+    version, and the SAME guard runs BEFORE any direct acceptance of the
+    registry ``latest`` — a dist-tag that lags the installed version (installed
+    8.5.0, latest 8.1.0) is recorded as ``no-newer-compatible``, never proposed
+    as a target. Discovery abstains entirely (``installed-version-unknown``)
+    when the installed version cannot be read from the canonical lockfile.
+    When no strictly-newer verified-compatible version exists in the bounded
+    window, the CURRENT version is kept (the package is NOT added to the
+    targets) and an honest ``no-newer-compatible`` evidence row records the
+    unfulfilled upgrade intent with the reason — never a downgrade and never a
+    false completion; the task builder surfaces that intent in the remainder.
+    Unknown engines are an abstention, never a false incompatibility claim;
+    without a pinned Node the choice is engine-unchecked.
+
+    Discovery is BOUNDED so a Desktop click never blocks on many minutes of
+    sequential registry probes: `parallelism` probes run concurrently,
+    `wall_budget_s` caps the phase wall-clock time (>=1 enforces a deadline),
+    and `max_packages` caps how many direct dependencies are probed at all.
+    Packages cut off by the cap or the deadline are recorded as honest
+    ``discovery-budget-skipped`` evidence — their upgrade is NOT assessed and
+    NOT claimed, and the task builder keeps them in the remainder; a missing
+    probe never becomes a proven lag, an invented version or zero findings.
+    `progress(processed, total)` is called after each completed probe.
+    """
+    if adaptive:
+        from iterative_adaptive_budget import discover_in_waves
+        return discover_in_waves(
+            discover=lambda batch, seconds, on_progress: _discover_targets(
+                project_dir, batch, runtime_env, node_version, parallelism=parallelism,
+                wall_budget_s=seconds, progress=on_progress, checkpoint=checkpoint),
+            current=current, initial_packages=max_packages, wall_budget_s=wall_budget_s,
+            progress=progress, emit=_emit_status, clock=time.monotonic)
+    global _ACTIVE_DISCOVERY_DEADLINE
+    targets: Dict[str, str] = {}
+    evidence: List[Dict[str, Any]] = []
+    names = sorted(current.items())
+    if max_packages > 0 and len(names) > max_packages:
+        for name, declared in names[max_packages:]:
+            evidence.append(
+                {
+                    "package": name, "declared": declared,
+                    "status": "discovery-budget-skipped",
+                    "reason": _budget_skip_reason(name, f"discovery budget cap ({max_packages}) reached"),
+                }
+            )
+        names = names[:max_packages]
+    total = len(names)
+
+    def hard_deadline() -> Optional[float]:
+        if wall_budget_s <= 0:
+            return None
+        import time as _time
+
+        return _time.monotonic() + wall_budget_s
+
+    deadline = hard_deadline()
+    processed = 0
+
+    def record(target_version: Optional[str], name: str, row: Dict[str, Any]) -> None:
+        nonlocal processed
+        if target_version is not None:
+            targets[name] = target_version
+        evidence.append(row)
+        if checkpoint is not None:
+            checkpoint.record(name, target_version, row)
+        processed += 1
+        if progress is not None:
+            progress(processed, total)
+
+    if checkpoint is not None:
+        pending = []
+        for name, declared in names:
+            saved = checkpoint.lookup(name, declared)
+            if saved is None:
+                pending.append((name, declared))
+            else:
+                target, row = saved
+                record(target, name, row)
+        names = pending
+        if processed:
+            _emit_status({"event": "begin.discovery-resumed", "reused": processed, "total": total})
+
+    # The wall budget is passed INTO every registry probe for the whole phase:
+    # each request bounds its own subprocess to the time remaining until the
+    # deadline (see `_probe_budget_timeout`), so probes that started before the
+    # deadline are killed AT it instead of overrunning it by a full default — a
+    # 1s budget finishes in ~1s, never in 1s + one full npm view. The deadline
+    # is restored in `finally` so later phases (e.g. engine prechecks) keep
+    # their own fixed timeouts.
+    previous_discovery_deadline = _ACTIVE_DISCOVERY_DEADLINE
+    if deadline is not None:
+        _ACTIVE_DISCOVERY_DEADLINE = deadline
+    # C1: parse the canonical lockfile ONCE for the whole phase and expose it
+    # through the contextvar, so every sequential probe reads the same
+    # read-only inventory instead of re-reading the lockfile per package. An
+    # outer phase (adaptive waves) already holds a fresh inventory for the
+    # SAME project and is reused; anything else is rebuilt for this project_dir.
+    # Python 3.14 does not copy contextvars into ThreadPoolExecutor workers, so
+    # the parallel branch passes this same instance explicitly to every probe.
+    # The token restores the previous value in ``finally``.
+    phase_inventory = _ACTIVE_INVENTORY.get()
+    if phase_inventory is None or not phase_inventory.belongs_to(project_dir):
+        phase_inventory = ResolutionInventory.for_project(project_dir)
+    inventory_token = _ACTIVE_INVENTORY.set(phase_inventory) if phase_inventory is not None else None
+    discovery_yarn_root = modern_yarn_root(project_dir)
+    yarn_root_token = _ACTIVE_DISCOVERY_YARN_ROOT.set(discovery_yarn_root)
+    try:
+        if parallelism <= 1:
+            for name, declared in names:
+                if deadline is not None and _after_deadline(deadline):
+                    evidence.append(
+                        {
+                            "package": name, "declared": declared,
+                            "status": "discovery-budget-skipped",
+                            "reason": _budget_skip_reason(name, "wall-clock budget exhausted"),
+                        }
+                    )
+                    processed += 1
+                    if progress is not None:
+                        progress(processed, total)
+                    continue
+                target, row = _discover_one_target(project_dir, name, declared, runtime_env, node_version)
+                record(target, name, row)
+            _order_discovery(targets, evidence)
+            return targets, evidence
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import threading
+
+        lock = threading.Lock()
+
+        def probe(item: Tuple[str, str], inventory: Optional[ResolutionInventory] = phase_inventory) -> Tuple[Optional[str], str, Dict[str, Any]]:
+            # Python 3.14 does not propagate contextvars into ThreadPoolExecutor
+            # workers, so the same read-only instance is handed in explicitly;
+            # it is immutable after construction, safe to share across threads.
+            # Each worker sets the contextvar for `_installed_version` to see
+            # during its own probe and restores it before returning.
+            token = _ACTIVE_INVENTORY.set(inventory) if inventory is not None else None
+            yarn_token = _ACTIVE_DISCOVERY_YARN_ROOT.set(discovery_yarn_root)
+            try:
+                name, declared = item
+                if deadline is not None and _after_deadline(deadline):
+                    return None, name, {
+                        "package": name, "declared": declared,
+                        "status": "discovery-budget-skipped",
+                        "reason": _budget_skip_reason(name, "wall-clock budget exhausted"),
+                    }
+                try:
+                    target, row = _discover_one_target(project_dir, name, declared, runtime_env, node_version)
+                    return target, name, row
+                except Exception:  # noqa: BLE001 - a probe failure is an abstention, never a constraint
+                    return None, name, {
+                        "package": name, "declared": declared,
+                        "status": "discovery-budget-skipped",
+                        "reason": _budget_skip_reason(name, "probe failed unexpectedly"),
+                    }
+            finally:
+                _ACTIVE_DISCOVERY_YARN_ROOT.reset(yarn_token)
+                if token is not None:
+                    _ACTIVE_INVENTORY.reset(token)
+
+        with ThreadPoolExecutor(max_workers=parallelism) as pool:
+            futures = {pool.submit(probe, item): item for item in names}
+            for future in as_completed(futures):
+                target, name, row = future.result()
+                if deadline is not None and _after_deadline(deadline):
+                    # Review re-check P1.2: a result that only ARRIVED after the
+                    # deadline is not evidence the run stayed within its budget,
+                    # so it is never accepted as a target or a finished probe —
+                    # it becomes an honest budget-skipped row instead.
+                    _, declared = futures[future]
+                    target = None
+                    row = {
+                        "package": name, "declared": declared,
+                        "status": "discovery-budget-skipped",
+                        "reason": _budget_skip_reason(name, "wall-clock budget exhausted before the probe finished"),
+                    }
+                with lock:
+                    record(target, name, row)
+        _order_discovery(targets, evidence)
+        return targets, evidence
+    finally:
+        _ACTIVE_DISCOVERY_YARN_ROOT.reset(yarn_root_token)
+        if inventory_token is not None:
+            _ACTIVE_INVENTORY.reset(inventory_token)
+        _ACTIVE_DISCOVERY_DEADLINE = previous_discovery_deadline
+
+
+def _budget_skip_reason(name: str, why: str) -> str:
+    return (
+        f"{why}; {name} was not probed, so its upgrade is not assessed "
+        "and no lag is claimed"
+    )
+
+
+def _after_deadline(deadline: float) -> bool:
+    import time as _time
+
+    return _time.monotonic() >= deadline
+
+
+def _order_discovery(targets: Dict[str, str], evidence: List[Dict[str, Any]]) -> None:
+    """Deterministic discovery output: stable ordering by package name so a
+    bounded/parallel discovery produces the SAME evidence rows as a sequential
+    one (reproducibility, never run-order)."""
+    ordered = {name: targets[name] for name in sorted(targets)}
+    targets.clear()
+    targets.update(ordered)
+    evidence.sort(key=lambda e: (str(e.get("package") or ""), str(e.get("status") or "")))
+
+
+def _engine_deferred_targets(
+    project_dir: Path,
+    incumbent: Mapping[str, str],
+    requested: Mapping[str, str],
+    node_version: str,
+    runtime_env: Optional[Dict[str, str]],
+) -> Tuple[Dict[str, str], List[Dict[str, Any]]]:
+    """#6 runtime-aware candidate selection BEFORE the expensive materialization.
+
+    For every requested target whose registry ``engines.node`` excludes the
+    run's chosen Node, the target is excluded from this plan's assignment and
+    returned as a deferral entry — an incompatible install is never
+    materialized and never becomes a false verification result. Transitive
+    incompatibility (introduced by a dependency, not declared on the direct
+    target) is out of scope here and remains a matter for install evidence.
+    Returns ``(effective_targets, deferrals)``.
+    """
+    from project_runtime import node_range_satisfied
+
+    effective: Dict[str, str] = {}
+    deferrals: List[Dict[str, Any]] = []
+    for name, version in sorted(requested.items()):
+        spec = _npm_engines_node(project_dir, name, version, runtime_env)
+        if not spec or node_range_satisfied(spec, node_version):
+            effective[name] = version
+            continue
+        deferrals.append(
+            {
+                "package": name,
+                "requestedVersion": version,
+                "nodeVersion": node_version,
+                "nodeSpec": spec,
+                "kind": "ENGINES_INCOMPATIBLE",
+                "reason": (
+                    f"{name}@{version} requires node {spec}, but the run's chosen "
+                    f"Node is {node_version}; target deferred before materialization"
+                ),
+            }
+        )
+    return effective, deferrals
+
+
+def _record_engine_deferrals(
+    ledger: Dict[str, Any], checkpoint_id: str, deferrals: Sequence[Mapping[str, Any]]
+) -> None:
+    """Persist engine-incompatible deferrals as deterministic ledger input.
+
+    A deferred target stays in the policy remainder/denominator (the config
+    targets are untouched); this is visibility evidence, never acceptance.
+    """
+    now = _now_iso()
+    entries = list(ledger.get("deferrals", []))
+    for entry in deferrals:
+        entries.append(
+            {
+                "baseCheckpointId": checkpoint_id,
+                "candidateId": "",
+                "cohortId": None,
+                "package": str(entry.get("package") or ""),
+                "requestedVersion": str(entry.get("requestedVersion") or ""),
+                "reason": str(entry.get("reason") or "engines.node incompatible with chosen Node"),
+                "kind": str(entry.get("kind") or "ENGINES_INCOMPATIBLE"),
+                "createdAt": now,
+            }
+        )
+    ledger["deferrals"] = entries
+
+
+# ---------------------------------------------------------------------------
+# materialize
+# ---------------------------------------------------------------------------
+
+def cmd_materialize(args: argparse.Namespace) -> int:
+    run_dir = Path(args.run_dir).resolve()
+    lock = _RunLock(run_dir, args.owner or f"pid-{os.getpid()}", stale_seconds=300)
+    lock.acquire()
+    try:
+        run = load_run(run_dir)
+        config = load_config(run_dir)
+        return _materialize_locked(run_dir, run, config, args)
+    finally:
+        lock.release()
+
+
+def _open_checkpoint_source(run_dir, checkpoint, config, *, run_id="", candidate_id=""):
+    try:
+        return open_source_snapshot(
+            Path(str(checkpoint["sourceSnapshotContainer"])),
+            expected_key=str(checkpoint["sourceSnapshotKey"]), timeout_seconds=0,
+        )
+    except SourceCaptureError as exc:
+        if not str(exc).startswith(("SOURCE_SNAPSHOT_TOOL_BUILD_MISMATCH:", "SOURCE_SNAPSHOT_CONTENT_MISMATCH:")):
+            raise
+    from checkpoint_build_upgrade import CheckpointBuildUpgradeError, reopen_checkpoint_source
+    verify_config = dataclasses.replace(
+        verify_config_from(config["verifyConfig"], run_dir), verification_purpose="intermediate-candidate"
+    )
+    with MigrationProgress(_emit_status, operation="checkpoint-upgrade", message="Opening preserved checkpoint",
+                           run_id=run_id, candidate_id=candidate_id) as progress:
+        def verify(project, assignment):
+            return verify_assignment(
+                project, assignment, config=verify_config, run_project_checks=True,
+                runtime_env=_runtime_env(config), progress=progress,
+                progress_label="checkpoint after DepLoom update",
+            )
+        try:
+            return reopen_checkpoint_source(run_dir, checkpoint, config, verify=verify, progress=progress, runtime_env=_runtime_env(config))
+        except SourceCaptureError as exc:
+            raise ProjectUnreadyError(
+                "SOURCE_SNAPSHOT_CONTENT_MISMATCH",
+                "Целостность сохранённого результата не подтверждена. Прежний checkpoint сохранён. " + str(exc),
+                command="",
+            ) from exc
+        except CheckpointBuildUpgradeError as exc:
+            raise ProjectUnreadyError(
+                "CHECKPOINT_BUILD_UPGRADE_UNCONFIRMED",
+                "Сохранённый результат не подтверждён новой версией DepLoom. Прежний checkpoint сохранён. " + str(exc),
+                command=exc.command,
+            ) from exc
+
+
+def _materialize_locked(
+    run_dir: Path, run: Mapping[str, Any], config: Mapping[str, Any], args: argparse.Namespace
+) -> int:
+    scheduler_started = time.monotonic()
+    if not run_budget_ok(config, run):
+        raise BudgetExceededError("RUN_DEADLINE_EXCEEDED")
+    _assert_runtime_unchanged(config)
+    candidate = load_candidate(run_dir)
+    if candidate is None:
+        raise InvalidInputError("NO_ACTIVE_CANDIDATE")
+    from iterative_stage_checkpoint import operation_journal, completed_materialization, observe_materialized_assignment
+    materialization_journal = operation_journal(run_dir, run, config, candidate, "materialize")
+    refs = (candidate.get("materializationRefs") or {})
+    workspace_root = trial_workspace_root(run_dir)
+    base = load_checkpoint(run_dir, str(candidate["baseCheckpointId"]))
+    if base.get("status") != "VERIFIED":
+        raise InvalidInputError("BASE_CHECKPOINT_NOT_VERIFIED")
+    if candidate.get("stage") not in {"PLANNED", "MATERIALIZED"}:
+        raise InvalidInputError(f"CANDIDATE_STAGE_NOT_PLANNED: {candidate.get("stage")}")
+    project_relative = Path(str(base.get("projectRelative") or "."))
+    project_path = workspace_root / project_relative
+    recovered = completed_materialization(materialization_journal, workspace_root, candidate["fullAssignment"],
+        lambda: observe_materialized_assignment(project_path, workspace_root, candidate["fullAssignment"], observed_resolved_assignment))
+    if recovered is not None:
+        _open_checkpoint_source(run_dir, base, config, run_id=str(run["runId"]))
+        save_candidate(run_dir, recovered)
+        resumed = {**run, "phase": "MATERIALIZING", "updatedAt": _now_iso()}
+        save_run(run_dir, resumed)
+        _emit_status({"event": "materialize.checkpoint-resumed", "runId": run["runId"], "candidateId": candidate["candidateId"]})
+        return 0
+    if candidate.get("stage") != "PLANNED":
+        raise InvalidInputError(
+            f"CANDIDATE_STAGE_NOT_PLANNED: {candidate.get('stage')}"
+        )
+    materialization_journal.write("materialize", "RUNNING")
+    base_checkpoint = load_checkpoint(run_dir, str(candidate["baseCheckpointId"]))
+    if base_checkpoint.get("status") != "VERIFIED":
+        raise InvalidInputError("BASE_CHECKPOINT_NOT_VERIFIED")
+
+    _emit_status(
+        {
+            "event": "materialize.start",
+            "runId": run["runId"],
+            "candidateId": candidate["candidateId"],
+        }
+    )
+
+    snapshot = _open_checkpoint_source(run_dir, base_checkpoint, config, run_id=str(run["runId"]), candidate_id=str(candidate["candidateId"]))
+    from lockfile_preflight import probe_candidate
+    from iterative_scope_expansion import apply_expansion_assignment
+    probe_started = time.monotonic()
+    probe = probe_candidate(
+        Path(getattr(snapshot, "project_path", Path(snapshot.root) / project_relative)), run_dir, candidate["fullAssignment"], candidate.get("scopeExpansionAdditions") or {},
+        source_root=Path(snapshot.root),
+        apply=lambda project, assignment, additions: apply_expansion_assignment(
+            project, assignment, additions, _apply_assignment, _validate_assignment_materialization),
+        run=lambda project: _run_install(project, timeout_seconds=args.timeout_seconds,
+            progress_label="candidate lockfile preflight", runtime_env=_runtime_env(config),
+            run_deadline_at=str(run.get("deadlineAt") or ""), lockfile_only=True))
+    probe_seconds = time.monotonic() - probe_started
+    if probe is not None and probe.returncode != 0:
+        # Only exact unavailable-target evidence is actionable without a full
+        # materialization. Other probe errors fall back; they cannot learn a
+        # false incompatibility from an intentionally smaller workspace.
+        output = (probe.stdout or "") + "\n" + (probe.stderr or "")
+        if record_unavailable_targets({}, run, config, candidate, output):
+            return _handle_materialize_failure(run_dir, run, config, candidate, base_checkpoint, install_result=probe)
+    if args.timeout_seconds and probe_seconds >= args.timeout_seconds:
+        raise BudgetExceededError("MATERIALIZATION_PREFLIGHT_TIME_BUDGET")
+    from iterative_trial_workspace import remove_trial_workspace, TrialWorkspaceCleanupError
+    try:
+        remove_trial_workspace(run_dir)
+    except TrialWorkspaceCleanupError as exc:
+        raise IterativeMigrationError("TRIAL_WORKSPACE_CLEANUP_BLOCKED", str(exc)) from exc
+    workspace_root = trial_workspace_root(run_dir)
+    _materialize_trial_tree(snapshot, workspace_root, args.timeout_seconds)
+
+    project_relative = Path(str(base_checkpoint.get("projectRelative") or "."))
+    project_path = workspace_root / project_relative
+    from iterative_scope_expansion import apply_expansion_assignment
+    changed = apply_expansion_assignment(
+        project_path, candidate["fullAssignment"], candidate.get("scopeExpansionAdditions") or {},
+        _apply_assignment, _validate_assignment_materialization)
+
+    from cohort_attempt_telemetry import record_attempt, stage_measurement
+    candidate = dict(candidate)
+    candidate["telemetrySequence"] = int(candidate.get("telemetrySequence") or 0) + 1
+    save_candidate(run_dir, candidate)
+    install_started = time.monotonic()
+    install_result = _run_install(
+        project_path,
+        timeout_seconds=max(1, args.timeout_seconds - probe_seconds) if args.timeout_seconds else 0,
+        progress_label="iterative migration exact materialization",
+        runtime_env=_runtime_env(config), run_deadline_at=str(run.get("deadlineAt") or ""),
+    )
+    install_seconds = time.monotonic() - install_started
+    install_kind, install_code = _materialization_failure((install_result.stdout or "") + "\n" + (install_result.stderr or "")) if install_result.returncode else ("passed", "")
+    install_outcome = "PASS" if install_result.returncode == 0 else "FAIL" if install_kind == "resolver" else "UNKNOWN"
+    measurements = [stage_measurement("install", install_seconds, install_outcome)]
+    candidate["stageMeasurements"] = list(candidate.get("stageMeasurements") or []) + measurements
+    save_candidate(run_dir, candidate)
+    record_attempt(run_dir, run, config, candidate, stage="install", outcome=install_outcome,
+                   seconds=install_seconds, stages=measurements,
+                   size_feedback="FAIL" if install_kind=="resolver" and install_code=="CONFLICT" else "NONE")
+    if install_result.returncode != 0:
+        return _handle_materialize_failure(
+            run_dir, run, config, candidate, base_checkpoint, install_result=install_result
+        )
+
+    try:
+        observed = observe_materialized_assignment(project_path, workspace_root, candidate["fullAssignment"], observed_resolved_assignment)
+    except Exception as exc:  # drift / undeclared -> materialization not exact
+        # Drift is a recoverable infrastructure-class observation (the install
+        # did not produce the requested exact assignment). It is bounded by the
+        # same infra retry budget and never becomes an incompatibility.
+        return _handle_materialize_failure(
+            run_dir, run, config, candidate, base_checkpoint, drift=exc
+        )
+    observed_hash = observed_resolved_hash(observed)
+
+    trial_snapshot = capture_source_snapshot(project_path, timeout_seconds=0)
+    candidate = dict(candidate)
+    candidate["schedulerSeconds"] = float(candidate.get("schedulerSeconds") or 0) + time.monotonic() - scheduler_started
+    candidate["stage"] = "MATERIALIZED"
+    candidate["materializationRefs"] = {
+        "workspaceRoot": str(workspace_root),
+        "projectRelative": str(project_relative),
+        "trialSnapshotKey": trial_snapshot.key,
+        "observedResolvedVersions": observed,
+        "observedResolvedHash": observed_hash,
+        "changedPackages": changed,
+        "installExitCode": install_result.returncode,
+    }
+    candidate["updatedAt"] = _now_iso()
+    from iterative_stage_checkpoint import trial_key
+    from baseline_constraint_verifier import _durable_proof_publication_allowed
+    materialization_journal.write("materialize", "PASS" if _durable_proof_publication_allowed(install_result) else "UNKNOWN", {
+        "workspaceRoot": str(workspace_root.resolve()), "artifactKey": trial_key(workspace_root),
+        "observed": observed, "candidate": candidate})
+    save_candidate(run_dir, candidate)
+    run = dict(run)
+    run["phase"] = "MATERIALIZING"
+    run["updatedAt"] = _now_iso()
+    save_run(run_dir, run)
+    _emit_status(
+        {
+            "event": "materialize.done",
+            "runId": run["runId"],
+            "candidateId": candidate["candidateId"],
+            "observedHash": observed_hash,
+            "installedPackages": len(observed),
+        }
+    )
+    return 0
+
+
+def _handle_materialize_failure(
+    run_dir: Path,
+    run: Mapping[str, Any],
+    config: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+    base_checkpoint: Mapping[str, Any],
+    *,
+    install_result: Optional[Any] = None,
+    drift: Optional[Exception] = None,
+) -> int:
+    """Conclude or bound a failed exact materialization with a durable result.
+
+    Three outcomes, all written under the run lock (the single counter owner):
+
+    * resolver (ETARGET/NOTARGET/...): defer the EXACT target through
+      ``record_unavailable_targets``, conclude the current candidate and defer
+      its exact fingerprint so plan-next can reach the remaining packages
+      without any manual apply-feedback. No learned incompatibility.
+    * infrastructure (recoverable): bounded by ``budget.maxInfraRetries`` for
+      this attempt sequence. While retries remain the candidate stays PLANNED
+      and the coordinator re-invokes materialize (retryable); when exhausted
+      the candidate is concluded and the identity is blocked for the CURRENT
+      registry scope with a recoverable stop + evidence.
+    * unknown: concluded immediately with evidence; the identity is blocked for
+      the current scope so an identical gate stops instead of replaying.
+    """
+    output = ""
+    exit_code: int = 1
+    if install_result is not None:
+        output = (install_result.stdout or "") + "\n" + (install_result.stderr or "")
+        exit_code = int(install_result.returncode)
+    if drift is not None:
+        output = output + f"\nobserved drift: {drift}"
+        classification: str = "infrastructure"
+        code: str = "DRIFT"
+    else:
+        classification, code = _materialization_failure(output)
+
+    candidate_id = str(candidate["candidateId"])
+    base_id = str(base_checkpoint["checkpointId"])
+    fingerprint = assignment_fingerprint(candidate["fullAssignment"])
+    revision_key = _attempt_revision_key(base_id, fingerprint)
+    max_retries = int(config["budget"]["maxInfraRetries"])
+
+    ledger = dict(load_ledger(run_dir))
+    counters = dict(ledger.get("counters", {}))
+
+    if classification == "resolver":
+        # ETARGET defers only the exact package target in this scope; the
+        # remaining packages stay actionable through plan-next. The
+        # availability deferral is EVIDENCE-gated: it records a target only
+        # when the failure output proves ``No matching version found for
+        # <name>@<version>`` for a changed/target package. When that evidence is
+        # missing (an ETARGET without an extractable per-target fingerprint)
+        # there is nothing real to defer — fabricating the deferral re-proposed
+        # the same fingerprint forever (B5). Reclassify to an honest unknown and
+        # fall through to the terminal path below: the candidate is concluded
+        # and the identity is blocked for the current scope, so an identical
+        # gate stops with evidence instead of replaying.
+        conflict = code == "CONFLICT"
+        if not conflict and not record_unavailable_targets(ledger, run, config, candidate, output):
+            classification = "unknown"
+            code = "RESOLVER_NO_EVIDENCE"
+        else:
+            _append_deferral(ledger, candidate, f"resolver {code}: " + ("exact assignment rejected by peer resolution" if conflict else "target version unavailable"))
+            candidate = dict(candidate)
+            candidate["stage"] = "REJECTED"
+            candidate["conclusion"] = {
+                "kind": "resolver-conflict" if conflict else "resolver-target-unavailable",
+                "code": code,
+                "reason": f"resolver {code} during exact materialization",
+                "exactTargetDeferred": not conflict,
+            }
+            candidate["attemptResult"] = _build_attempt_result(
+                candidate, base_id, classification=classification, code=code,
+                exit_code=exit_code, retry_count=0, max_retries=max_retries,
+                retryable=False, terminal_failure=True, output_tail=output,
+            )
+            candidate["updatedAt"] = _now_iso()
+            save_candidate(run_dir, candidate)
+            run = dict(run)
+            run["activeCandidateId"] = None
+            run["phase"] = "READY"
+            run["updatedAt"] = _now_iso()
+            save_run(run_dir, run)
+            save_ledger(run_dir, ledger)
+            _emit_status(
+                {
+                    "event": "materialize.failed",
+                    "runId": run["runId"],
+                    "candidateId": candidate_id,
+                    "kind": classification,
+                    "code": code,
+                    "exitCode": exit_code,
+                    "outputTail": output[-2000:],
+                    "concluded": True,
+                    "exactTargetDeferred": not conflict,
+                }
+            )
+            return 0
+
+    # infrastructure / unknown from here on.
+    previous = candidate.get("attemptResult") or {}
+    retry_count = int(previous.get("retryCount") or 0)
+    infra_counter = int(counters.get("infraRetries", 0)) + 1
+    counters["infraRetries"] = infra_counter
+    run = dict(run)
+    run["updatedAt"] = _now_iso()
+
+    recoverable = classification == "infrastructure"
+    can_retry = recoverable and retry_count < max_retries
+    if can_retry:
+        # Keep the candidate PLANNED so the coordinator re-invokes materialize;
+        # the durable attemptResult is the bounded retry counter for the
+        # sequence (it survives a Desktop restart between retries).
+        retry_count += 1
+        candidate = dict(candidate)
+        candidate["attemptResult"] = _build_attempt_result(
+            candidate, base_id, classification=classification, code=code,
+            exit_code=exit_code, retry_count=retry_count, max_retries=max_retries,
+            retryable=True, terminal_failure=False, output_tail=output,
+        )
+        candidate["updatedAt"] = _now_iso()
+        save_candidate(run_dir, candidate)
+        ledger["counters"] = counters
+        save_ledger(run_dir, ledger)
+        run["phase"] = "MATERIALIZING"
+        save_run(run_dir, run)
+        _emit_status(
+            {
+                "event": "materialize.failed",
+                "runId": run["runId"],
+                "candidateId": candidate_id,
+                "kind": classification,
+                "code": code,
+                "exitCode": exit_code,
+                "outputTail": output[-2000:],
+                "retryable": True,
+                "retryCount": retry_count,
+                "maxRetries": max_retries,
+            }
+        )
+        return 0
+
+    # Terminal for this sequence: conclude the candidate and block the identity
+    # for the current registry scope. run.infraBlocked makes the coordinator
+    # STOP with evidence; plan-next --retry-infra (user continuation after the
+    # cause changed) opens a fresh attempt sequence with a fresh budget.
+    scoped_key = _infra_scope_key(run, config, base_id, fingerprint)
+    current_scope = availability_scope_flat(run, config)
+    infra_blocks = list(ledger.get("infraBlocks") or [])
+    infra_blocks = [
+        entry for entry in infra_blocks
+        if not (entry.get("scopeKey") == scoped_key and entry.get("revisionKey") == revision_key)
+    ]
+    infra_blocks.append(
+        {
+            "scopeKey": scoped_key,
+            "scopeHash": current_scope,
+            "revisionKey": revision_key,
+            "baseCheckpointId": base_id,
+            "candidateId": candidate_id,
+            "assignmentFingerprint": fingerprint,
+            "classification": classification,
+            "code": code,
+            "retryCount": retry_count,
+            "maxRetries": max_retries,
+            "reason": f"{classification.upper()} {code}: materialize failed {retry_count} time(s); recoverable, cause may change",
+            "evidenceTail": output[-2000:],
+            "journalRef": "attempt.log",
+            "createdAt": _now_iso(),
+        }
+    )
+    ledger["infraBlocks"] = infra_blocks
+    ledger["counters"] = counters
+    candidate = dict(candidate)
+    candidate["stage"] = "REJECTED"
+    candidate["conclusion"] = {
+        "kind": "infra-blocked" if recoverable else "unknown-failed",
+        "code": code,
+        "reason": f"{classification.upper()} {code}: materialize retries exhausted or not classifiable",
+        "scopeKey": scoped_key,
+    }
+    candidate["attemptResult"] = _build_attempt_result(
+        candidate, base_id, classification=classification, code=code,
+        exit_code=exit_code, retry_count=retry_count, max_retries=max_retries,
+        retryable=False, terminal_failure=True, output_tail=output,
+    )
+    candidate["updatedAt"] = _now_iso()
+    save_candidate(run_dir, candidate)
+    run["activeCandidateId"] = None
+    run["phase"] = "READY"
+    run["infraBlocked"] = {
+        "baseCheckpointId": base_id,
+        "assignmentFingerprint": fingerprint,
+        "classification": classification,
+        "code": code,
+        "reason": f"{classification.upper()} {code}: materialize failed; cause may change",
+        "evidenceTail": output[-2000:],
+        "retryCount": retry_count,
+        "maxRetries": max_retries,
+        "blockedAt": _now_iso(),
+    }
+    save_run(run_dir, run)
+    save_ledger(run_dir, ledger)
+    _emit_status(
+        {
+            "event": "materialize.failed",
+            "runId": run["runId"],
+            "candidateId": candidate_id,
+            "kind": classification,
+            "code": code,
+            "exitCode": exit_code,
+            "outputTail": output[-2000:],
+            "retryable": False,
+            "terminalFailure": True,
+            "retryCount": retry_count,
+            "maxRetries": max_retries,
+        }
+    )
+    return 0
+
+
+def _materialize_trial_tree(
+    snapshot: SourceSnapshot, workspace_root: Path, timeout_seconds: int
+) -> None:
+    from storage_capacity import require_capacity
+    require_capacity(workspace_root, snapshot.byte_count, "trial materialization")
+    workspace_root.parent.mkdir(parents=True, exist_ok=True)
+    with MigrationProgress(_emit_status, operation="materialize", message="Preparing isolated source snapshot copy"):
+        method = materialize_private_tree(
+            Path(snapshot.root),
+            workspace_root,
+            timeout_seconds=0,
+            progress_label="iterative migration trial materialization",
+        )
+    if not workspace_root.exists():
+        raise IterativeMigrationError(
+            "TRIAL_MATERIALIZATION_MISSING", f"materialize_private_tree returned {method!r}"
+        )
+    # The sealed snapshot is captured read-only for integrity; this trial is a
+    # working tree the agent and the package manager must be able to write in.
+    apply_tree_write_protection(workspace_root, readonly=False)
+
+
+# Materialize failure classification. Recoverable infrastructure causes
+# (registry auth/rate-limit/server/offline/cache/network/filesystem) bound the
+# infra retry budget and NEVER become compatibility evidence; a resolver
+# ETARGET (with extractable per-target evidence) defers only the exact target;
+# a 404 without that evidence and anything else untagged is an honest unknown
+# that stops with evidence instead of looping (B5).
+_MATERIALIZE_INFRA_MARKERS = (
+    ("RATE_LIMIT", ("429", "e429", "rate limit exceeded", "too many requests")),
+    ("UNAUTHORIZED", ("401", "e401", "unauthorized", "authentication failed")),
+    ("FORBIDDEN", ("403", "e403", "forbidden")),
+    ("OFFLINE", ("eoffline", "offline", "network is unreachable")),
+    ("CACHE_MISS", ("enotcached", "not in cache", "missing from cache", "enoent")),
+    ("CONNECTION", ("econnreset", "econnrefused", "esockettimeout", "eai_again", "etimedout", "getaddrinfo", "socket hang up", "network error", "network request")),
+    ("FILESYSTEM", ("eacces", "eperm", "eio")),
+)
+
+
+def _materialization_failure(output: str) -> Tuple[str, str]:
+    """Return (classification, code) for a failed exact install.
+
+    classification: ``infrastructure`` | ``resolver`` | ``unknown``.
+    code: a stable short code (ETARGET, NOT_FOUND, TARBALL_UNAVAILABLE,
+    RATE_LIMIT, ...). The classification is scheduling input only; nothing here
+    grants verification proof or asserts incompatibility. A 404 is never a
+    ``resolver`` ETARGET on its own: a bare 404 (NOT_FOUND) or a missing tarball
+    (TARBALL_UNAVAILABLE) is an unknown with no per-target evidence, and the
+    resolver branch reclassifies an evidence-less ETARGET to
+    RESOLVER_NO_EVIDENCE rather than fabricating a deferral.
+    """
+    lowered = (output or "").lower()
+    if re.search(r"\b5\d\d\b", output or ""):
+        return "infrastructure", "SERVER_ERROR"
+    for code, markers in _MATERIALIZE_INFRA_MARKERS:
+        for marker in markers:
+            if marker in lowered:
+                return "infrastructure", code
+    # A straight 404 is NOT resolver evidence: without an extractable
+    # ``No matching version for <name>@<version>`` fingerprint there is no
+    # per-target availability fact to defer, and treating it as an ETARGET
+    # deferral fabricated a ledger entry that re-proposed the same fingerprint
+    # forever (B5). A missing TARBALL (``.tgz``/``.tar.gz``) and any other 404
+    # are honest unknowns that stop with evidence instead of looping. The check
+    # sits BEFORE the resolver markers so a literal ``e404`` can never be
+    # swallowed by the broader resolver keywords.
+    if "e404" in lowered or "404 not found" in lowered:
+        if re.search(r"\.tgz\b|\.tar\.gz\b", output or ""):
+            return "unknown", "TARBALL_UNAVAILABLE"
+        return "unknown", "NOT_FOUND"
+    if "eresolve" in lowered:
+        return "resolver", "CONFLICT"
+    for marker, code in (
+        ("etarget", "ETARGET"),
+        ("yn0082", "ETARGET"),
+        ("enotarget", "NOTARGET"),
+        ("no matching version", "ETARGET"),
+        ("unable to resolve", "RESOLVER"),
+        ("unresolved", "RESOLVER"),
+    ):
+        if marker in lowered:
+            return "resolver", code
+    if "fixed" in lowered or "conflict" in lowered:
+        return "resolver", "CONFLICT"
+    return "unknown", "UNKNOWN"
+
+
+def _classify_materialization_failure(output: str) -> str:
+    # Kept as a thin, backward-compatible facade (kind only) for callers that
+    # render the event; the coordinator consumes the structured classification.
+    return _materialization_failure(output)[0]
+
+
+def _attempt_revision_key(base_checkpoint_id: Any, fingerprint: str) -> str:
+    """Per-revision durable identity for repair/infra budgets."""
+    return _sha256_text(f"{base_checkpoint_id}|{fingerprint}")
+
+
+def _infra_scope_key(
+    run: Mapping[str, Any], config: Mapping[str, Any], base_checkpoint_id: Any, fingerprint: str
+) -> str:
+    """Infra attempt identity: (registry/auth coordinates, base, fingerprint).
+
+    The registry coordinates come from availability_scope, so a change of the
+    server/proxy/offline flag naturally expires an old infra block without the
+    user having to know the key.
+    """
+    from iterative_target_deferrals import availability_scope
+
+    return _sha256_text(
+        f"{availability_scope(run, config)}|{base_checkpoint_id}|{fingerprint}"
+    )
+
+
+def availability_scope_flat(run: Mapping[str, Any], config: Mapping[str, Any]) -> str:
+    from iterative_target_deferrals import availability_scope
+
+    return availability_scope(run, config)
+
+
+def _build_attempt_result(
+    candidate: Mapping[str, Any],
+    base_checkpoint_id: str,
+    *,
+    classification: str,
+    code: str,
+    exit_code: int,
+    retry_count: int,
+    max_retries: int,
+    retryable: bool,
+    terminal_failure: bool,
+    output_tail: str,
+) -> Dict[str, Any]:
+    sequence = list(
+        (candidate.get("attemptResult") or {}).get("attemptSequence") or []
+    )
+    return {
+        "kind": "materialize",
+        "classification": classification,
+        "code": code,
+        "exitCode": int(exit_code),
+        "retryCount": int(retry_count),
+        "maxRetries": int(max_retries),
+        "retryable": bool(retryable),
+        "recoverable": classification == "infrastructure",
+        "terminalFailure": bool(terminal_failure),
+        "attemptSequence": sequence + [classification],
+        "lastFailureEvidence": {
+            "outputTail": (output_tail or "")[-2000:],
+            "journalRef": "attempt.log",
+        },
+        "candidateId": candidate.get("candidateId"),
+        "baseCheckpointId": base_checkpoint_id,
+        "createdAt": _now_iso(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# precheck (diagnostic screen inside the materialized trial)
+# ---------------------------------------------------------------------------
+
+def cmd_precheck(args: argparse.Namespace) -> int:
+    run_dir = Path(args.run_dir).resolve()
+    lock = _RunLock(run_dir, args.owner or f"pid-{os.getpid()}", stale_seconds=300)
+    lock.acquire()
+    try:
+        run = load_run(run_dir)
+        config = load_config(run_dir)
+        return _precheck_locked(run_dir, run, config, args)
+    finally:
+        lock.release()
+
+
+def _precheck_locked(
+    run_dir: Path, run: Mapping[str, Any], config: Mapping[str, Any], args: argparse.Namespace
+) -> int:
+    scheduler_started = time.monotonic()
+    if not run_budget_ok(config, run):
+        raise BudgetExceededError("RUN_DEADLINE_EXCEEDED")
+    _assert_runtime_unchanged(config)
+    candidate = load_candidate(run_dir)
+    if candidate is None or candidate.get("stage") != "MATERIALIZED":
+        raise InvalidInputError("CANDIDATE_NOT_MATERIALIZED")
+    refs = candidate.get("materializationRefs") or {}
+    workspace_root = Path(str(refs["workspaceRoot"]))
+    project_path = workspace_root / str(refs.get("projectRelative") or ".")
+
+    commands = list((config.get("verifyConfig") or {}).get("commands") or ())
+    if not commands:
+        commands = list(discover_baseline_project_checks(project_path))
+
+    failing: List[Dict[str, Any]] = []
+    first_failure: Optional[Dict[str, Any]] = None
+    from cohort_attempt_telemetry import record_attempt, stage_measurement, command_stage
+    measurements = []
+    candidate = dict(candidate)
+    candidate["telemetrySequence"] = int(candidate.get("telemetrySequence") or 0) + 1
+    save_candidate(run_dir, candidate)
+    runtime_env = _runtime_env(config)
+    base_env: Dict[str, str] = os.environ
+    if runtime_env:
+        base_env = {**base_env, **runtime_env}
+    from iterative_stage_checkpoint import operation_journal, DiagnosticCommandSequence
+    precheck_journal = operation_journal(run_dir, run, config, candidate, "precheck")
+    sequence = DiagnosticCommandSequence(precheck_journal, workspace_root, project_path, commands, base_env)
+    completed_prefix = sequence.resume_prefix()
+    if completed_prefix:
+        _emit_status({"event": "precheck.checkpoint-resumed", "runId": run["runId"],
+                      "candidateId": candidate["candidateId"], "completedCommands": completed_prefix})
+    for command_index, command in enumerate(commands, 1):
+        if command_index <= completed_prefix:
+            continue
+        before_key = sequence.begin(command_index, command)
+        env: Dict[str, str] = {
+            "CI": "1",
+            "npm_config_ignore_scripts": "true",
+        }
+        command_started = time.monotonic()
+        with MigrationProgress(_emit_status, operation="precheck", message=f"Running project command: {command}", run_id=run["runId"], candidate_id=candidate["candidateId"]) as progress:
+            argv = _command_argv(command, base_env)
+            try:
+                result = _run(
+                    argv, project_path,
+                    timeout_seconds=_clamp_int(args.timeout_seconds, 1200, 120, 4 * 3600),
+                    env=env, base_env=base_env, progress=progress,
+                    progress_label=f"iterative migration precheck {command}",
+                )
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                output = getattr(exc, 'output', '') or ''
+                if isinstance(output, bytes):
+                    output = output.decode('utf-8', errors='replace')
+                # The supervisor did not return a project exit status. Keep
+                # this UNKNOWN instead of inventing a failed project check.
+                result = subprocess.CompletedProcess(argv, -1, stdout=str(output),
+                    stderr=f'{type(exc).__name__}: {exc}')
+                result.deploom_infra_detected = True
+                result.deploom_infrastructure_reason = 'timeout' if isinstance(exc, subprocess.TimeoutExpired) else 'spawn'
+        sequence.complete(command_index, command, before_key, result)
+        failed = result.returncode != 0
+        inconclusive = (result.returncode < 0 or result.returncode in {124, 137}
+                        or bool(getattr(result, 'deploom_infra_detected', False)))
+        measurement_outcome = "UNKNOWN" if inconclusive else "FAIL" if failed else "PASS"
+        measurements.append(stage_measurement(command_stage(command), time.monotonic()-command_started, measurement_outcome, command))
+        entry = {
+            "command": command,
+            "exitCode": result.returncode,
+            "tail": (result.stdout or result.stderr or "")[-4000:] if failed else "",
+        }
+        if failed:
+            failing.append(entry)
+            if first_failure is None:
+                first_failure = entry
+                break  # PRECHECK may stop at the first meaningful error
+
+    candidate = dict(candidate)
+    candidate["schedulerSeconds"] = float(candidate.get("schedulerSeconds") or 0) + time.monotonic() - scheduler_started
+    candidate["stageMeasurements"] = list(candidate.get("stageMeasurements") or []) + measurements
+    save_candidate(run_dir, candidate)
+    precheck_outcome = next((m["outcome"] for m in measurements if m["outcome"] != "PASS"), "PASS")
+    record_attempt(run_dir, run, config, candidate, stage="precheck", outcome=precheck_outcome,
+                   seconds=time.monotonic()-scheduler_started, stages=measurements,
+                   size_feedback="FAIL" if precheck_outcome=="FAIL" else "NONE")
+    if failing and precheck_outcome == "UNKNOWN":
+        candidate["stage"] = "PRECHECKED"
+        candidate["diagnostics"] = failing
+        save_candidate(run_dir, candidate)
+        save_run(run_dir, {**run, "phase": "VERIFYING", "updatedAt": _now_iso()})
+        _emit_status({"event": "precheck.inconclusive", "runId": run["runId"],
+                      "candidateId": candidate["candidateId"], "reason": "fresh authoritative verification required"})
+        return 0
+    if failing:
+        candidate["stage"] = "REPAIRING"
+        candidate["diagnostics"] = failing
+        candidate["updatedAt"] = _now_iso()
+        save_candidate(run_dir, candidate)
+        _write_candidate_repair_requests(
+            run_dir, run, candidate, config, failing_commands=failing, reason="project-source-config-repair"
+        )
+        run = dict(run)
+        run["phase"] = "REPAIRING"
+        run["updatedAt"] = _now_iso()
+        save_run(run_dir, run)
+        _emit_status(
+            {
+                "event": "precheck.repair-required",
+                "runId": run["runId"],
+                "candidateId": candidate["candidateId"],
+                "failingCommands": [
+                    {"command": item["command"], "exitCode": item["exitCode"]}
+                    for item in failing
+                ],
+            }
+        )
+        return 0
+
+    candidate["stage"] = "PRECHECKED"
+    candidate["updatedAt"] = _now_iso()
+    save_candidate(run_dir, candidate)
+    run = dict(run)
+    run["phase"] = "PRECHECK"
+    run["updatedAt"] = _now_iso()
+    save_run(run_dir, run)
+    _emit_status(
+        {
+            "event": "precheck.pass",
+            "runId": run["runId"],
+            "candidateId": candidate["candidateId"],
+            "commands": commands,
+        }
+    )
+    return 0
+
+
+def _command_argv(command: str, environment: Optional[Mapping[str, str]] = None) -> List[str]:
+    return project_check_command_argv(command, environment)
+
+
+def _write_candidate_repair_requests(
+    run_dir: Path,
+    run: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+    config: Mapping[str, Any],
+    *,
+    failing_commands: Sequence[Mapping[str, Any]],
+    reason: str,
+) -> None:
+    project_name = str(config.get("projectName") or "")
+    assignment = candidate["fullAssignment"]
+    request = {
+        "schemaVersion": SCHEMA_VERSION,
+        "requestId": _new_id("repair"),
+        "candidateId": candidate["candidateId"],
+        "runId": run["runId"],
+        "baseCheckpointId": candidate["baseCheckpointId"],
+        "attemptId": candidate.get("attemptId", 0),
+        "project": project_name,
+        "mode": "iterative",
+        "assignment": [list(item) for item in sorted(assignment.items())],
+        "fingerprint": assignment_fingerprint(assignment),
+        "snapshotIdentity": str(
+            (candidate.get("materializationRefs") or {}).get("trialSnapshotKey") or ""
+        ),
+        "failingCommands": [
+            {"command": item["command"], "exitCode": item["exitCode"]}
+            for item in failing_commands
+        ],
+        "diagnosticsTail": (failing_commands[0]["tail"] if failing_commands else ""),
+        "reason": reason,
+        "disposition": "repair-or-replan",
+    }
+    existing = read_repair_requests(run_dir)
+    if not any(
+        item.get("candidateId") == candidate["candidateId"] and item.get("attemptId") == candidate.get("attemptId")
+        for item in existing
+    ):
+        existing.append(request)
+    write_repair_requests(run_dir, existing)
+
+
+# ---------------------------------------------------------------------------
+# verify-exact (authoritative; the only way to accept a checkpoint)
+# ---------------------------------------------------------------------------
+
+def cmd_verify_exact(args: argparse.Namespace) -> int:
+    run_dir = Path(args.run_dir).resolve()
+    lock = _RunLock(run_dir, args.owner or f"pid-{os.getpid()}", stale_seconds=600)
+    lock.acquire()
+    try:
+        run = load_run(run_dir)
+        config = load_config(run_dir)
+        return _verify_exact_locked(run_dir, run, config, args)
+    finally:
+        lock.release()
+
+
+def _verify_exact_locked(
+    run_dir: Path, run: Mapping[str, Any], config: Mapping[str, Any], args: argparse.Namespace
+) -> int:
+    _assert_runtime_unchanged(config)
+    if _recover_iteration_transition(run_dir, run, config):
+        return 0
+    if _recover_checkpoint_publication(run_dir, run, config) is not None:
+        return 0
+    if not run_budget_ok(config, run):
+        raise BudgetExceededError("RUN_DEADLINE_EXCEEDED")
+    candidate = load_candidate(run_dir)
+    if candidate is None:
+        raise InvalidInputError("NO_ACTIVE_CANDIDATE")
+    if candidate.get("stage") not in {"PRECHECKED", "REPAIRING", "VERIFYING"}:
+        raise InvalidInputError(
+            f"CANDIDATE_STAGE_NOT_READY_FOR_VERIFY: {candidate.get('stage')}"
+        )
+    # A crash between persisting the failure counter and publishing the run
+    # stop must not buy another physical verification on restart.
+    failures = int(candidate.get("verifyInfraFailures") or 0)
+    limit = int(config["budget"]["maxInfraRetries"])
+    if failures > limit:
+        evidence = candidate.get("verificationFailure") or {}
+        run = dict(run)
+        run["phase"] = "READY"
+        run["infraBlocked"] = {
+            "operation": "verify-exact", "candidateId": candidate["candidateId"],
+            "baseCheckpointId": candidate["baseCheckpointId"],
+            "classification": evidence.get("kind", "unknown"),
+            "reason": evidence.get("summary", "Verification infrastructure retries exhausted"),
+            "failures": failures, "maxRetries": limit, "blockedAt": _now_iso(),
+        }
+        save_run(run_dir, run)
+        return 0
+    base_checkpoint = load_checkpoint(run_dir, str(candidate["baseCheckpointId"]))
+
+    refs = candidate.get("materializationRefs") or {}
+    workspace_root = Path(str(refs["workspaceRoot"]))
+    project_path = workspace_root / str(refs.get("projectRelative") or ".")
+    if not (project_path / "package.json").exists():
+        raise InvalidInputError(f"TRIAL_PROJECT_MISSING: {project_path}")
+
+    candidate = dict(candidate)
+    candidate["stage"] = "VERIFYING"
+    candidate["updatedAt"] = _now_iso()
+    save_candidate(run_dir, candidate)
+    run = dict(run)
+    run["phase"] = "VERIFYING"
+    run["updatedAt"] = _now_iso()
+    save_run(run_dir, run)
+
+    verify_config = verify_config_from(config["verifyConfig"], run_dir)
+    remaining_run = None
+    if run.get("deadlineAt"):
+        try:
+            remaining_run = datetime.strptime(str(run["deadlineAt"]), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp() - time.time()
+        except (ValueError, TypeError):
+            pass
+    if remaining_run is not None and remaining_run <= 0:
+        raise BudgetExceededError("RUN_DEADLINE_EXCEEDED")
+    run_deadline = time.monotonic() + remaining_run if remaining_run is not None else 0
+    verify_config = dataclasses.replace(
+        verify_config,
+        verification_purpose="intermediate-candidate",
+        project_checks=config.get("verifyConfig", {}).get("projectChecks", "adaptive"),
+        budget_phase_deadline=(min(verify_config.budget_phase_deadline, run_deadline)
+            if verify_config.budget_phase_deadline and run_deadline
+            else verify_config.budget_phase_deadline or run_deadline),
+    )
+    _emit_status(
+        {
+            "event": "verify-exact.start",
+            "runId": run["runId"],
+            "candidateId": candidate["candidateId"],
+        }
+    )
+    from cohort_attempt_telemetry import record_attempt, event_offset, verification_stages
+    candidate["telemetrySequence"] = int(candidate.get("telemetrySequence") or 0) + 1
+    save_candidate(run_dir, candidate)
+    offset = event_offset(verify_config.telemetry_path)
+    scheduler_started = time.monotonic()
+    with MigrationProgress(_emit_status, operation="verify-exact", message="iterative migration verify-exact: preparing verification", run_id=run["runId"], candidate_id=candidate["candidateId"]) as progress:
+        from iterative_stage_checkpoint import operation_journal, VerificationResultCheckpoint
+        result_journal = operation_journal(run_dir, run, config, candidate, "verify-result")
+        result_environment = {**os.environ, **(_runtime_env(config) or {}), "CI": "1"}
+        result_checkpoint = VerificationResultCheckpoint(
+            result_journal, workspace_root, project_path, config["verifyConfig"], result_environment)
+        result = result_checkpoint.lookup(verify_config.proof_cache_dir, progress)
+        if result is not None:
+            _emit_status({"event": "verify-exact.checkpoint-resumed", "runId": run["runId"],
+                          "candidateId": candidate["candidateId"], "kind": result.kind})
+        else:
+            before_key = result_checkpoint.begin(progress)
+            result = verify_assignment(
+                project_path,
+                candidate["fullAssignment"],
+                config=verify_config,
+                run_project_checks=True,
+                progress=progress,
+                progress_label="iterative migration verify-exact",
+                runtime_env=_runtime_env(config),
+            )
+            result_checkpoint.complete(before_key, result, progress)
+    _emit_status(
+        {
+            "event": "verify-exact.result",
+            "runId": run["runId"],
+            "candidateId": candidate["candidateId"],
+            "ok": result.ok,
+            "kind": result.kind,
+            "summary": result.summary,
+            "projectFailures": [
+                {"command": f.command, "exitCode": f.exit_code}
+                for f in result.project_failures
+            ],
+        }
+    )
+
+    verify_seconds = time.monotonic()-scheduler_started
+    measurements = verification_stages(verify_config.telemetry_path, offset, assignment_fingerprint(candidate["fullAssignment"]))
+    candidate = {**candidate, "schedulerSeconds": float(candidate.get("schedulerSeconds") or 0) + verify_seconds,
+                 "stageMeasurements": list(candidate.get("stageMeasurements") or []) + measurements,
+                 "lastVerificationSeconds": verify_seconds, "lastVerificationMeasurements": measurements}
+    save_candidate(run_dir, candidate)
+    if not result.ok:
+        verify_outcome = "FAIL" if result.kind in {"dependency", "preparation", "project"} else "UNKNOWN"
+        if any(m.get("outcome")=="UNKNOWN" for m in measurements) or any(f.exit_code < 0 or f.exit_code in {124,137} for f in result.project_failures):
+            verify_outcome = "UNKNOWN"
+        record_attempt(run_dir, run, config, candidate, stage="verify-exact", outcome=verify_outcome,
+                       seconds=verify_seconds, stages=measurements, size_feedback="FAIL" if verify_outcome=="FAIL" and result.kind in {"dependency","project"} else "NONE",
+                       evidence_kind="structural" if result.kind=="dependency" else "opaque" if result.kind=="project" else "unavailable")
+    if result.ok:
+        return _accept_checkpoint(
+            run_dir, run, config, candidate, base_checkpoint, result
+        )
+    from iterative_state_transaction import StateTransaction, state_context
+    with StateTransaction(run_dir, state_context(run_dir, run, config, candidate), _write_json_atomic):
+        from cohort_action_cost import append_observation, observation_scope
+        scheduler_ledger = load_ledger(run_dir)
+        append_observation(scheduler_ledger, scope=observation_scope(run, config), candidate=candidate,
+                           seconds=candidate["schedulerSeconds"],
+                           outcome="rejected" if result.kind in {"dependency", "preparation"} else "inconclusive",
+                           source_key=str(base_checkpoint.get("sourceSnapshotKey") or ""))
+        save_ledger(run_dir, scheduler_ledger)
+
+        if result.kind == "project":
+            failing = [
+                {"command": f.command, "exitCode": f.exit_code, "tail": f.output}
+                for f in result.project_failures
+            ]
+            candidate = load_candidate(run_dir)
+            candidate = dict(candidate)
+            ledger = load_ledger(run_dir)
+            counters = dict(ledger.get("counters", {}))
+            max_attempts = int(config["budget"]["maxRepairAttemptsPerRevision"])
+            # B2: the repair budget belongs to THIS candidate incarnation
+            # (candidate.attemptId), so a NEW candidate never inherits a spent
+            # per-revision count and restarting the SAME attempt never resets it.
+            # The ledger keeps the per-revision total only as observable telemetry
+            # with a single owner (the locked controller).
+            used = int(candidate.get("attemptId", 0)) + 1
+            revision_key = _attempt_revision_key(
+                str(candidate["baseCheckpointId"]),
+                assignment_fingerprint(candidate["fullAssignment"]),
+            )
+            by_revision = dict(counters.get("repairAttemptsByRevision") or {})
+            by_revision[revision_key] = used
+            counters["repairAttemptsByRevision"] = by_revision
+            counters["repairAttemptsForRevision"] = used  # latest-revision telemetry
+            ledger = dict(ledger)
+            ledger["counters"] = counters
+            if used >= max_attempts:
+                _record_block(
+                    ledger,
+                    run_dir,
+                    candidateId=str(candidate["candidateId"]),
+                    baseCheckpointId=str(candidate["baseCheckpointId"]),
+                    kind="NOT_ACTIONABLE",
+                    reason=f"REPAIR_ATTEMPTS_EXHAUSTED completed={used} max={max_attempts}",
+                    assignmentFingerprint=assignment_fingerprint(candidate["fullAssignment"]),
+                )
+                candidate["stage"] = "REJECTED"
+                candidate["updatedAt"] = _now_iso()
+                save_candidate(run_dir, candidate)
+                run = dict(run)
+                run["activeCandidateId"] = None
+                run["phase"] = "READY"
+                run["updatedAt"] = _now_iso()
+                save_run(run_dir, run)
+                _emit_status(
+                    {
+                        "event": "verify-exact.rejected",
+                        "runId": run["runId"],
+                        "candidateId": candidate["candidateId"],
+                        "reason": "REPAIR_ATTEMPTS_EXHAUSTED",
+                    }
+                )
+                return 0
+            candidate["attemptId"] = used
+            candidate["stage"] = "REPAIRING"
+            candidate["updatedAt"] = _now_iso()
+            save_candidate(run_dir, candidate)
+            _write_candidate_repair_requests(
+                run_dir,
+                run,
+                candidate,
+                config,
+                failing_commands=failing,
+                reason="project-source-config-repair",
+            )
+            save_ledger(run_dir, ledger)
+            run = dict(run)
+            run["phase"] = "REPAIRING"
+            run["updatedAt"] = _now_iso()
+            save_run(run_dir, run)
+            return 0
+
+        if result.kind in {"dependency", "preparation"}:
+            # A deterministic dependency/preparation failure of the EXACT candidate
+            # becomes a deterministic scoped block for the same base checkpoint.
+            ledger = load_ledger(run_dir)
+            _record_block(
+                ledger,
+                run_dir,
+                candidateId=str(candidate["candidateId"]),
+                baseCheckpointId=str(candidate["baseCheckpointId"]),
+                kind="NEGATIVE_VERIFY",
+                reason=f"kind={result.kind}: {result.summary}",
+                assignmentFingerprint=assignment_fingerprint(candidate["fullAssignment"]),
+            )
+            candidate = load_candidate(run_dir)
+            candidate = dict(candidate)
+            candidate["stage"] = "REJECTED"
+            candidate["updatedAt"] = _now_iso()
+            save_candidate(run_dir, candidate)
+            run = dict(run)
+            run["activeCandidateId"] = None
+            run["phase"] = "READY"
+            run["updatedAt"] = _now_iso()
+            save_run(run_dir, run)
+            _emit_status(
+                {
+                    "event": "verify-exact.rejected",
+                    "runId": run["runId"],
+                    "candidateId": candidate["candidateId"],
+                    "reason": f"DETERMINISTIC_{result.kind.upper()}",
+                }
+            )
+            return 0
+
+        # UNKNOWN/infrastructure evidence never rejects the assignment. Bound the
+        # same candidate's re-verification; retain repaired bytes for explicit retry.
+        failures = int(candidate.get("verifyInfraFailures") or 0) + 1
+        limit = int(config["budget"]["maxInfraRetries"])
+        candidate["verifyInfraFailures"] = failures
+        candidate["verificationFailure"] = {"kind": result.kind, "summary": result.summary}
+        save_candidate(run_dir, candidate)
+        run = dict(run)
+        exhausted = failures > limit
+        run["phase"] = "READY" if exhausted else "VERIFYING"
+        if exhausted:
+            run["infraBlocked"] = {
+                "operation": "verify-exact", "candidateId": candidate["candidateId"],
+                "baseCheckpointId": candidate["baseCheckpointId"],
+                "classification": result.kind, "reason": result.summary,
+                "failures": failures, "maxRetries": limit, "blockedAt": _now_iso(),
+            }
+        run["updatedAt"] = _now_iso()
+        save_run(run_dir, run)
+        _emit_status({"event": "verify-exact.inconclusive", "runId": run["runId"],
+                      "candidateId": candidate["candidateId"], "retryable": not exhausted,
+                      "failures": failures, "summary": result.summary})
+        return 0
+
+
+def _record_block(
+    ledger: Dict[str, Any], run_dir: Path, *, candidateId: str, baseCheckpointId: str,
+    kind: str, reason: str, assignmentFingerprint: str,
+) -> None:
+    entry = {
+        "kind": kind,
+        "candidateId": candidateId,
+        "baseCheckpointId": baseCheckpointId,
+        "assignmentFingerprint": assignmentFingerprint,
+        "reason": reason,
+        "createdAt": _now_iso(),
+    }
+    ledger = dict(ledger)
+    from iterative_stage_checkpoint import negative_evidence_scope
+    entry["evidenceScope"] = negative_evidence_scope(run_dir, load_config(run_dir), baseCheckpointId)
+    blocks = list(ledger.get("blocks", []))
+    blocks.append(entry)
+    ledger["blocks"] = blocks
+    save_ledger(run_dir, ledger)
+
+
+def _accept_checkpoint(
+    run_dir: Path,
+    run: Mapping[str, Any],
+    config: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+    base_checkpoint: Mapping[str, Any],
+    result: BaselineVerifyResult,
+    *, supersede_publication: bool = False,
+) -> int:
+    for name, policy in (config.get("packagePolicies") or {}).items():
+        if policy == "keep-current" and (candidate.get("fullAssignment") or {}).get(name) != (base_checkpoint.get("fullAssignment") or {}).get(name):
+            raise InvalidInputError(f"KEEP_CURRENT_CHANGED: {name}")
+    for name in load_ledger(run_dir).get("userDeferredPackages", []):
+        if (candidate.get("fullAssignment") or {}).get(name) != (base_checkpoint.get("fullAssignment") or {}).get(name):
+            raise InvalidInputError(f"USER_DEFERRED_PACKAGE_CHANGED: {name}")
+    candidate_id = str(candidate["candidateId"])
+    base_id = str(base_checkpoint["checkpointId"])
+    seq = int(base_checkpoint.get("seq", 0)) + 1
+    checkpoint_id = f"C{seq}"
+    workspace_root = Path(str(candidate["materializationRefs"]["workspaceRoot"]))
+    project_path = workspace_root / str(candidate["materializationRefs"].get("projectRelative") or ".")
+    manifest_hash, lock_hash, lock_path = manifest_and_lock_hashes(project_path)
+
+    _emit_status(
+        {
+            "event": "verify-exact.accepting",
+            "runId": run["runId"],
+            "candidateId": candidate_id,
+            "checkpointId": checkpoint_id,
+            "parent": base_id,
+        }
+    )
+    with MigrationProgress(_emit_status, operation="checkpoint", message="Saving verified source snapshot", run_id=run["runId"], candidate_id=candidate_id) as progress:
+        from verification_stage_checkpoint import capture_recovery_source
+        snapshot, _reused = capture_recovery_source(
+            project_path, run_dir / "v" / "sc",
+            preferred_destination=run_dir / SOURCE_DIR / checkpoint_id, timeout_seconds=0, progress=progress)
+    if (not result.ok or not result.verified_source_snapshot_key
+            or result.verified_source_snapshot_key != snapshot.key
+            or result.verified_assignment_fingerprint != assignment_fingerprint(candidate["fullAssignment"])):
+        raise InvalidInputError("VERIFIED_SOURCE_IDENTITY_MISMATCH: preserve the incumbent and reverify the changed trial")
+    project_relative = resolve_project_relative(project_path, snapshot)
+
+    observed = dict(result.observed_resolved_versions or {})
+    old_assignment = {str(k): str(v) for k, v in (base_checkpoint.get("fullAssignment") or {}).items()}
+    new_assignment = {str(k): str(v) for k, v in (candidate.get("fullAssignment") or {}).items()}
+    accepted_delta = _accepted_delta(old_assignment, new_assignment)
+
+    checkpoint: Dict[str, Any] = {
+        "schemaVersion": SCHEMA_VERSION,
+        "checkpointId": checkpoint_id,
+        "parentCheckpointId": base_id,
+        "seq": seq,
+        "status": "VERIFIED",
+        "sourceSnapshotKey": snapshot.key,
+        "sourceSnapshotContainer": str(snapshot.container),
+        "sourceHead": snapshot.git_head or "",
+        "projectRelative": str(project_relative),
+        "manifestHash": manifest_hash,
+        "lockfileHash": lock_hash or "",
+        "resolvedStateKey": result.resolved_state_key or "",
+        "observedResolvedHash": result.observed_resolved_hash or observed_resolved_hash(observed),
+        "fullAssignment": new_assignment,
+        "acceptedDelta": accepted_delta,
+        "cohortId": candidate.get("cohortId") or None,
+        "iteration": {"candidateId": candidate_id, "attemptId": candidate.get("attemptId", 0),
+                      "assignmentFingerprint": assignment_fingerprint(new_assignment),
+                      "schedulerSeconds": candidate.get("schedulerSeconds"),
+                      "stageMeasurements": candidate.get("stageMeasurements") or [],
+                      "cohortSelection": candidate.get("cohortSelection") or {}},
+        "verification": {
+            "status": "passed",
+            "kind": result.kind,
+            "commands": list((config.get("verifyConfig") or {}).get("commands") or ()),
+            "scope": config.get("validationScope") or {"mode": "selected-checks", "deferredChecks": (config.get("validationProfile") or {}).get("deferredChecks", "")},
+            "failingCommands": [],
+        },
+        "proofRefs": {
+            "resolvedStateKey": result.resolved_state_key or "",
+            "preparationProofKey": result.preparation_proof_key or "",
+            "commandCheckpoints": list(getattr(result, "command_checkpoint_refs", ())),
+        },
+        "runtimeContractHash": _runtime_contract_hash(config),
+        "audit": {"status": "UNKNOWN", "evidenceRef": ""},
+        "createdAt": _now_iso(),
+        "toolBuildId": config.get("toolBuildId") or "",
+    }
+    # Write-ahead publication binds the physically verified snapshot and the
+    # next pointer before either state file changes. Recovery revalidates bytes.
+    previous_run = dict(run)
+    run = dict(run)
+    run["activeCheckpointId"] = checkpoint_id
+    run["activeCandidateId"] = None
+    run["generation"] = int(run.get("generation", 1)) + 1
+    run["phase"] = "READY"
+    run["updatedAt"] = _now_iso()
+    from iterative_checkpoint_publication import prepare_publication, TRANSACTION
+    prepare_publication(run_dir, previous_run, config, checkpoint, run, candidate_id, _write_json_atomic,
+                        supersede_verified=supersede_publication)
+    save_checkpoint(run_dir, checkpoint)
+    save_run(run_dir, run)
+    clear_candidate(run_dir)
+    write_repair_requests(run_dir, [])
+    (run_dir / TRANSACTION).unlink()
+
+    # The accepted pointer is durable first. Lossless cold storage failure
+    # cannot revoke it or erase the previous snapshot; expose the failure.
+    from snapshot_compaction import compact_superseded
+    with MigrationProgress(_emit_status, operation="storage", message="Compacting superseded source snapshots", run_id=run["runId"]) as progress:
+        storage = compact_superseded(run_dir, progress=progress)
+    _emit_status({"event": "storage.compaction", "runId": run["runId"], **storage})
+
+    # Physical acceptance telemetry follows the durable pointer switch too.
+    from cohort_attempt_telemetry import record_attempt
+    targets = config.get("targets") or {}
+    cumulative = sum(str(new_assignment.get(n)) == str(v) for n,v in targets.items())
+    record_attempt(run_dir, run, config, candidate, stage="verify-exact", outcome="PASS",
+                   seconds=candidate.get("lastVerificationSeconds"), stages=candidate.get("lastVerificationMeasurements") or [],
+                   accepted_delta=accepted_delta, cumulative_verified=cumulative, size_feedback="PASS")
+    # Success learning follows the durable pointer switch, never precedes it.
+    from cohort_action_cost import append_observation, observation_scope
+    scheduler_ledger = load_ledger(run_dir)
+    append_observation(scheduler_ledger, scope=observation_scope(run, config), candidate=candidate,
+                       seconds=float(candidate.get("schedulerSeconds") or 0), outcome="accepted",
+                       source_key=str(base_checkpoint.get("sourceSnapshotKey") or ""))
+    save_ledger(run_dir, scheduler_ledger)
+    _emit_status(
+        {
+            "event": "checkpoint.accepted",
+            "runId": run["runId"],
+            "checkpointId": checkpoint_id,
+            "parent": base_id,
+            "acceptedPackages": sorted(accepted_delta["changed"].keys()),
+            "deltaSummary": {
+                "changed": len(accepted_delta["changed"]),
+                "added": len(accepted_delta["added"]),
+                "removed": len(accepted_delta["removed"]),
+            },
+        }
+    )
+    return 0
+
+
+def _recover_iteration_transition(run_dir, run, config):
+    from iterative_state_transaction import recover_transition
+    def validate_base(cid, source_key):
+        checkpoint = load_checkpoint(run_dir, cid)
+        if checkpoint.get("status") != "VERIFIED" or checkpoint.get("sourceSnapshotKey") != source_key:
+            raise ValueError("ITERATION_TRANSITION_BASE_DRIFT")
+        _open_checkpoint_source(run_dir, checkpoint, config, run_id=str(run["runId"]))
+    try:
+        recovered = recover_transition(run_dir, run, config, write_json=_write_json_atomic, validate_source=validate_base)
+    except (ValueError, OSError) as exc:
+        raise InvalidInputError(f"ITERATION_TRANSITION_RECOVERY_FAILED: {exc}") from exc
+    if recovered:
+        _emit_status({"event": "iteration.transition-recovered", "runId": run["runId"]})
+    return recovered
+
+
+def _recover_checkpoint_publication(run_dir, run, config):
+    from iterative_checkpoint_publication import recover_publication
+    try:
+        recovered = recover_publication(
+            run_dir, run, config,
+            read_checkpoint=lambda cid: load_checkpoint(run_dir, cid) if _checkpoint_path(run_dir, cid).exists() else None,
+            save_checkpoint=lambda cp: save_checkpoint(run_dir, cp),
+            validate_source=lambda cp: _open_checkpoint_source(run_dir, cp, config, run_id=str(run["runId"])),
+            save_run=lambda value: save_run(run_dir, value),
+            clear_candidate=lambda: clear_candidate(run_dir),
+            clear_repairs=lambda: write_repair_requests(run_dir, []),
+        )
+    except (ValueError, OSError) as exc:
+        raise InvalidInputError(f"CHECKPOINT_PUBLICATION_RECOVERY_FAILED: {exc}") from exc
+    if recovered is not None:
+        _emit_status({"event": "checkpoint.publication-recovered", "runId": run["runId"],
+                      "checkpointId": recovered["activeCheckpointId"]})
+    return recovered
+
+
+def _accepted_delta(
+    old_assignment: Mapping[str, str], new_assignment: Mapping[str, str]
+) -> Dict[str, Dict[str, str]]:
+    added: Dict[str, str] = {}
+    changed: Dict[str, str] = {}
+    removed: Dict[str, str] = {}
+    for name, new_version in sorted(new_assignment.items()):
+        old_version = old_assignment.get(name)
+        if old_version is None:
+            added[name] = new_version
+        elif str(old_version) != str(new_version):
+            changed[name] = new_version
+    for name, old_version in sorted(old_assignment.items()):
+        if name not in new_assignment:
+            removed[name] = old_version
+    return {"added": added, "changed": changed, "removed": removed}
+
+
+# ---------------------------------------------------------------------------
+# apply-feedback (typed agent feedback => scheduling, never proof)
+# ---------------------------------------------------------------------------
+
+def cmd_apply_feedback(args: argparse.Namespace) -> int:
+    run_dir = Path(args.run_dir).resolve()
+    lock = _RunLock(run_dir, args.owner or f"pid-{os.getpid()}", stale_seconds=120)
+    lock.acquire()
+    try:
+        run = load_run(run_dir)
+        config = load_config(run_dir)
+        feedback = _read_feedback(args.feedback_file)
+        return _apply_feedback_locked(run_dir, run, config, feedback)
+    finally:
+        lock.release()
+
+
+def _read_feedback(feedback_file: str) -> Dict[str, Any]:
+    path = Path(feedback_file).resolve()
+    try:
+        value = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError) as exc:
+        raise InvalidInputError(f"FEEDBACK_FILE_INVALID: {exc}") from exc
+    if not isinstance(value, dict):
+        raise InvalidInputError("FEEDBACK_NOT_OBJECT")
+    return value
+
+
+def _apply_feedback_locked(
+    run_dir: Path, run: Mapping[str, Any], config: Mapping[str, Any], feedback: Mapping[str, Any]
+) -> int:
+    _require_schema(feedback, "FEEDBACK")
+    candidate = load_candidate(run_dir)
+    if candidate is None:
+        raise StaleFeedbackError(
+            f"STALE_FEEDBACK_NO_CANDIDATE: run={feedback.get('runId')}"
+        )
+    candidate_run = str(candidate.get("runId") or "")
+    if candidate_run != str(feedback.get("runId") or ""):
+        raise StaleFeedbackError(
+            f"STALE_FEEDBACK_RUN: candidate run={candidate_run} feedback run={feedback.get('runId')}"
+        )
+    if candidate["candidateId"] != str(feedback.get("candidateId") or ""):
+        raise StaleFeedbackError(
+            f"STALE_FEEDBACK_CANDIDATE: active={candidate['candidateId']} feedback={feedback.get('candidateId')}"
+        )
+    if candidate["baseCheckpointId"] != str(feedback.get("baseCheckpointId") or ""):
+        raise StaleFeedbackError(
+            f"STALE_FEEDBACK_BASE: active base={candidate['baseCheckpointId']} feedback={feedback.get('baseCheckpointId')}"
+        )
+    attempt_id = int(feedback.get("attemptId", -1))
+    if attempt_id != int(candidate.get("attemptId", 0)):
+        raise StaleFeedbackError(
+            f"STALE_FEEDBACK_ATTEMPT: active attempt={candidate.get('attemptId')} feedback={attempt_id}"
+        )
+    kind = str(feedback.get("kind") or "").strip().upper()
+    if kind not in FEEDBACK_KINDS:
+        raise InvalidInputError(f"FEEDBACK_KIND_INVALID: {kind}")
+
+    changed_files = feedback.get("changedFiles")
+    if changed_files is not None:
+        if not isinstance(changed_files, list) or not all(
+            isinstance(item, str) for item in changed_files
+        ):
+            raise InvalidInputError("FEEDBACK_CHANGED_FILES_INVALID")
+        _validate_changed_files(run_dir, candidate, changed_files)
+
+    # B5: the whole payload is validated BEFORE any durable write. An invalid
+    # feedback must fail here and leave the on-disk state untouched — never
+    # conclude the candidate first and only then raise (the old ordering left a
+    # half-written durable state: REJECTED candidate with no ledger feedback).
+    reason = feedback.get("reason")
+    if reason is not None and not isinstance(reason, str):
+        raise InvalidInputError("FEEDBACK_REASON_INVALID")
+    diagnostics_refs = feedback.get("diagnosticsRefs") or []
+    if not isinstance(diagnostics_refs, list) or not all(
+        isinstance(item, str) for item in diagnostics_refs
+    ):
+        raise InvalidInputError("FEEDBACK_DIAGNOSTICS_INVALID")
+    proposed_scope = feedback.get("proposedScope") or {}
+    if not isinstance(proposed_scope, dict):
+        raise InvalidInputError("FEEDBACK_SCOPE_INVALID")
+    proposed_constraints = feedback.get("proposedConstraints") or {}
+    if not isinstance(proposed_constraints, dict):
+        raise InvalidInputError("FEEDBACK_CONSTRAINTS_INVALID")
+    companions: Optional[Sequence[str]] = None
+    if kind in {"NEEDS_COHORT_EXPANSION", "NEEDS_ALTERNATIVE"}:
+        companions = proposed_scope.get("companions" if kind == "NEEDS_COHORT_EXPANSION" else "alternatives")
+        if companions is not None:
+            if not isinstance(companions, list) or not all(
+                isinstance(item, str) for item in companions
+            ):
+                raise InvalidInputError("FEEDBACK_COMPANIONS_INVALID")
+            companions = [str(item) for item in companions]
+
+    ledger = load_ledger(run_dir)
+    feedback_record = {
+        "schemaVersion": SCHEMA_VERSION,
+        "runId": str(feedback["runId"]),
+        "candidateId": candidate["candidateId"],
+        "baseCheckpointId": candidate["baseCheckpointId"],
+        "attemptId": attempt_id,
+        "kind": kind,
+        "reason": str(feedback.get("reason") or ""),
+        "changedFiles": changed_files or [],
+        "diagnosticsRefs": feedback.get("diagnosticsRefs") or [],
+        "proposedScope": feedback.get("proposedScope") or {},
+        "proposedConstraints": feedback.get("proposedConstraints") or {},
+        "createdAt": _now_iso(),
+    }
+    ledger = dict(ledger)
+    from cohort_attempt_telemetry import append_attempt, agent_measurement, stage_measurement
+    from cohort_action_cost import observation_scope
+    agent_seconds = agent_measurement(run_dir, candidate)
+    candidate = dict(candidate)
+    candidate["telemetrySequence"] = int(candidate.get("telemetrySequence") or 0) + 1
+    append_attempt(ledger, scope=observation_scope(run,config), config=config, candidate=candidate,
+                   stage="agent", outcome="UNKNOWN", seconds=agent_seconds,
+                   stages=[stage_measurement("agent",agent_seconds,"UNKNOWN")])
+    # Feedback is a proposal: neither prose nor agent exit records verified PASS.
+    save_candidate(run_dir, candidate)
+    feedback_list = list(ledger.get("feedback", []))
+    feedback_list.append(feedback_record)
+    ledger["feedback"] = feedback_list
+
+    run = dict(run)
+    if kind in {"READY_FOR_VERIFY"}:
+        run["phase"] = "VERIFYING"
+    elif kind in {"NEEDS_COHORT_EXPANSION", "NEEDS_ALTERNATIVE", "INCONCLUSIVE", "INFRA_BLOCKED"}:
+        # Scheduling conclusions: the candidate is concluded and freed so the
+        # planner can produce a new revision from the SAME base checkpoint.
+        # They never carry proof authority: nothing here changes the accepted
+        # checkpoint.
+        candidate = dict(candidate)
+        candidate["stage"] = "REJECTED"
+        candidate["updatedAt"] = _now_iso()
+        save_candidate(run_dir, candidate)
+        run["activeCandidateId"] = None
+        run["phase"] = "READY"
+        if kind in {"NEEDS_COHORT_EXPANSION", "NEEDS_ALTERNATIVE"}:
+            if companions is not None:
+                _record_scope_expansion(
+                    ledger, candidate, list(companions), str(feedback.get("reason") or "")
+                )
+        if kind in {"INCONCLUSIVE", "NEEDS_ALTERNATIVE", "NEEDS_COHORT_EXPANSION"}:
+            _append_deferral(ledger, candidate, str(feedback.get("reason") or "inconclusive"))
+    elif kind == "REPAIRING":
+        run["phase"] = "REPAIRING"
+
+    run = dict(run)
+    run["updatedAt"] = _now_iso()
+    save_run(run_dir, run)
+    save_ledger(run_dir, ledger)
+    _emit_status(
+        {
+            "event": "feedback.accepted",
+            "runId": run["runId"],
+            "candidateId": candidate["candidateId"],
+            "kind": kind,
+            "attemptId": attempt_id,
+        }
+    )
+    return 0
+
+
+def _record_scope_expansion(
+    ledger: Dict[str, Any],
+    candidate: Mapping[str, Any],
+    companions: Sequence[str],
+    reason: str,
+) -> None:
+    """Record a proposed companion (cohort expansion) as deterministic scope input.
+
+    The planner requires an exact assignment and preserves original declaration
+    guards. Missing peers may be added to the isolated trial; this is not proof.
+    """
+    ledger["scopeExpansions"] = list(ledger.get("scopeExpansions", [])) + [
+        {
+            "baseCheckpointId": candidate["baseCheckpointId"],
+            "candidateId": candidate["candidateId"],
+            "package": "",
+            "packages": sorted((candidate.get("delta") or {}).get("changed") or {}),
+            "companions": [str(item) for item in companions],
+            "assignmentFingerprint": assignment_fingerprint(candidate["fullAssignment"]),
+            "reason": reason,
+            "createdAt": _now_iso(),
+        }
+    ]
+
+
+def _append_deferral(
+    ledger: Dict[str, Any], candidate: Mapping[str, Any], reason: str
+) -> None:
+    """Defer this exact attempt; a different verified base may permit a retry."""
+    # This is scheduling evidence, never a learned incompatibility. Without
+    # the exact fingerprint, INCONCLUSIVE starves later independent cohorts by
+    # proposing the same assignment forever on the same verified checkpoint.
+    ledger["deferrals"] = list(ledger.get("deferrals", [])) + [
+        {
+            "baseCheckpointId": candidate["baseCheckpointId"],
+            "candidateId": candidate["candidateId"],
+            "cohortId": candidate.get("cohortId"),
+            "packages": sorted((candidate.get("delta") or {}).get("changed") or {}),
+            "assignmentFingerprint": assignment_fingerprint(candidate["fullAssignment"]),
+            "reason": reason,
+            "createdAt": _now_iso(),
+        }
+    ]
+
+
+def _validate_changed_files(
+    run_dir: Path, candidate: Mapping[str, Any], changed_files: Sequence[str]
+) -> None:
+    workspace_root = Path(
+        str((candidate.get("materializationRefs") or {}).get("workspaceRoot") or "")
+    ).resolve()
+    allowed_scope = candidate.get("allowedSourceScope") or {}
+    forbidden = set(allowed_scope.get("forbiddenRelatives") or FORBIDDEN_TRIAL_RELATIVES)
+    workspace_root_str = str(workspace_root).lower()
+    for raw in changed_files:
+        value = str(raw).replace("\\", "/")
+        candidate_path = (workspace_root / value).resolve()
+        if not str(candidate_path).lower().startswith(workspace_root_str):
+            raise InvalidInputError(
+                f"FEEDBACK_PATH_OUTSIDE_TRIAL: {raw}"
+            )
+        relative = candidate_path.relative_to(workspace_root)
+        parts = relative.parts
+        if parts and parts[0] in {"node_modules"}:
+            raise InvalidInputError(f"FEEDBACK_FORBIDDEN_DEPENDENCY_PATH: {raw}")
+        if parts and parts[-1] in forbidden:
+            raise InvalidInputError(
+                f"FEEDBACK_FORBIDDEN_MANIFEST_LOCK_PATH: {raw}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# status, finish, audit
+# ---------------------------------------------------------------------------
+
+def cmd_status(args: argparse.Namespace) -> int:
+    run_dir = Path(args.run_dir).resolve()
+    run = load_run(run_dir)
+    config = load_config(run_dir)
+    checkpoint_id = str(run["activeCheckpointId"])
+    checkpoint = load_checkpoint(run_dir, checkpoint_id)
+    candidate = load_candidate(run_dir)
+    ledger = load_ledger(run_dir)
+    repair_requests = read_repair_requests(run_dir)
+    from iterative_task import build_progress_summary
+    progress_summary = build_progress_summary(config, _all_checkpoints(run_dir), checkpoint, ledger)
+    from iterative_scope_expansion import prepare_expansions
+    from iterative_cohort_planner import cohort_atom_issues
+    from iterative_resume import terminal_repair_resumable
+    status_incumbent = dict(checkpoint.get("fullAssignment") or {})
+    status_desired, status_ledger, expansion_issues = prepare_expansions(
+        status_incumbent,
+        {n: (config.get("targets") or {}).get(n, v) for n, v in status_incumbent.items()},
+        ledger, checkpoint_id, _all_checkpoints(run_dir),
+        unavailable={(e.get("package"), e.get("target")) for e in ledger.get("targetAvailabilityDeferrals", [])
+                     if e.get("scope") == availability_scope_flat(run, config)})
+    expansion_issues += cohort_atom_issues(status_incumbent, status_desired, config, status_ledger, checkpoint_id)
+    if candidate and (candidate.get("cohortSelection") or {}).get("budgetAdapted"):
+        selected = set((candidate.get("delta") or {}).get("changed") or {})
+        expansion_issues = [issue for issue in expansion_issues
+                            if issue.get("reason") != "COHORT_ATOM_EXCEEDS_CAP"
+                            or not set(issue.get("packages") or []).issubset(selected)]
+    payload = {
+        "schemaVersion": SCHEMA_VERSION,
+        "run": run,
+        "activeCheckpoint": checkpoint,
+        "progressSummary": progress_summary,
+        "goalSatisfied": _policy_satisfied(config, checkpoint),
+        "terminalRepairResumable": terminal_repair_resumable(run_dir, run, checkpoint, candidate, ledger, config),
+        "checkpointPublicationPending": (run_dir / "checkpoint-publication.json").exists(),
+        "iterationPublicationPending": (run_dir / "iteration-transition.json").exists(),
+        "candidate": candidate,
+        "ledgerSummary": {
+            "blocks": len(ledger.get("blocks", [])),
+            "deferrals": len(ledger.get("deferrals", [])),
+            "feedback": len(ledger.get("feedback", [])),
+            "infraBlocks": len(ledger.get("infraBlocks", [])),
+            "attemptTelemetry": len(ledger.get("attemptTelemetry", [])),
+            "cohortSizeState": ledger.get("cohortSizeState") or {},
+            "conflictRegions": ledger.get("conflictRegions") or [],
+            "schedulerProgress": ledger.get("schedulerProgress") or {},
+            "counters": ledger.get("counters", {}),
+        },
+        "infraBlocked": run.get("infraBlocked") or None,
+        "scopeExpansionIssues": expansion_issues,
+        "openRepairRequests": repair_requests,
+        "config": {
+            "projectName": config.get("projectName"),
+            "targetLevel": config.get("targetLevel"),
+            "budget": config.get("budget"),
+            "verifyConfigCommands": config.get("verifyConfig", {}).get("commands", []),
+            # D2.4: the UI needs the requested-vs-effective runtime contract and
+            # the CI evidence source to render, not to decide. The durable
+            # runtime block lives in run-config.json; this is its view.
+            "goalMode": config.get("goalMode"),
+            "requestedNode": config.get("requestedNode") or "",
+            "runtime": config.get("runtime") or {},
+        },
+    }
+    status_path = run_dir / "status.json"
+    _write_json_atomic(status_path, payload)
+    _emit_status({"event": "status.ready", "runId": run["runId"], "statusPath": str(status_path)})
+    print(_stable_json(payload))
+    return 0
+
+
+def _policy_satisfied(config: Mapping[str, Any], checkpoint: Mapping[str, Any]) -> bool:
+    targets = {str(k): str(v) for k, v in (config.get("targets") or {}).items()}
+    if not targets and config.get("goalMode") != "audit-policy":
+        return False
+    incumbent = checkpoint.get("fullAssignment") or {}
+    if config.get("goalMode") == "audit-policy":
+        required = {n for n, policy in (config.get("packagePolicies") or {}).items() if policy == "required"}
+        return ((checkpoint.get("audit") or {}).get("status") == "PASS" and
+                all(n in targets and str(incumbent.get(n)) == str(targets[n]) for n in required))
+    return all(
+        name in incumbent and str(targets[name]) == str(incumbent[name])
+        for name in targets
+    )
+
+
+def _terminal_outcome(satisfied: bool, audit_status: str, accepted_count: int) -> str:
+    # R8: durable complete/partial/blocked. A satisfied policy is COMPLETE only
+    # on a PASS audit; any missing/UNKNOWN evidence never yields COMPLETE.
+    if satisfied and audit_status == "PASS":
+        return "COMPLETE"
+    if audit_status not in ("PASS", "FAIL"):
+        return "BLOCKED_BASELINE"
+    if accepted_count > 0:
+        return "PARTIAL_VERIFIED"
+    return "NO_VERIFIED_UPGRADE"
+
+
+def _is_baseline_checkpoint(checkpoint: Mapping[str, Any]) -> bool:
+    # The baseline C0 has no parent and seq 0; every accepted checkpoint records
+    # its parent and a higher seq (see _accept_checkpoint).
+    return not checkpoint.get("parentCheckpointId") and int(checkpoint.get("seq") or 0) == 0
+
+
+def _accepted_upgrade_count(checkpoints: Sequence[Mapping[str, Any]]) -> int:
+    # B3: C0 is the VERIFIED starting point, not an accepted UPGRADE. Finish must
+    # not count it, otherwise a run with zero real updates reports
+    # acceptedCheckpoints=1 / PARTIAL_VERIFIED instead of
+    # NO_VERIFIED_UPGRADE (actual updates = 0).
+    return sum(
+        1
+        for c in checkpoints
+        if c.get("status") == "VERIFIED" and not _is_baseline_checkpoint(c)
+    )
+
+
+def cmd_finish(args: argparse.Namespace) -> int:
+    run_dir = Path(args.run_dir).resolve()
+    lock = _RunLock(run_dir, args.owner or f"pid-{os.getpid()}", stale_seconds=600)
+    lock.acquire()
+    try:
+        run = load_run(run_dir)
+        config = load_config(run_dir)
+        if getattr(args, "lang", None):
+            delivery = json.loads((run_dir / "delivery-state.json").read_text(encoding="utf-8-sig")) if (run_dir / "delivery-state.json").exists() else None
+            if delivery and (delivery.get("documentLanguage") or "en") != args.lang:
+                raise InvalidInputError("DOCUMENT_LANGUAGE_LOCKED_FOR_DELIVERY")
+            config = {**config, "documentLanguage": args.lang}
+            save_config(run_dir, config)
+        return _finish_locked(run_dir, run, config)
+    finally:
+        lock.release()
+
+
+def _finish_locked(run_dir: Path, run: Mapping[str, Any], config: Mapping[str, Any]) -> int:
+    checkpoints = _all_checkpoints(run_dir)
+    reports_dir = run_dir / REPORTS_DIR
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    existing_outcome = run.get("terminalOutcome")
+    # P2 (#1): a repair-only run carries NO migration targets. Its terminal is not
+    # a partial migration when the current-state control passes — the repair goal
+    # (project passes its own checks) is what got satisfied.
+    repair_only = bool(config.get("repairOnly")) and not (config.get("targets") or {})
+
+    # R8: finish is an IDEMPOTENT terminal transition. The durable outcome is
+    # computed once from the audit evidence + acceptance chain; every later call
+    # only re-writes the reports from the same durable state.
+    if not existing_outcome:
+        active_id = str(run["activeCheckpointId"])
+        checkpoint = load_checkpoint(run_dir, active_id)
+        audit = checkpoint.get("audit") or {}
+        audit_status = str(audit.get("status") or "")
+        if audit_status not in ("PASS", "FAIL"):
+            # The independent audit of the EXACT accepted checkpoint is a
+            # precondition of finalizing; UNKNOWN evidence never yields
+            # COMPLETE, so finish runs the audit when the run was finished
+            # before it had evidence.
+            audit_args = argparse.Namespace(
+                registry="",
+                lag_months=None,
+                min_lag_ok_pct=None,
+                max_known_high=None,
+                yarn_audit_engine="auto",
+            )
+            _audit_locked(run_dir, run, config, audit_args)
+            run = load_run(run_dir)
+            checkpoint = load_checkpoint(run_dir, active_id)
+            audit = checkpoint.get("audit") or {}
+            audit_status = str(audit.get("status") or "")
+        satisfied = _policy_satisfied(config, checkpoint)
+        # Count actual version deltas only on the active ancestor chain.
+        by_id = {c.get("checkpointId"): c for c in checkpoints}
+        chain, seen, cursor = [], set(), checkpoint
+        while cursor and cursor.get("checkpointId") not in seen:
+            seen.add(cursor.get("checkpointId"))
+            parent = by_id.get(cursor.get("parentCheckpointId"))
+            if parent and cursor.get("status") == "VERIFIED" and cursor.get("fullAssignment") != parent.get("fullAssignment"):
+                chain.append(cursor)
+            cursor = parent
+        accepted_count = len(chain)
+        outcome = _terminal_outcome(satisfied, audit_status, accepted_count)
+        # P2 (#1): a repair-only run whose CURRENT-state control passes the audit
+        # is a repair SUCCESS — never a partial migration ("0 verified UPGRADES"
+        # must not read as "часть обновлений применена"). The audit gates it
+        # exactly like a real migration: UNKNOWN evidence stays BLOCKED_BASELINE.
+        if repair_only and audit_status == "PASS" and str(checkpoint.get("status")) == "VERIFIED":
+            outcome = "REPAIR_VERIFIED"
+            satisfied = True
+        run = dict(run)
+        run["terminal"] = outcome
+        run["terminalOutcome"] = {
+            "outcome": outcome,
+            "satisfied": satisfied,
+            "auditStatus": audit_status,
+            "acceptedCheckpoints": accepted_count,
+            "finishedAt": _now_iso(),
+            "activeCheckpointId": active_id,
+        }
+        run["phase"] = "TERMINAL"
+        run["updatedAt"] = _now_iso()
+        save_run(run_dir, run)
+    else:
+        outcome = str(existing_outcome.get("outcome") or run.get("terminal") or "")
+
+    # finish may have just persisted fresh audit evidence. Render those bytes,
+    # not the pre-audit checkpoint list loaded at entry.
+    checkpoints = _all_checkpoints(run_dir)
+    from migration_documents import generate_run_documents
+    generate_run_documents(run_dir, run, config, checkpoints)
+    _emit_status(
+        {
+            "event": "finish.done",
+            "runId": run["runId"],
+            "terminal": outcome,
+            "checkpoints": [c["checkpointId"] for c in checkpoints],
+            "reportsDir": str(reports_dir),
+        }
+    )
+    return 0
+
+
+def _all_checkpoints(run_dir: Path) -> List[Dict[str, Any]]:
+    checkpoint_ids = []
+    for path in sorted((run_dir / CHECKPOINT_DIR).glob("C*.json")):
+        try:
+            checkpoint_ids.append(path.stem)
+        except Exception:
+            continue
+    checkpoints = [load_checkpoint(run_dir, cid) for cid in checkpoint_ids]
+    chain, tail = _ordered_checkpoint_chain(checkpoints)
+    return chain + tail
+
+
+def _ordered_checkpoint_chain(
+    checkpoints: Sequence[Mapping[str, Any]],
+) -> tuple:
+    """Topological order by parent links: C0 -> C1 -> ... -> deepest accepted
+    checkpoint. A plain filename sort would mis-rank C10 before C9; the ACTIVE
+    checkpoint is resolved by identity (run.activeCheckpointId) with the chain
+    tail as fallback, never by string comparison. Unconnected checkpoints are
+    appended deterministically by id."""
+    by_id = {str(c.get("checkpointId")): c for c in checkpoints}
+    chain: List[Mapping[str, Any]] = []
+    seen = set()
+    current = next(
+        (c for c in by_id.values() if not str(c.get("parentCheckpointId") or "").strip()),
+        None,
+    )
+    while current is not None:
+        cid = str(current.get("checkpointId"))
+        if cid in seen:
+            break
+        seen.add(cid)
+        chain.append(current)
+        current = next(
+            (
+                c
+                for c in by_id.values()
+                if str(c.get("checkpointId")) not in seen
+                and str(c.get("parentCheckpointId") or "") == cid
+            ),
+            None,
+        )
+    tail = [c for c in by_id.values() if str(c.get("checkpointId")) not in seen]
+    tail.sort(key=lambda c: str(c.get("checkpointId")))
+    return chain, tail
+
+
+def _resolve_active_checkpoint(
+    run: Mapping[str, Any], checkpoints: Sequence[Mapping[str, Any]]
+) -> Mapping[str, Any]:
+    """R10: the ACTIVE checkpoint is governed by identity (run.activeCheckpointId),
+    with the deepest accepted chain member as explicit fallback — never the
+    string-max checkpoint id (C10 > C9 would silently describe the wrong state)."""
+    active_id = str(run.get("activeCheckpointId") or "")
+    if active_id:
+        for checkpoint in checkpoints:
+            if str(checkpoint.get("checkpointId")) == active_id:
+                return checkpoint
+    chain, _tail = _ordered_checkpoint_chain(checkpoints)
+    return chain[-1] if chain else (checkpoints[-1] if checkpoints else {})
+
+
+def _build_migration_report(
+    run_dir: Path, run: Mapping[str, Any], config: Mapping[str, Any],
+    checkpoints: Sequence[Mapping[str, Any]], terminal_outcome: Optional[Mapping[str, Any]] = None,
+) -> str:
+    from migration_documents import run_inputs, complete_inputs, migration_document
+    data = run_inputs(run_dir, run, config, checkpoints)
+    if terminal_outcome is not None:
+        data["run"] = {**run, "terminalOutcome": terminal_outcome}
+    return migration_document(complete_inputs(data), config.get("documentLanguage") or "en")
+
+
+def _build_developer_upgrade_guide(
+    run_dir: Path, config: Mapping[str, Any], checkpoints: Sequence[Mapping[str, Any]]
+) -> str:
+    from migration_documents import run_inputs, complete_inputs, migration_document, optional
+    run = optional(run_dir / "run.json") or {}
+    data = run_inputs(run_dir, run, config, checkpoints)
+    return migration_document(complete_inputs(data), config.get("documentLanguage") or "en", guide=True)
+
+
+def cmd_audit(args: argparse.Namespace) -> int:
+    """Independent audit of the ACTIVE checkpoint's exact dependency state."""
+    run_dir = Path(args.run_dir).resolve()
+    lock = _RunLock(run_dir, args.owner or f"pid-{os.getpid()}", stale_seconds=600)
+    lock.acquire()
+    try:
+        run = load_run(run_dir)
+        config = load_config(run_dir)
+        return _audit_locked(run_dir, run, config, args)
+    finally:
+        lock.release()
+
+
+def _audit_locked(
+    run_dir: Path, run: Mapping[str, Any], config: Mapping[str, Any], args: argparse.Namespace
+) -> int:
+    from iterative_adaptive_budget import recover_checkpoint_audit
+    _assert_runtime_unchanged(config)
+    overrides = {key: getattr(args, key, None) for key in (
+        "registry", "lag_months", "min_lag_ok_pct", "max_known_high", "yarn_audit_engine")
+        if getattr(args, key, None) not in (None, "", "auto")}
+    if getattr(args, "refresh_evidence", None):
+        # A stale report needs its own bounded refresh, not the completed
+        # collection's retry slot. Repeated retries share this same identity.
+        overrides["refresh_evidence"] = args.refresh_evidence
+    audit_identity = _sha256_text(_stable_json(overrides)) if overrides else ""
+    checkpoint_id = str(run["activeCheckpointId"])
+    return recover_checkpoint_audit(checkpoint_id=checkpoint_id, config=config,
+        read_run=lambda: load_run(run_dir), write_run=lambda value: save_run(run_dir, value),
+        read_checkpoint=lambda: load_checkpoint(run_dir, checkpoint_id),
+        operation=lambda: _audit_once_locked(run_dir, load_run(run_dir), config, args),
+        budget_ok=lambda value: run_budget_ok(config, value), emit=_emit_status, pause=time.sleep,
+        audit_identity=audit_identity)
+
+
+def _audit_once_locked(
+    run_dir: Path, run: Mapping[str, Any], config: Mapping[str, Any], args: argparse.Namespace
+) -> int:
+    _assert_runtime_unchanged(config)
+    checkpoint = load_checkpoint(run_dir, str(run["activeCheckpointId"]))
+    snapshot = _open_checkpoint_source(run_dir, checkpoint, config, run_id=str(run["runId"]))
+    project_path = Path(snapshot.root) / str(checkpoint.get("projectRelative") or ".")
+    try:
+        from manual_dependency_audit import build_report, markdown
+    except Exception as exc:
+        raise IterativeMigrationError("AUDIT_UNAVAILABLE", f"{exc}") from exc
+    audit_workspace = run_dir / AUDIT_DIR / f"{checkpoint['checkpointId']}"
+    audit_workspace.mkdir(parents=True, exist_ok=True)
+    audit_policy = config.get("auditPolicy") or {}
+    dashboard_state_raw = str(config.get("dashboardState") or "").strip()
+    dashboard_state = (
+        Path(dashboard_state_raw).expanduser().resolve()
+        if dashboard_state_raw and Path(dashboard_state_raw).exists()
+        else None
+    )
+    # R8: the independent audit runs over the EXACT accepted checkpoint bytes
+    # with the ACTUAL policy captured at begin (lag window, lag-ok threshold,
+    # known-High limit) plus the user's package lag policy from dashboard state
+    # — never dashboard_state=None.
+    from iterative_audit_policy import audit_engine_for_retry
+    audit_started=time.monotonic()
+    report = build_report(
+        project_path,
+        str(config.get("projectName") or ""),
+        registry=args.registry or "",
+        lag_months=int(
+            (args.lag_months if args.lag_months is not None
+             else audit_policy.get("lagMonths", 12))
+        ),
+        dashboard_state=dashboard_state,
+        audit_workspace=audit_workspace,
+        target_level=str(config.get("targetLevel") or "yellow"),
+        min_lag_ok_pct=int(
+            (args.min_lag_ok_pct if args.min_lag_ok_pct is not None
+             else audit_policy.get("minLagOkPct", 80))
+        ),
+        max_known_high=int((args.max_known_high if args.max_known_high is not None
+                            else audit_policy.get("maxKnownHigh", 1))),
+        yarn_audit_engine=audit_engine_for_retry(args.yarn_audit_engine, checkpoint.get("audit") or {}),
+        max_known_moderate=audit_policy.get("maxKnownModerate"),
+        max_known_low=audit_policy.get("maxKnownLow"),
+        runtime_env=_runtime_env(config),
+    )
+    # R8: persist the FULL report as JSON/Markdown evidence (not just a status +
+    # directory link), then record the coverage/vuln metrics in the checkpoint.
+    evidence_report = audit_workspace / "audit-report.json"
+    evidence_markdown = audit_workspace / "audit-report.md"
+    evidence_report.write_text(
+        _stable_json(report), encoding="utf-8"
+    )
+    try:
+        evidence_markdown.write_text(markdown(report, config.get("documentLanguage") or "en"), encoding="utf-8")
+    except Exception as exc:  # the markdown renderer must never hide a finished audit
+        evidence_markdown.write_text(
+            f"# Audit report (markdown render failed: {exc})\n\n" + _stable_json(report),
+            encoding="utf-8",
+        )
+    evidence_ref = str(audit_workspace)
+    audit_status = _audit_status_from_report(report)
+    from cohort_attempt_telemetry import record_attempt, stage_measurement
+    audit_seconds=time.monotonic()-audit_started
+    record_attempt(run_dir,run,config,{"candidateId":None,"telemetrySequence":time.time_ns()},
+                   stage="audit",outcome=audit_status,seconds=audit_seconds,
+                   stages=[stage_measurement("audit",audit_seconds,audit_status)])
+    audit_metrics = report.get("audit") or {}
+    from iterative_audit_policy import audit_recovery_reason
+    checkpoint = dict(checkpoint)
+    checkpoint["audit"] = {
+        "status": audit_status,
+        "evidenceRef": evidence_ref,
+        "auditComplete": report.get("auditComplete") is True and report.get("lagComplete") is True,
+        "securityComplete": _audit_status_from_report({**report, "lagComplete": True}) in {"PASS", "FAIL"},
+        "lagComplete": bool(report.get("lagComplete")),
+        "unknownPackages": [{"package": item.get("name"), "version": item.get("current"), "reason": item.get("error")}
+                            for item in report.get("lag", []) if item.get("status") == "unknown"],
+        "retryableReason": audit_recovery_reason(report, allow_canonical=args.yarn_audit_engine in (None, "", "auto")),
+        "engine": audit_metrics.get("engine"),
+        "lagOkPct": audit_metrics.get("lagOkPct"),
+        "lagOk": audit_metrics.get("lagOk"),
+        "lagLagging": audit_metrics.get("lagLagging"),
+        "lagUnknown": audit_metrics.get("lagUnknown"),
+        "lagTotal": audit_metrics.get("lagTotal"),
+        "vulnerabilityPackages": len(audit_metrics.get("packages") or {}),
+        "packageTotals": audit_metrics.get("packageTotals") or {},
+        "advisoryTotals": audit_metrics.get("advisoryTotals") or {},
+        "vulnerablePackages": [{"package": n, "severity": v.get("severity") or next((s for s in ("critical", "high", "moderate", "low") if v.get(s, 0)), None), "direct": v.get("isDirect"),
+                                "nodes": v.get("nodes") or [], "range": v.get("range")}
+                               for n, v in (audit_metrics.get("packages") or {}).items()],
+        "policy": report.get("policy") or {},
+        "generatedAt": report.get("generatedAt") or "",
+    }
+    save_checkpoint(run_dir, checkpoint)
+    if checkpoint.get("checkpointId") == "C0":
+        from migration_documents import write_pre_fix_report
+        write_pre_fix_report(run_dir, run, config, checkpoint)
+    _emit_status(
+        {
+            "event": "audit.done",
+            "runId": run["runId"],
+            "checkpointId": checkpoint["checkpointId"],
+            "status": audit_status,
+            "evidenceRef": evidence_ref,
+            "evidenceJson": str(evidence_report),
+            "evidenceMarkdown": str(evidence_markdown),
+        }
+    )
+    return 0
+
+
+def _audit_status_from_report(report: Mapping[str, Any]) -> str:
+    from iterative_audit_policy import audit_policy_status
+
+    return audit_policy_status(report)
+
+
+def cmd_export_task(args: argparse.Namespace) -> int:
+    """Publish the ТЗ (task) artifact from durable state only.
+
+    Never starts a Baseline and never runs project checks: the builder reads
+    run.json / run-config.json / checkpoints / ledger.  Insufficient durable
+    JSON is a diagnosed InvalidInputError listing the missing fields, so the
+    UI can show the reason and a concrete next action.
+
+    R9: with --legacy-dashboard-state the LEGACY saved Baseline result is
+    imported by the SAME builder (versioned artifactSource=legacy-baseline)
+    into the shared task contract without any rerun or invented proof.
+    """
+    run_dir = Path(args.run_dir).resolve()
+    legacy_dashboard = (args.legacy_dashboard_state or "").strip()
+    if legacy_dashboard:
+        if not (args.project_name or "").strip():
+            raise InvalidInputError("LEGACY_PROJECT_NAME_REQUIRED: --project-name must name the legacy project")
+        from iterative_task import TaskExportError, export_legacy_task_artifact, verify_task_input_errors
+
+        run_dir.mkdir(parents=True, exist_ok=True)
+        languages = ["ru", "en"] if args.language == "both" else [args.language]
+        try:
+            summary = export_legacy_task_artifact(
+                Path(legacy_dashboard).expanduser().resolve(),
+                (args.project_name or "").strip(),
+                run_dir,
+                languages=languages,
+            )
+        except TaskExportError as exc:
+            raise InvalidInputError(f"{exc.code}: {exc.summary}") from exc
+        _emit_status(summary)
+        return 0
+    if not (run_dir / "run.json").exists():
+        raise InvalidInputError("RUN_STATE_MISSING: no run.json under the run dir")
+    from iterative_task import TaskExportError, export_task_artifact, verify_task_input_errors
+
+    languages = ["ru", "en"] if args.language == "both" else [args.language]
+    if args.check_only:
+        missing = verify_task_input_errors(run_dir)
+        if missing:
+            raise InvalidInputError(
+                "TASK_INPUT_INSUFFICIENT: " + "; ".join(missing)
+            )
+        _emit_status(
+            {
+                "event": "export-task.check",
+                "runId": str(json.loads((run_dir / "run.json").read_text(encoding="utf-8-sig")).get("runId") or ""),
+                "sufficient": True,
+            }
+        )
+        return 0
+    try:
+        summary = export_task_artifact(run_dir, languages=languages)
+    except TaskExportError as exc:
+        raise InvalidInputError(f"{exc.code}: {exc.summary}")
+    _emit_status(summary)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="iterative_migration",
+        description="Iterative (накопительная) dependency migration steps.",
+    )
+    parser.add_argument("--run-dir", required=True, help="Durable run directory")
+    parser.add_argument("--owner", default="", help="Writer/lease owner id")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    begin = sub.add_parser("begin", help="Захват C0 (Исходный замер)")
+    begin.add_argument("--project-dir", required=True)
+    begin.add_argument("--source-scope", choices=("frontend", "project-gitignore", "repository"), default="repository",
+                       help="repository keeps all authoritative source; frontend explicitly excludes MSBuild-owned backend bin/obj, agent state and declared Nx cache; project-gitignore is a legacy repository alias")
+    begin.add_argument("--project-name", default="")
+    begin.add_argument("--intent-file", default="")
+    begin.add_argument("--max-known-moderate", type=int, default=None)
+    begin.add_argument("--max-known-low", type=int, default=None)
+    begin.add_argument("--workspace-id", default="")
+    begin.add_argument("--project-id", default="")
+    begin.add_argument("--run-id", default="")
+    begin.add_argument("--target-level", choices=("yellow", "green"), default="yellow")
+    begin.add_argument("--lang", choices=("en", "ru"), default="en", help="Explicit language of all migration documents")
+    begin.add_argument(
+        "--check-only",
+        action="store_true",
+        help="standalone 'Проверить проект': preflight + контроль текущих зависимостей, без run.json/discovery/снапшота",
+    )
+    begin.add_argument(
+        "--repair-only",
+        action="store_true",
+        help="repair текущего состояния: контроль текущих версий БЕЗ целей и discovery (обход roadmap); красный C0 → BOOTSTRAP_REPAIR, зелёный → READY/REPAIR_VERIFIED",
+    )
+    begin.add_argument(
+        "--adopt-repair-source",
+        action="store_true",
+        help="начать миграцию С исправленных исходников завершённого ремонта (REPAIR_VERIFIED): C0 наследует проверенный снимок repair-handoff.json вместо повторного снятия с красного project-dir",
+    )
+    begin.add_argument("--targets-file", default="", help="JSON {package: exact version} policy targets")
+    begin.add_argument("--validation-profile", default="", help="Explicit migration validation profile JSON: commands, unitCommand, compareExistingFailures, deferredChecks")
+    begin.add_argument("--verify-config", default="", help="BaselineVerifyConfig JSON file (commands, projectChecks, ...)")
+    begin.add_argument("--tool-build-id", default="")
+    begin.add_argument("--run-budget-minutes", type=int, default=None)
+    begin.add_argument("--max-repair-attempts", type=int, default=None)
+    begin.add_argument("--max-infra-retries", type=int, default=None)
+    begin.add_argument("--phase-timeout-seconds", type=int, default=None)
+    begin.add_argument("--adaptive-discovery", action="store_true", help="Grow discovery in useful waves within the wall deadline and a hard 200-package limit")
+    begin.add_argument("--cohort-max-packages", type=int, choices=range(1, 33), default=24, help="Adaptive cohort cap (default 24; starts at the cap)")
+    begin.add_argument("--cohort-initial-packages", type=int, choices=range(1, 33), default=None)
+    begin.add_argument("--cohort-exploration-ratio", type=int, choices=range(2, 17), default=2)
+    begin.add_argument("--cohort-search-steps", type=int, choices=range(8, 4097), metavar="8..4096", default=128)
+    begin.add_argument("--cohort-scheduling-strategy", choices=("local-adaptive-region", "adaptive-size", "whole-first"), default="whole-first")
+    begin.add_argument(
+        "--dashboard-state",
+        default="",
+        help="Workspace dashboard-state.json carrying the user package lag policy (used by the independent audit)",
+    )
+    begin.add_argument("--lag-months", type=int, default=None)
+    begin.add_argument("--min-lag-ok-pct", type=int, default=None)
+    begin.add_argument("--max-known-high", type=int, default=None)
+    begin.add_argument(
+        "--requested-node",
+        default="",
+        help="Явный Node.js для проекта/CI (точная версия или major). Пусто = не задано пользователем; "
+        "недоступная версия даёт ENVIRONMENT_UNAVAILABLE, а не fallback на PATH",
+    )
+    begin.add_argument(
+        "--discover-parallelism",
+        type=int,
+        default=1,
+        help="Сколько registry-проб discovery выполнять параллельно (Desktop передаёт ограниченный бюджет; 1 = строго последовательно, как раньше)",
+    )
+    begin.add_argument(
+        "--discover-timeout-s",
+        type=int,
+        default=0,
+        help="Wall-clock бюджет фазы discovery в секундах; 0 = без жёсткого дедлайна",
+    )
+    begin.add_argument(
+        "--discover-max-packages",
+        type=int,
+        default=0,
+        help="Сколько прямых зависимостей максимум пробовать в discovery; 0 = без капа",
+    )
+
+    verify_bootstrap = sub.add_parser("verify-bootstrap", help="Повторная контрольная проверка C0 после bootstrap repair")
+    verify_bootstrap.add_argument("--timeout-seconds", type=int, default=1800)
+
+    archive_run = sub.add_parser("archive-run", help="Сохранить прежний прогон целиком в истории для нового запуска")
+    archive_run.add_argument("--recover-only", action="store_true")
+
+    archive_repair = sub.add_parser(
+        "archive-repair-run",
+        help="Транзакционная архивация TERMINAL REPAIR_VERIFIED прогона: фиксирует repair-handoff.json + project-check.json, исправленный снимок sources/C0 остаётся для следующей миграции",
+    )
+
+    bootstrap_materialize = sub.add_parser(
+        "bootstrap-materialize",
+        help="Материализация version-neutral trial для repair исходников C0",
+    )
+    bootstrap_materialize.add_argument("--timeout-seconds", type=int, default=1800)
+
+    sub.add_parser("resume", help="Продолжить незавершённый прогон с последнего VERIFIED checkpoint без сброса бюджетов")
+
+    review = sub.add_parser("review-cohort", help="Согласовать состав когорты или отложить исключённые пакеты")
+    review.add_argument("--input-file", required=True)
+
+    plan_next = sub.add_parser("plan-next", help="Выбрать следующий небольшой шаг от активного checkpoint")
+    plan_next.add_argument(
+        "--retry-infra",
+        action="store_true",
+        help="Пользовательское продолжение после изменённой инфраструктурной причины: снять recoverable infra-блоки текущего registry-scope и открыть новую attempt-последовательность со свежим infra-бюджетом",
+    )
+
+    materialize = sub.add_parser("materialize", help="Физическая материализация точных версий в isolated trial")
+    materialize.add_argument("--timeout-seconds", type=int, default=1200)
+
+    precheck = sub.add_parser("precheck", help="Диагностический прогон проверок в trial (PRECHECK)")
+    precheck.add_argument("--timeout-seconds", type=int, default=1200)
+
+    verify_exact = sub.add_parser("verify-exact", help="Авторитетная полная проверка того же exact candidate на repaired bytes")
+
+    apply_feedback = sub.add_parser("apply-feedback", help="Проверить и принять typed feedback агента")
+    apply_feedback.add_argument("--feedback-file", required=True)
+
+    status = sub.add_parser("status", help="Машинный статус run")
+    finish = sub.add_parser("finish", help="Сформировать MIGRATION_REPORT.md / DEVELOPER_UPGRADE_GUIDE.md")
+    finish.add_argument("--lang", choices=("en", "ru"), default=None)
+
+    audit = sub.add_parser("audit", help="Независимый аудит активного checkpoint")
+    audit.add_argument("--registry", default="")
+    audit.add_argument("--lag-months", type=int, default=None)
+    audit.add_argument("--min-lag-ok-pct", type=int, default=None)
+    audit.add_argument("--max-known-high", type=int, default=None)
+    audit.add_argument("--yarn-audit-engine", default="auto")
+
+    export_task = sub.add_parser("export-task", help="Сформировать ТЗ (task artifact) из durable state или legacy Baseline без Baseline")
+    export_task.add_argument("--language", choices=("ru", "en", "both"), default="both")
+    export_task.add_argument(
+        "--check-only", action="store_true",
+        help="Only diagnose input sufficiency; never produces an artifact",
+    )
+    export_task.add_argument(
+        "--legacy-dashboard-state",
+        default="",
+        help="Путь к сохранённому dashboard-state.json старого Baseline; import в общий task-контракт тем же builder",
+    )
+    export_task.add_argument(
+        "--project-name",
+        default="",
+        help="Имя проекта внутри dashboard-state.json (обязательно при --legacy-dashboard-state)",
+    )
+
+    return parser
+
+
+from iterative_cohort_review import command as cmd_review_cohort
+
+COMMANDS = {
+    "review-cohort": cmd_review_cohort,
+    "begin": cmd_begin,
+    "verify-bootstrap": cmd_verify_bootstrap,
+    "bootstrap-materialize": cmd_bootstrap_materialize,
+    "archive-repair-run": cmd_archive_repair_run,
+    "archive-run": cmd_archive_run,
+    "resume": cmd_resume,
+    "plan-next": cmd_plan_next,
+    "materialize": cmd_materialize,
+    "precheck": cmd_precheck,
+    "verify-exact": cmd_verify_exact,
+    "apply-feedback": cmd_apply_feedback,
+    "status": cmd_status,
+    "finish": cmd_finish,
+    "audit": cmd_audit,
+    "export-task": cmd_export_task,
+}
+
+
+def _install_metrics() -> None:
+    """Opt-in DEPLOOM_METRICS instrumentation (no-op in normal execution)."""
+    if not os.environ.get("DEPLOOM_METRICS"):
+        return
+    try:
+        import atexit
+
+        import runtime_metrics
+
+        runtime_metrics.mark_start()
+        runtime_metrics.wrap_popen()
+        runtime_metrics.wrap_walk()
+        runtime_metrics.wrap_stat()
+        atexit.register(runtime_metrics.emit_final)
+    except Exception:
+        pass
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    _install_metrics()
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        configure_utf8_stdio()
+        recovery_dir = Path(args.run_dir).resolve()
+        if (recovery_dir / RESTART_TRANSACTION).exists():
+            recovery_lock = _RunLock(recovery_dir, args.owner or f"pid-{os.getpid()}")
+            recovery_lock.acquire()
+            try:
+                recover_restart_archive(recovery_dir, _write_json_atomic)
+            except RestartArchiveError as exc:
+                raise InvalidInputError(str(exc)) from exc
+            finally:
+                recovery_lock.release()
+        if (recovery_dir / REPAIR_ARCHIVE_TRANSACTION).exists():
+            recovery_lock = _RunLock(recovery_dir, args.owner or f"pid-{os.getpid()}")
+            recovery_lock.acquire()
+            try:
+                _recover_repair_archive(recovery_dir)
+            finally:
+                recovery_lock.release()
+        from iterative_cohort_review import recover as recover_cohort_review
+        recover_cohort_review(recovery_dir)
+        from scoped_source_policy import MODE_ENV
+        previous_scope = os.environ.get(MODE_ENV)
+        if args.command == "begin":
+            mode = args.source_scope
+        else:
+            mode = load_config(recovery_dir).get("sourceScope", "repository") if (recovery_dir / CONFIG_FILENAME).exists() else "repository"
+        os.environ[MODE_ENV] = mode
+        try:
+            return int(COMMANDS[args.command](args) or 0)
+        finally:
+            if previous_scope is None: os.environ.pop(MODE_ENV, None)
+            else: os.environ[MODE_ENV] = previous_scope
+    except ProjectUnreadyError as exc:
+        print(f"ITERATIVE_MIGRATION_FAILURE_V1 {json.dumps({'code': exc.code, 'summary': str(exc), 'command': exc.command, 'fixable': True})}")
+        return 2
+    except (StaleFeedbackError, InvalidInputError) as exc:
+        print(f"ITERATIVE_MIGRATION_FAILURE_V1 {json.dumps({'code': exc.code, 'summary': str(exc)})}")
+        return 2
+    except StorageCapacityError as exc:
+        print(f"ITERATIVE_MIGRATION_FAILURE_V1 {json.dumps({'code': 'DISK_SPACE_LOW', 'summary': str(exc), 'fixable': False})}")
+        return 5
+    except BudgetExceededError as exc:
+        print(f"ITERATIVE_MIGRATION_FAILURE_V1 {json.dumps({'code': exc.code, 'summary': str(exc)})}")
+        return 4
+    except IterativeMigrationError as exc:
+        print(f"ITERATIVE_MIGRATION_FAILURE_V1 {json.dumps({'code': exc.code, 'summary': str(exc)})}")
+        return 5
+    except KeyboardInterrupt:
+        return 130
+    except Exception as exc:  # pragma: no cover - defensive CLI boundary
+        import traceback
+
+        traceback.print_exc()
+        print(
+            f"ITERATIVE_MIGRATION_FAILURE_V1 "
+            f"{json.dumps({'code': 'INTERNAL', 'summary': f'{type(exc).__name__}: {exc}'})}"
+        )
+        return 1
+
+
+def configure_utf8_stdio() -> None:
+    import sys
+
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8")
+            except Exception:
+                pass
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

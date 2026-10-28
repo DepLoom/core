@@ -1,0 +1,1509 @@
+from __future__ import annotations
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import ctypes
+import dataclasses
+import hashlib
+import os
+import shutil
+import stat
+import subprocess
+import tempfile
+import threading
+import time
+import uuid
+from pathlib import Path
+from typing import Callable, Mapping, Optional
+from io_governor import io_slot
+from reparse_materialization import (
+    ReparseLink,
+    ReparseMaterializationError,
+    inventory_reparse_plan,
+    is_windows_junction,
+)
+from verification_observability import (
+    emit_observability_event,
+    new_observability_id,
+)
+
+# BLOCK_Y_FULL_OBSERVABILITY_V1
+
+ProgressCallback = Callable[[str], None]
+
+
+@dataclasses.dataclass(frozen=True)
+class GuardResult:
+    mutations: tuple[str, ...] = ()
+    errors: tuple[str, ...] = ()
+    notification_only: tuple[str, ...] = ()
+
+
+@dataclasses.dataclass(frozen=True)
+class WorkspaceChangeResult:
+    # Observed writes in one fully-private verification trial.
+    changes: tuple[str, ...] = ()
+    errors: tuple[str, ...] = ()
+
+
+class WorkspaceChangeGuard:
+    # Conservative whole-workspace mutation detector. A clean result only
+    # permits reuse of the already-private trial for the next check. Any event,
+    # watcher error, unsupported platform, or overflow forces fresh materialization.
+
+    def __init__(self, root: Path) -> None:
+        self.root = root.resolve()
+        self._watcher: Optional["_DirectoryWatcher"] = None
+        self._started = False
+        self._stopped: Optional[WorkspaceChangeResult] = None
+
+    def start(self) -> bool:
+        if os.name != "nt":
+            return False
+        watcher = _DirectoryWatcher(self.root)
+        self._watcher = watcher
+        self._started = watcher.start()
+        return self._started
+
+    def stop(self) -> WorkspaceChangeResult:
+        if self._stopped is not None:
+            return self._stopped
+        watcher = self._watcher
+        if watcher is None:
+            self._stopped = WorkspaceChangeResult(errors=("workspace watcher unavailable",))
+            return self._stopped
+        barrier_paths: set[str] = set()
+        if self._started:
+            # Drain notifications before cancellation; quiescent process trees
+            # alone do not prove that queued filesystem events were delivered.
+            from source_snapshot import _drain_watcher
+            try:
+                if not _drain_watcher(watcher, self.root, barrier_paths=barrier_paths):
+                    watcher.errors.append("private trial event barrier unavailable")
+            except Exception as exc:
+                watcher.errors.append(f"private trial event barrier failed: {exc}")
+            finally:
+                watcher.stop()
+        changes = tuple(sorted({
+            f"{action}:{name.replace(chr(92), '/')}"
+            for action, name in watcher.events
+            if name and name.replace(chr(92), "/") not in barrier_paths
+        }))
+        self._stopped = WorkspaceChangeResult(
+            changes=changes,
+            errors=tuple(watcher.errors),
+        )
+        return self._stopped
+
+
+
+
+# The rendezvous file name is not authority. Ownership is a live Windows kernel
+# FILE HANDLE opened with shareMode=0. A stale file is deliberately harmless.
+_SNAPSHOT_LEASE_BUSY_ERRORS = frozenset({32, 33})  # sharing / lock violation
+
+
+@dataclasses.dataclass
+class _SnapshotLease:
+    path: Path
+    handle: int
+    closed: bool = False
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        handle = int(self.handle or 0)
+        self.handle = 0
+        if os.name == "nt" and handle:
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            kernel32.CloseHandle(wintypes.HANDLE(handle))
+        try:
+            self.path.unlink()
+        except OSError:
+            pass
+
+
+@dataclasses.dataclass(frozen=True)
+class _SnapshotLeaseAttempt:
+    lease: Optional[_SnapshotLease]
+    reason: str = ""
+    win_error: int = 0
+
+
+def _snapshot_lease_path(prepared_workspace_root: Path) -> Path:
+    identity = os.path.normcase(str(prepared_workspace_root.resolve()))
+    digest = hashlib.sha256(identity.encode("utf-8", errors="surrogatepass")).hexdigest()
+    root = Path(os.environ.get("TEMP") or os.environ.get("TMP") or tempfile.gettempdir())
+    return root / "deploom-prepared-snapshot-leases" / f"{digest}.lease"
+
+
+def _open_snapshot_lease(prepared_workspace_root: Path) -> _SnapshotLeaseAttempt:
+    """One non-blocking OS-level lease attempt."""
+    if os.name != "nt":
+        return _SnapshotLeaseAttempt(None, "unsupported-platform", 0)
+
+    from ctypes import wintypes
+
+    lease_path = _snapshot_lease_path(prepared_workspace_root)
+    try:
+        lease_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return _SnapshotLeaseAttempt(None, "lease-directory-error", 0)
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+
+    GENERIC_READ = 0x80000000
+    GENERIC_WRITE = 0x40000000
+    OPEN_ALWAYS = 4
+    FILE_ATTRIBUTE_NORMAL = 0x00000080
+    handle = kernel32.CreateFileW(
+        str(lease_path),
+        GENERIC_READ | GENERIC_WRITE,
+        0,  # shareMode=0: live handle == exclusive snapshot ownership
+        None,
+        OPEN_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        None,
+    )
+    invalid = ctypes.c_void_p(-1).value
+    handle_value = ctypes.cast(handle, ctypes.c_void_p).value
+    if handle_value in (None, invalid):
+        error = int(ctypes.get_last_error())
+        reason = "lease-busy" if error in _SNAPSHOT_LEASE_BUSY_ERRORS else "lease-open-error"
+        return _SnapshotLeaseAttempt(None, reason, error)
+    return _SnapshotLeaseAttempt(_SnapshotLease(lease_path, int(handle_value)))
+
+
+def _try_acquire_snapshot_lease(
+    prepared_workspace_root: Path,
+    *,
+    progress: Optional[ProgressCallback] = None,
+) -> Optional[_SnapshotLease]:
+    """Try exclusive ownership for a junction-backed consumer.
+
+    Busy means another live consumer owns the shared payload, so this fast path
+    is not used. The caller's private-copy fallback acquires the SAME lease
+    before reading snapshot bytes; it never races a transient shared mutation.
+    """
+    if os.name != "nt":
+        return None
+    attempt = _open_snapshot_lease(prepared_workspace_root)
+    if attempt.lease is not None:
+        return attempt.lease
+    if progress:
+        progress(
+            f"NTFS fast clone unavailable: reason={attempt.reason}; "
+            f"winError={attempt.win_error}; private copy will use the snapshot lease"
+        )
+    return None
+
+
+def acquire_snapshot_copy_lease(
+    prepared_workspace_root: Path,
+    *,
+    timeout_seconds: int,
+    progress: Optional[ProgressCallback] = None,
+) -> Optional[_SnapshotLease]:
+    """Acquire exclusive ownership before ANY private read of shared snapshot.
+
+    Waiting is correctness-critical: copying immediately after a fast-path lease
+    collision could read bytes while the live junction consumer is transiently
+    mutating them. Only sharing/lock violations are retried. Every other lease
+    error fails closed; timeout is infrastructure failure, never proof evidence.
+    """
+    if os.name != "nt":
+        return None
+    started = time.monotonic()
+    deadline = started + max(1, int(timeout_seconds))
+    announced = False
+    while True:
+        attempt = _open_snapshot_lease(prepared_workspace_root)
+        if attempt.lease is not None:
+            if announced and progress:
+                progress(
+                    "prepared snapshot private-copy lease acquired after contention; "
+                    f"waited={int(time.monotonic() - started)}s"
+                )
+            return attempt.lease
+        if attempt.reason != "lease-busy":
+            raise RuntimeError(
+                "PREPARED_SNAPSHOT_LEASE_UNAVAILABLE: "
+                f"reason={attempt.reason}; winError={attempt.win_error}"
+            )
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                "PREPARED_SNAPSHOT_LEASE_TIMEOUT: another live consumer retained "
+                f"the prepared snapshot for >={max(1, int(timeout_seconds))}s"
+            )
+        if not announced and progress:
+            progress(
+                "prepared snapshot is owned by another live verification consumer; "
+                "waiting before proof-safe private copy"
+            )
+            announced = True
+        time.sleep(0.10)
+
+
+def try_acquire_snapshot_cleanup_lease(
+    prepared_workspace_root: Path,
+) -> Optional[_SnapshotLease]:
+    """Best-effort exclusive ownership for cache retirement.
+
+    Eviction is never allowed to delete bytes under a live junction/copy
+    reader. On contention or lock infrastructure failure we intentionally leak
+    the unregistered temp snapshot until process cleanup rather than race proof
+    execution.
+    """
+    if os.name != "nt":
+        return None
+    return _open_snapshot_lease(prepared_workspace_root).lease
+
+
+@dataclasses.dataclass
+class _GuardedClone:
+    target_root: Path
+    project: Path
+    junctions: list[Path]
+    guard: "_DependencyTreeGuard"
+    lease: "_SnapshotLease"
+    # Sealed lower roots this clone deliberately mapped in by junction. These
+    # are proof-authoritative read sources even though they live outside the
+    # trial root, so observed-assignment checks must accept them explicitly
+    # instead of treating every junction traversal as a boundary escape.
+    authorized_lower_roots: tuple[Path, ...] = ()
+    stopped: Optional[GuardResult] = None
+    git_objects: tuple[tuple[str, Path, tuple[int, int]], ...] = ()
+
+
+_ACTIVE: dict[str, _GuardedClone] = {}
+_ACTIVE_LOCK = threading.Lock()
+_GUARDED_DRAIN_PATHS: list[tuple[Path, Optional[tuple[int, int]]]] = []
+_GUARDED_DRAIN_LOCK = threading.Lock()
+
+
+def guarded_integrity_drain_tokens(root: Path) -> frozenset[str]:
+    """Exact process-owned, removed sentinels visible to a parent seal watcher."""
+    root = root.resolve()
+    with _GUARDED_DRAIN_LOCK:
+        paths = tuple(_GUARDED_DRAIN_PATHS)
+    return frozenset(path.relative_to(root).as_posix() for path, _identity in paths if path.is_relative_to(root))
+
+
+def guarded_integrity_drain_directories(root: Path) -> dict[str, tuple[int, int]]:
+    """Directory objects whose timestamps our exact sentinels necessarily touch."""
+    root = root.resolve()
+    with _GUARDED_DRAIN_LOCK:
+        paths = tuple(_GUARDED_DRAIN_PATHS)
+    return {path.parent.relative_to(root).as_posix(): identity for path, identity in paths
+            if identity is not None and path.parent.is_relative_to(root)}
+
+
+def _key(path: Path) -> str:
+    return os.path.normcase(str(path.resolve()))
+
+
+def _git_root(project_dir: Path) -> Optional[Path]:
+    from git_identity import git_toplevel
+
+    return git_toplevel(project_dir)
+
+
+def _dependency_roots(prepared_root: Path) -> list[Path]:
+    result: list[Path] = []
+    prepared_root = prepared_root.resolve()
+    for current, dirs, _files in os.walk(prepared_root):
+        dirs[:] = [name for name in dirs if name != ".git"]
+        current_path = Path(current)
+        if current_path.name == "node_modules":
+            result.append(current_path.resolve())
+            dirs[:] = []
+            continue
+        if "node_modules" in dirs:
+            node_modules = (current_path / "node_modules").resolve()
+            result.append(node_modules)
+            dirs.remove("node_modules")
+    unique = {os.path.normcase(str(path)): path for path in result}
+    return [unique[key] for key in sorted(unique)]
+
+
+def guarded_lower_enabled() -> bool:
+    return str(
+        os.environ.get("DEPLOOM_DISABLE_GUARDED_LOWER") or ""
+    ).strip().lower() not in {"1", "true", "yes", "on"}
+
+
+def dependency_root_manifest(
+    prepared_root: Path,
+    *,
+    progress: Optional[ProgressCallback] = None,
+) -> tuple[str, ...]:
+    """Return only relative node_modules roots; never hash dependency payloads."""
+    prepared_root = prepared_root.resolve()
+    operation_id = new_observability_id("dependency-roots")
+    started = time.monotonic()
+    emit_observability_event(
+        "filesystem.dependency-roots.start",
+        operationId=operation_id,
+        schema="verification-substrate-v2",
+    )
+    roots = _dependency_roots(prepared_root)
+    relative: list[str] = []
+    for root in roots:
+        try:
+            item = root.relative_to(prepared_root)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"DEPENDENCY_ROOT_ESCAPE: {root} outside {prepared_root}"
+            ) from exc
+        relative.append(item.as_posix())
+    result = tuple(sorted(set(relative)))
+    if progress:
+        progress(
+            "Ω dependency lower discovery ready: "
+            f"roots={len(result)}, integrityHashPass=skipped"
+        )
+    emit_observability_event(
+        "filesystem.dependency-roots.finish",
+        operationId=operation_id,
+        schema="verification-substrate-v2",
+        outcome="passed",
+        rootCount=len(result),
+        integrityHashPass=False,
+        durationMs=max(0, int((time.monotonic() - started) * 1000)),
+    )
+    return result
+
+
+def _overlay_copy_workers() -> int:
+    raw = str(os.environ.get("DEPLOOM_OMEGA_OVERLAY_WORKERS") or "").strip()
+    if raw:
+        try:
+            return max(1, min(64, int(raw)))
+        except ValueError:
+            pass
+    logical = max(1, int(os.cpu_count() or 4))
+    # Overlay excludes node_modules; huge /MT values mostly amplify AV/metadata
+    # pressure. Keep enough concurrency to hide latency without 128-thread I/O.
+    return max(8, min(32, logical))
+
+
+def _integrity_key(path: Path, prepared_root: Path) -> str:
+    relative = path.relative_to(prepared_root).as_posix()
+    return os.path.normcase(relative.replace("/", os.sep)).replace("\\", "/")
+
+
+def _integrity_hash_workers() -> int:
+    """Bound parallel hashing so NTFS/AV latency is hidden without I/O flooding."""
+    raw = str(os.environ.get("DEPLOOM_INTEGRITY_HASH_WORKERS") or "").strip()
+    if raw:
+        try:
+            return max(1, min(32, int(raw)))
+        except ValueError:
+            pass
+    # node_modules sealing on Windows is normally metadata/filter-driver bound,
+    # not SHA-256 CPU bound. A moderate pool overlaps that latency without an
+    # unbounded queue against Defender/EDR/NTFS.
+    return min(12, max(4, (os.cpu_count() or 4) // 2))
+
+
+def _fingerprint_path_with_size(path: Path) -> tuple[str, int]:
+    """Return the exact content fingerprint plus bytes consumed from the file."""
+    metadata = os.lstat(path)
+    if stat.S_ISLNK(metadata.st_mode):
+        payload = os.readlink(path).encode("utf-8", errors="surrogatepass")
+        return "symlink:" + hashlib.sha256(payload).hexdigest(), int(metadata.st_size)
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ValueError(f"unsupported dependency payload type: {path}")
+
+    digest = hashlib.sha256()
+    total = 0
+    with path.open("rb", buffering=1024 * 1024) as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            digest.update(chunk)
+    return "file:" + digest.hexdigest(), total
+
+
+def _fingerprint_path(path: Path) -> str:
+    # Watcher classification uses the same byte-level fingerprint as sealing.
+    return _fingerprint_path_with_size(path)[0]
+
+
+def _seal_dependency_candidate(
+    path: Path,
+    prepared_root: Path,
+) -> Optional[tuple[str, str, int]]:
+    """Hash one os.walk file candidate, preserving fail-closed semantics."""
+    try:
+        metadata = os.lstat(path)
+        if not (stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)):
+            return None
+        fingerprint, size = _fingerprint_path_with_size(path)
+        return _integrity_key(path, prepared_root), fingerprint, size
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(
+            f"PREPARED_DEPENDENCY_INTEGRITY_CAPTURE_FAILED: {path}: {exc}"
+        ) from exc
+
+
+# BLOCK_OMEGA_VERIFICATION_SUBSTRATE_V2
+# Legacy diagnostic helper only; production guarded lower does not call it.
+def build_dependency_integrity_manifest(
+    prepared_root: Path,
+    *,
+    progress: Optional[ProgressCallback] = None,
+    progress_interval_seconds: int = 15,
+) -> dict[str, str]:
+    """Seal every dependency payload byte before any junction consumer exists.
+
+    Proof semantics are unchanged: every regular dependency file/symlink gets
+    the same SHA-256 fingerprint and unreadable payloads fail closed. Only the
+    execution strategy is parallelized. Final mapping order is canonical.
+    """
+    prepared_root = prepared_root.resolve()
+    started = time.monotonic()
+    integrity_operation_id = new_observability_id("integrity")
+    emit_observability_event(
+        "filesystem.integrity.start",
+        operationId=integrity_operation_id,
+        label="sealed dependency integrity manifest",
+        preparedRootName=prepared_root.name,
+    )
+    interval = max(1, int(progress_interval_seconds or 15))
+    next_progress = started + interval
+    candidates: list[Path] = []
+
+    # Inventory discovery stays deterministic and single-threaded. The prepared
+    # stage is private here; no junction-backed consumer exists until sealing is
+    # complete.
+    for dependency_root in _dependency_roots(prepared_root):
+        for current, dirs, names in os.walk(dependency_root, followlinks=False):
+            dirs.sort(key=str.lower)
+            names.sort(key=str.lower)
+            current_path = Path(current)
+            candidates.extend(current_path / name for name in names)
+
+    manifest: dict[str, str] = {}
+    files = 0
+    total_bytes = 0
+    workers = _integrity_hash_workers()
+    if progress:
+        progress(
+            "sealed dependency integrity manifest hashing: "
+            f"candidates={len(candidates)}, workers={workers}"
+        )
+
+    with ThreadPoolExecutor(
+        max_workers=workers,
+        thread_name_prefix="deploom-integrity",
+    ) as executor:
+        future_paths = {
+            executor.submit(_seal_dependency_candidate, path, prepared_root): path
+            for path in candidates
+        }
+        for future in as_completed(future_paths):
+            result = future.result()
+            if result is None:
+                continue
+            key, fingerprint, size = result
+            manifest[key] = fingerprint
+            files += 1
+            total_bytes += size
+
+            now = time.monotonic()
+            if progress and now >= next_progress:
+                progress(
+                    "sealed dependency integrity manifest: "
+                    f"files={files}/{len(candidates)}, bytes={total_bytes}, "
+                    f"workers={workers}, elapsed={int(now - started)}s"
+                )
+                next_progress = now + interval
+
+    canonical = dict(sorted(manifest.items()))
+    if progress:
+        progress(
+            "sealed dependency integrity manifest ready: "
+            f"files={files}, bytes={total_bytes}, workers={workers}, "
+            f"elapsed={int(time.monotonic() - started)}s"
+        )
+    emit_observability_event(
+        "filesystem.integrity.finish",
+        operationId=integrity_operation_id,
+        label="sealed dependency integrity manifest",
+        outcome="passed",
+        candidateFiles=len(candidates),
+        fileCount=files,
+        byteCount=total_bytes,
+        workers=workers,
+        durationMs=max(0, int((time.monotonic() - started) * 1000)),
+    )
+    return canonical
+
+
+def _run_overlay_robocopy(
+    source: Path,
+    target: Path,
+    excluded: list[Path],
+    progress: Optional[ProgressCallback],
+) -> bool:
+    robocopy = shutil.which("robocopy")
+    if not robocopy:
+        return False
+    argv = [
+        robocopy,
+        str(source),
+        str(target),
+        "/E",
+        "/COPY:DAT",
+        "/DCOPY:DAT",
+        "/R:1",
+        "/W:1",
+        "/NFL",
+        "/NDL",
+        "/NJH",
+        "/NJS",
+        "/NP",
+        "/SL",
+        "/XJ",
+        f"/MT:{_overlay_copy_workers()}",
+    ]
+    if excluded:
+        argv.extend(["/XD", *[str(path) for path in excluded]])
+    if progress:
+        progress(
+            "Ω guarded lower: copying sealed source/config/.git upper "
+            "without dependency payload bytes"
+        )
+    try:
+        from cross_process_io import shared_io_slot
+        with shared_io_slot("copy", progress=progress, label="guarded source upper copy", timeout_seconds=300):
+            result = subprocess.run(
+                argv,
+                cwd=str(source),
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=300,
+                check=False,
+            )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode < 8
+
+
+def _create_junction(link: Path, target: Path) -> bool:
+    comspec = os.environ.get("COMSPEC") or shutil.which("cmd.exe")
+    if not comspec:
+        return False
+    link.parent.mkdir(parents=True, exist_ok=True)
+    if link.exists() or link.is_symlink():
+        try:
+            if link.is_dir() and not link.is_symlink():
+                shutil.rmtree(link)
+            else:
+                link.unlink()
+        except OSError:
+            return False
+    command = subprocess.list2cmdline(["mklink", "/J", str(link), str(target)])
+    try:
+        result = subprocess.run(
+            [comspec, "/d", "/s", "/c", command],
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0 and link.is_dir()
+
+
+def _remove_junction(path: Path) -> None:
+    try:
+        os.rmdir(path)
+    except OSError:
+        try:
+            subprocess.run(
+                [os.environ.get("COMSPEC") or "cmd.exe", "/d", "/s", "/c", "rmdir", str(path)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=15,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+
+def _batch_escape(value: Path) -> str:
+    return str(value).replace("%", "%%").replace('"', '""')
+
+
+def _create_junction_batch(pairs: list[tuple[Path, Path]]) -> bool:
+    if not pairs:
+        return True
+    comspec = os.environ.get("COMSPEC") or shutil.which("cmd.exe")
+    if not comspec:
+        return False
+    batch = pairs[0][0].parent / f".deploom-junctions-{os.getpid()}-{threading.get_ident()}.cmd"
+    lines = ["@echo off"]
+    for link, target in pairs:
+        link.parent.mkdir(parents=True, exist_ok=True)
+        lines.append(
+            f'mklink /J "{_batch_escape(link)}" "{_batch_escape(target)}" >nul || exit /b 1'
+        )
+    lines.append("exit /b 0")
+    try:
+        batch.write_text("\r\n".join(lines) + "\r\n", encoding="utf-8")
+        command = subprocess.list2cmdline([str(batch)])
+        result = subprocess.run(
+            [comspec, "/d", "/s", "/c", command],
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=max(30, min(180, len(pairs))),
+            check=False,
+        )
+        return result.returncode == 0 and all(link.is_dir() for link, _ in pairs)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    finally:
+        try:
+            batch.unlink()
+        except OSError:
+            pass
+
+
+def _copy_local_bin(source: Path, target: Path) -> bool:
+    try:
+        if target.exists():
+            shutil.rmtree(target)
+        # Follow symlinks: local CLI shims must resolve through this clone's
+        # package junctions instead of pointing back into the prepared tree.
+        shutil.copytree(source, target, symlinks=False)
+        return True
+    except OSError:
+        return False
+
+
+def _is_internal_windows_reparse(
+    entry: Path,
+    prepared_workspace_root: Path,
+) -> tuple[bool, Optional[Path]]:
+    if os.name != "nt":
+        return False, None
+    checker = getattr(os.path, "isjunction", None)
+    is_junction = False
+    if callable(checker):
+        try:
+            is_junction = bool(checker(entry))
+        except OSError:
+            is_junction = False
+    if not (is_junction or entry.is_symlink()):
+        return False, None
+    try:
+        target = entry.resolve(strict=True)
+        relative = target.relative_to(prepared_workspace_root.resolve())
+    except (OSError, ValueError):
+        return True, None
+    return True, relative
+
+
+def _populate_node_modules_shell(
+    prepared_root: Path,
+    clone_root: Path,
+    *,
+    prepared_workspace_root: Path,
+    clone_workspace_root: Path,
+    reparse_plan: tuple[ReparseLink, ...],
+) -> tuple[bool, list[Path]]:
+    """Build a private node_modules shell from one canonical reparse plan.
+
+    Scope directories are always private shells. Each package child is handled
+    independently, so an owned workspace link can never carry a scope-level
+    junction back into the PreparedArtifact.
+    """
+    clone_root.mkdir(parents=True, exist_ok=True)
+    pairs: list[tuple[Path, Path]] = []
+    local_cache_names = set(EPHEMERAL_CACHE_DIR_NAMES)
+    plan_by_link = {item.link_relative: item for item in reparse_plan}
+
+    def planned_target(entry: Path) -> Optional[Path]:
+        try:
+            relative = entry.relative_to(prepared_workspace_root).as_posix()
+        except ValueError:
+            return None
+        item = plan_by_link.get(relative)
+        if item is None:
+            return None
+        return clone_workspace_root.joinpath(*Path(item.target_relative).parts)
+
+    def add_entry(entry: Path, destination: Path, *, scope_level: bool) -> bool:
+        lowered = entry.name.lower()
+        if lowered in local_cache_names:
+            destination.mkdir(parents=True, exist_ok=True)
+            return True
+        if lowered == ".bin" and entry.is_dir():
+            return _copy_local_bin(entry, destination)
+
+        is_reparse, _legacy_relative = _is_internal_windows_reparse(
+            entry, prepared_workspace_root
+        )
+        if is_reparse:
+            target = planned_target(entry)
+            if target is None:
+                return False
+            # A scope directory itself is authority-ambiguous. Only individual
+            # package children may be workspace links.
+            if entry.name.startswith("@") and not scope_level:
+                return False
+            pairs.append((destination, target))
+            return True
+
+        if entry.is_dir():
+            if not scope_level and entry.name.startswith("@"):
+                destination.mkdir(parents=True, exist_ok=True)
+                try:
+                    children = sorted(entry.iterdir(), key=lambda item: item.name.lower())
+                except OSError:
+                    return False
+                return all(
+                    add_entry(child, destination / child.name, scope_level=True)
+                    for child in children
+                )
+            pairs.append((destination, entry.resolve()))
+            return True
+        if entry.is_file():
+            shutil.copy2(entry, destination, follow_symlinks=True)
+        return True
+
+    try:
+        entries = sorted(prepared_root.iterdir(), key=lambda item: item.name.lower())
+        if not all(add_entry(entry, clone_root / entry.name, scope_level=False) for entry in entries):
+            return False, []
+        if not _create_junction_batch(pairs):
+            for link, _ in reversed(pairs):
+                _remove_junction(link)
+            return False, []
+        return True, [link for link, _ in pairs]
+    except OSError:
+        for link, _ in reversed(pairs):
+            _remove_junction(link)
+        return False, []
+
+
+EPHEMERAL_CACHE_DIR_NAMES = (".vite", ".vitest", ".cache", ".vite-temp")
+
+
+def apply_tree_write_protection(
+    root: Path,
+    *,
+    readonly: bool,
+    skip_dir_names: "frozenset[str]" = frozenset(),
+) -> int:
+    """Seal (or release) every regular file in a private tree.
+
+    Write protection lives on the file OBJECT, not on the directory entry, so
+    it is enforced through every hardlink alias to that object. That is what
+    makes it a sound defence against alias mutation: an attacker who links a
+    sealed file into an unwatched directory still cannot write through the
+    alias. Cost is O(files) once at seal time and zero on every later hit.
+
+    Reparse points are NEVER traversed. `os.walk` follows NTFS junctions and
+    `os.path.islink` is False for them, so a naive walk over a guarded clone
+    would reach straight through its package junctions and unprotect the
+    sealed lower they point at -- silently destroying the protection it was
+    supposed to preserve.
+
+    Threat boundary: the owner of a file may clear its write protection. This
+    stops accidental and tool-driven mutation, and it stops alias writes by any
+    principal that cannot rewrite the sealed file's own attributes. It is not a
+    defence against a principal who owns the tree and deliberately unprotects
+    it, so content detection must never depend on it.
+    """
+    touched = 0
+    for current, directories, names in os.walk(root):
+        directories[:] = [
+            name
+            for name in directories
+            if name not in skip_dir_names
+            and not _is_reparse_directory(Path(current) / name)
+        ]
+        for name in names:
+            path = Path(current) / name
+            try:
+                mode = os.stat(path, follow_symlinks=False).st_mode
+                os.chmod(
+                    path,
+                    (mode & ~0o222) if readonly else (mode | stat.S_IWRITE),
+                )
+                touched += 1
+            except OSError:
+                continue
+    return touched
+
+
+def _is_reparse_directory(path: Path) -> bool:
+    try:
+        if path.is_junction():
+            return True
+    except (OSError, AttributeError):
+        pass
+    try:
+        return bool(
+            os.stat(path, follow_symlinks=False).st_file_attributes
+            & stat.FILE_ATTRIBUTE_REPARSE_POINT
+        )
+    except (OSError, AttributeError):
+        return os.path.islink(path)
+
+
+def tree_object_identity(path: Path) -> Optional[tuple[int, int]]:
+    """Filesystem object identity of a directory, not just its pathname.
+
+    A watched directory can be renamed away and a different directory put back
+    at the same textual path. The watcher keeps a handle to the ORIGINAL object
+    and stays silent, while `is_dir()` on the path still succeeds. Only the
+    (device, file-id) pair distinguishes the two objects.
+    """
+    try:
+        stat_result = os.stat(path)
+    except OSError:
+        return None
+    if not stat_result.st_ino:
+        return None
+    return (stat_result.st_dev, stat_result.st_ino)
+
+
+def drain_watcher(
+    watcher: "_DirectoryWatcher",
+    root: Path,
+    *,
+    timeout_seconds: float = 2.0,
+) -> tuple[bool, str]:
+    """Prove every change completed before this boundary has been delivered.
+
+    ReadDirectoryChangesW reports changes for one tree in order, so writing a
+    sentinel inside the watched subtree and waiting for that sentinel's OWN
+    notification proves every earlier change was already observed. Returns
+    (delivered, token); the caller must ignore events carrying `token` and must
+    treat delivered=False as "unknown", never as proof of an unchanged tree.
+    """
+    token = f".deploom-drain-{uuid.uuid4().hex}"
+    marker = root / token
+    try:
+        marker.write_text("drain", encoding="utf-8")
+    except OSError:
+        return False, token
+    deadline = time.monotonic() + max(0.05, float(timeout_seconds))
+    delivered = False
+    try:
+        while time.monotonic() < deadline:
+            if any(token in relative for _action, relative in list(watcher.events)):
+                delivered = True
+                break
+            if watcher.errors:
+                break
+            time.sleep(0.005)
+    finally:
+        try:
+            marker.unlink()
+        except OSError:
+            pass
+    return delivered, token
+
+
+def _is_ephemeral_change(relative: str) -> bool:
+    parts = [part.lower() for part in relative.replace("\\", "/").split("/") if part]
+    return bool(parts) and parts[0] in {".vite", ".vitest", ".cache"}
+
+
+class _DirectoryWatcher:
+    FILE_ACTION_ADDED = 0x00000001
+    FILE_ACTION_REMOVED = 0x00000002
+    FILE_ACTION_MODIFIED = 0x00000003
+    FILE_ACTION_RENAMED_OLD_NAME = 0x00000004
+    FILE_ACTION_RENAMED_NEW_NAME = 0x00000005
+    FILE_LIST_DIRECTORY = 0x0001
+    FILE_SHARE_READ = 0x00000001
+    FILE_SHARE_WRITE = 0x00000002
+    FILE_SHARE_DELETE = 0x00000004
+    OPEN_EXISTING = 3
+    FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+    FILE_FLAG_OVERLAPPED = 0x40000000
+    FILTER = 0x00000001 | 0x00000002 | 0x00000004 | 0x00000008 | 0x00000010 | 0x00000040
+    ERROR_IO_PENDING = 997
+    ERROR_OPERATION_ABORTED = 995
+
+    class _OVERLAPPED(ctypes.Structure):
+        _fields_ = [
+            ("Internal", ctypes.c_size_t), ("InternalHigh", ctypes.c_size_t),
+            ("Offset", ctypes.c_ulong), ("OffsetHigh", ctypes.c_ulong),
+            ("hEvent", ctypes.c_void_p),
+        ]
+
+    def __init__(self, root: Path) -> None:
+        self.root = root.resolve()
+        self.events: list[tuple[int, str]] = []
+        self.errors: list[str] = []
+        self._stop = threading.Event()
+        self._handle = None
+        self._event_handle = None
+        self._overlapped: Optional[_DirectoryWatcher._OVERLAPPED] = None
+        self._buffer = ctypes.create_string_buffer(64 * 1024)
+        self._thread: Optional[threading.Thread] = None
+        self.armed_ms = 0
+
+    @staticmethod
+    def _kernel32():
+        from ctypes import wintypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.ReadDirectoryChangesW.argtypes = [
+            wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD, wintypes.BOOL,
+            wintypes.DWORD, wintypes.LPVOID, wintypes.LPVOID, wintypes.LPVOID,
+        ]
+        kernel32.ReadDirectoryChangesW.restype = wintypes.BOOL
+        return kernel32
+
+    def _issue(self) -> bool:
+        assert self._overlapped is not None
+        kernel32 = self._kernel32()
+        kernel32.ResetEvent(self._event_handle)
+        ok = kernel32.ReadDirectoryChangesW(
+            self._handle, ctypes.byref(self._buffer), len(self._buffer), True,
+            self.FILTER, None, ctypes.byref(self._overlapped), None,
+        )
+        if ok:
+            return True
+        error = ctypes.get_last_error()
+        if error == self.ERROR_IO_PENDING:
+            return True
+        self.errors.append(f"ReadDirectoryChangesW arm failed for {self.root}: {error}")
+        return False
+
+    def start(self) -> bool:
+        if os.name != "nt":
+            return False
+        from ctypes import wintypes
+        started = time.monotonic()
+        kernel32 = self._kernel32()
+        kernel32.CreateFileW.argtypes = [
+            wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+            wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+        ]
+        kernel32.CreateFileW.restype = wintypes.HANDLE
+        kernel32.CreateEventW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR]
+        kernel32.CreateEventW.restype = wintypes.HANDLE
+        handle = kernel32.CreateFileW(
+            str(self.root), self.FILE_LIST_DIRECTORY,
+            self.FILE_SHARE_READ | self.FILE_SHARE_WRITE | self.FILE_SHARE_DELETE,
+            None, self.OPEN_EXISTING,
+            self.FILE_FLAG_BACKUP_SEMANTICS | self.FILE_FLAG_OVERLAPPED, None,
+        )
+        invalid = ctypes.c_void_p(-1).value
+        handle_value = ctypes.cast(handle, ctypes.c_void_p).value if handle else None
+        if handle_value in (None, 0, invalid):
+            self.errors.append(f"CreateFileW failed for {self.root}: {ctypes.get_last_error()}")
+            return False
+        self._handle = handle
+        self._event_handle = kernel32.CreateEventW(None, True, False, None)
+        if not self._event_handle:
+            self.errors.append(f"CreateEventW failed for {self.root}: {ctypes.get_last_error()}")
+            kernel32.CloseHandle(self._handle)
+            self._handle = None
+            return False
+        self._overlapped = self._OVERLAPPED()
+        self._overlapped.hEvent = ctypes.cast(self._event_handle, ctypes.c_void_p).value
+        if not self._issue():
+            kernel32.CloseHandle(self._event_handle)
+            kernel32.CloseHandle(self._handle)
+            self._event_handle = None
+            self._handle = None
+            return False
+        self.armed_ms = max(0, int((time.monotonic() - started) * 1000))
+        emit_observability_event(
+            "filesystem.watcher.armed", root=str(self.root), armedMs=self.armed_ms,
+            backend="ReadDirectoryChangesW-overlapped", outcome="passed",
+        )
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return True
+
+    def _consume(self, size: int) -> None:
+        if size == 0:
+            self.errors.append(f"ReadDirectoryChangesW buffer overflow for {self.root}")
+            return
+        raw = self._buffer.raw
+        offset = 0
+        while offset + 12 <= size:
+            next_offset = int.from_bytes(raw[offset:offset + 4], "little")
+            action = int.from_bytes(raw[offset + 4:offset + 8], "little")
+            name_len = int.from_bytes(raw[offset + 8:offset + 12], "little")
+            end = offset + 12 + name_len
+            if end > size:
+                self.errors.append(f"ReadDirectoryChangesW malformed buffer for {self.root}")
+                return
+            name = raw[offset + 12:end].decode("utf-16-le", errors="replace")
+            if name:
+                self.events.append((action, name.replace("\\", "/")))
+            if next_offset == 0:
+                break
+            offset += next_offset
+
+    def _run(self) -> None:
+        from ctypes import wintypes
+        kernel32 = self._kernel32()
+        kernel32.GetOverlappedResult.argtypes = [wintypes.HANDLE, ctypes.POINTER(self._OVERLAPPED), ctypes.POINTER(wintypes.DWORD), wintypes.BOOL]
+        kernel32.GetOverlappedResult.restype = wintypes.BOOL
+        returned = wintypes.DWORD(0)
+        try:
+            while not self._stop.is_set():
+                ok = kernel32.GetOverlappedResult(
+                    self._handle, ctypes.byref(self._overlapped), ctypes.byref(returned), True
+                )
+                if not ok:
+                    error = ctypes.get_last_error()
+                    if self._stop.is_set() and error == self.ERROR_OPERATION_ABORTED:
+                        break
+                    self.errors.append(f"GetOverlappedResult failed for {self.root}: {error}")
+                    break
+                self._consume(int(returned.value))
+                if self.errors or self._stop.is_set() or not self._issue():
+                    break
+        finally:
+            if self._event_handle:
+                kernel32.CloseHandle(self._event_handle)
+                self._event_handle = None
+            if self._handle:
+                kernel32.CloseHandle(self._handle)
+                self._handle = None
+
+    def stop(self) -> None:
+        if self._thread is None:
+            return
+        time.sleep(0.05)
+        self._stop.set()
+        if self._handle and self._overlapped is not None:
+            try:
+                kernel32 = self._kernel32()
+                kernel32.CancelIoEx(self._handle, ctypes.byref(self._overlapped))
+            except Exception as exc:
+                self.errors.append(f"CancelIoEx failed for {self.root}: {exc}")
+        self._thread.join(timeout=5)
+        if self._thread.is_alive():
+            self.errors.append(f"dependency watcher did not stop for {self.root}")
+
+
+def _classify_integrity_notification(
+    prepared_root: Path,
+    root: Path,
+    action: int,
+    relative: str,
+    integrity_manifest: Mapping[str, str],
+) -> str:
+    """Return ignored | notification-only | mutation for one watcher event."""
+    if action in {
+        _DirectoryWatcher.FILE_ACTION_ADDED,
+        _DirectoryWatcher.FILE_ACTION_REMOVED,
+        _DirectoryWatcher.FILE_ACTION_RENAMED_OLD_NAME,
+        _DirectoryWatcher.FILE_ACTION_RENAMED_NEW_NAME,
+    }:
+        return "mutation"
+    if action != _DirectoryWatcher.FILE_ACTION_MODIFIED:
+        return "mutation"
+
+    target = root.joinpath(*[part for part in relative.replace("\\", "/").split("/") if part])
+    try:
+        if target.is_dir():
+            return "ignored"
+        if not target.is_file() and not target.is_symlink():
+            return "mutation"
+        expected = integrity_manifest.get(_integrity_key(target, prepared_root))
+        if not expected:
+            return "mutation"
+        return "notification-only" if _fingerprint_path(target) == expected else "mutation"
+    except (OSError, ValueError):
+        return "mutation"
+
+
+class _DependencyTreeGuard:
+    """Guard a shared dependency lower tree without an O(files) pre-hash.
+
+    The proof rule is stricter and cheaper than the legacy integrity-manifest
+    path: while the exclusive snapshot lease is held, any non-ephemeral
+    filesystem notification in a shared dependency root rejects the fast path.
+    Watcher errors/overflow also reject it. Therefore a byte-for-byte baseline
+    hash of every node_modules file is not needed to accept a *quiet* command.
+    """
+
+    def __init__(
+        self,
+        roots: list[Path],
+        *, strict_roots: tuple[Path, ...] = (),
+    ) -> None:
+        self.watchers = [_DirectoryWatcher(root) for root in roots]
+        self.strict_roots = frozenset(strict_roots)
+        self.strict_identities = {root: tree_object_identity(root) for root in strict_roots}
+        self.drain_tokens: dict[Path, set[str]] = {}
+
+    def ignores(self, watcher, name):
+        if name in self.drain_tokens.get(watcher.root, ()):
+            return True
+        return watcher.root not in self.strict_roots and _is_ephemeral_change(name)
+
+    def drain_strict(self) -> tuple[str, ...]:
+        errors = []
+        for watcher in self.watchers:
+            if watcher.root not in self.strict_roots:
+                continue
+            if watcher._thread is None or not watcher._thread.is_alive():
+                errors.append(f"Git object watcher unavailable: {watcher.root}")
+                continue
+            delivered, token = drain_watcher(watcher, watcher.root)
+            self.drain_tokens.setdefault(watcher.root, set()).add(token)
+            with _GUARDED_DRAIN_LOCK:
+                _GUARDED_DRAIN_PATHS.append((watcher.root / token, self.strict_identities[watcher.root]))
+                del _GUARDED_DRAIN_PATHS[:-512]
+            if not delivered or any(os.path.lexists(watcher.root / old)
+                                    for old in self.drain_tokens[watcher.root]):
+                errors.append(f"Git object watcher drain unconfirmed: {watcher.root}")
+        return tuple(errors)
+
+    def start(self) -> bool:
+        started: list[_DirectoryWatcher] = []
+        for watcher in self.watchers:
+            if not watcher.start():
+                for item in started:
+                    item.stop()
+                return False
+            started.append(watcher)
+        return True
+
+    def stop(self) -> GuardResult:
+        mutations: list[str] = []
+        errors: list[str] = list(self.drain_strict())
+        for watcher in self.watchers:
+            watcher.stop()
+            errors.extend(watcher.errors)
+            for _action, event in watcher.events:
+                if self.ignores(watcher, event):
+                    continue
+                mutations.append(f"{watcher.root}:{_action}:{event}")
+        return GuardResult(
+            mutations=(),
+            errors=tuple(errors),
+            notification_only=tuple(sorted(set(mutations))),
+        )
+
+
+def try_materialize_guarded_clone(
+    *,
+    source_project: Path,
+    prepared_workspace_root: Path,
+    project_relative: Path,
+    target: Path,
+    dependency_roots: Optional[tuple[str, ...]] = None,
+    dependency_integrity: Optional[Mapping[str, str]] = None,
+    progress: Optional[ProgressCallback] = None,
+) -> Optional[Path]:
+    """Materialize a fresh Windows upper over an exclusively guarded lower.
+
+    `dependency_integrity` is accepted only for compatibility with pre-Ω
+    callers. It is deliberately not consulted: Ω accepts a shared lower only
+    when its watcher observed no meaningful event at all.
+    """
+    del dependency_integrity
+
+    if os.name != "nt" or not guarded_lower_enabled():
+        return None
+
+    prepared_workspace_root = prepared_workspace_root.resolve()
+    target = target.resolve()
+
+    if dependency_roots:
+        resolved_roots: list[Path] = []
+        for raw in dependency_roots:
+            relative = Path(str(raw))
+            if relative.is_absolute() or ".." in relative.parts:
+                return None
+            candidate = (prepared_workspace_root / relative).resolve()
+            try:
+                candidate.relative_to(prepared_workspace_root)
+            except ValueError:
+                return None
+            if not candidate.is_dir() or candidate.name != "node_modules":
+                return None
+            resolved_roots.append(candidate)
+        dependency_root_paths = sorted(
+            {os.path.normcase(str(item)): item for item in resolved_roots}.values(),
+            key=lambda item: str(item).lower(),
+        )
+    else:
+        dependency_root_paths = _dependency_roots(prepared_workspace_root)
+
+    if not dependency_root_paths:
+        return None
+
+    try:
+        canonical_reparse_plan = inventory_reparse_plan(prepared_workspace_root)
+    except ReparseMaterializationError:
+        return None
+
+    operation_id = new_observability_id("guarded-lower")
+    started = time.monotonic()
+    emit_observability_event(
+        "filesystem.guarded-lower.start",
+        operationId=operation_id,
+        schema="verification-substrate-v2",
+        dependencyRoots=len(dependency_root_paths),
+        sourceProject=str(source_project.resolve()),
+    )
+
+    lease = _try_acquire_snapshot_lease(
+        prepared_workspace_root,
+        progress=progress,
+    )
+    if lease is None:
+        emit_observability_event(
+            "filesystem.guarded-lower.finish",
+            operationId=operation_id,
+            schema="verification-substrate-v2",
+            outcome="fallback",
+            reason="snapshot-lease-unavailable",
+            durationMs=max(0, int((time.monotonic() - started) * 1000)),
+        )
+        return None
+    lease_transferred = False
+    guard = None
+    junctions: list[Path] = []
+    # Borrow only the sealed object database, never a live checkout. Mutable
+    # index/refs/config remain private. Unusual Git layouts use the full copy.
+    git_objects = ()
+    objects = prepared_workspace_root / ".git" / "objects"
+    if (objects.is_dir() and not objects.is_symlink()
+        and not (objects / "info" / "alternates").exists()
+        and objects.resolve() == objects.absolute()
+        and not any(Path(item.link_relative) == Path(".git/objects") or
+            Path(".git/objects") in Path(item.link_relative).parents for item in canonical_reparse_plan)):
+        identity = tree_object_identity(objects)
+        if identity is not None:
+            git_objects = ((".git/objects", objects, identity),)
+
+    try:
+        lower_roots = [*dependency_root_paths, *(item[1] for item in git_objects)]
+        # Arm before copying/mapping so setup cannot hide a lower mutation.
+        guard = _DependencyTreeGuard(lower_roots, strict_roots=tuple(item[1] for item in git_objects))
+        if not guard.start():
+            return None
+        excluded = list(lower_roots)
+        if not _run_overlay_robocopy(
+            prepared_workspace_root,
+            target,
+            excluded,
+            progress,
+        ):
+            shutil.rmtree(target, ignore_errors=True)
+            return None
+
+        for relative, lower, _identity in git_objects:
+            link = target / relative
+            if not _create_junction(link, lower):
+                return None
+            junctions.append(link)
+        for dependency_root in dependency_root_paths:
+            relative = dependency_root.relative_to(prepared_workspace_root)
+            clone_root = target / relative
+            ok, created = _populate_node_modules_shell(
+                dependency_root,
+                clone_root,
+                prepared_workspace_root=prepared_workspace_root,
+                clone_workspace_root=target,
+                reparse_plan=canonical_reparse_plan,
+            )
+            if not ok:
+                for existing in reversed(junctions):
+                    _remove_junction(existing)
+                shutil.rmtree(target, ignore_errors=True)
+                return None
+            junctions.extend(created)
+
+        project = target / project_relative
+        if not project.is_dir():
+            guard.stop()
+            for existing in reversed(junctions):
+                _remove_junction(existing)
+            shutil.rmtree(target, ignore_errors=True)
+            return None
+
+        state = _GuardedClone(
+            target_root=target,
+            project=project,
+            junctions=junctions,
+            guard=guard,
+            lease=lease,
+            authorized_lower_roots=tuple(dependency_root_paths),
+            git_objects=git_objects,
+        )
+        with _ACTIVE_LOCK:
+            _ACTIVE[_key(target)] = state
+        lease_transferred = True
+
+        if progress:
+            progress(
+                "Ω guarded lower ready: sealed source/config copied privately; "
+                f"dependencyRoots={len(dependency_root_paths)}, "
+                f"packageJunctions={len(junctions)}, sharedGitObjectRoots={len(git_objects)}, integrityHashPass=skipped"
+            )
+        emit_observability_event(
+            "filesystem.guarded-lower.finish",
+            operationId=operation_id,
+            schema="verification-substrate-v2",
+            outcome="passed",
+            dependencyRoots=len(dependency_root_paths),
+            packageJunctions=len(junctions),
+            integrityHashPass=False,
+            durationMs=max(0, int((time.monotonic() - started) * 1000)),
+        )
+        return project
+    except Exception as exc:
+        if lease_transferred:
+            cleanup_guarded_clone(target)
+        else:
+            shutil.rmtree(target, ignore_errors=True)
+        emit_observability_event(
+            "filesystem.guarded-lower.finish",
+            operationId=operation_id,
+            schema="verification-substrate-v2",
+            outcome="fallback",
+            reason=type(exc).__name__,
+            durationMs=max(0, int((time.monotonic() - started) * 1000)),
+        )
+        return None
+    finally:
+        if not lease_transferred:
+            if guard is not None:
+                guard.stop()
+            for junction in reversed(junctions):
+                _remove_junction(junction)
+            if target.exists():
+                shutil.rmtree(target, ignore_errors=True)
+            lease.close()
+
+
+def guarded_clone_is_active(target: Path) -> bool:
+    with _ACTIVE_LOCK:
+        return _key(target) in _ACTIVE
+
+
+def guarded_clone_authorized_roots(target: Path) -> tuple[Path, ...]:
+    """Sealed lower roots the Ω plan deliberately mapped into `target`.
+
+    A guarded clone reads its dependency tree through junctions that point at
+    the sealed PreparedArtifact lower, which by construction lives outside the
+    trial root. Those targets are authoritative, so an authority-bearing reader
+    needs to know which outside roots were intentionally mapped. Any resolved
+    path landing outside both the trial root and this set is still a genuine
+    escape.
+    """
+    with _ACTIVE_LOCK:
+        state = _ACTIVE.get(_key(target))
+    if state is None:
+        return ()
+    return tuple(state.authorized_lower_roots)
+
+
+def guarded_clone_git_objects(target: Path) -> tuple[str, ...]:
+    """Borrowed source subtrees, eligible only under this live exclusive guard."""
+    with _ACTIVE_LOCK:
+        state = _ACTIVE.get(_key(target))
+    if state is None or state.stopped is not None:
+        return ()
+    problems = _git_object_mapping_errors(state)
+    if problems:
+        raise RuntimeError("; ".join(problems))
+    return tuple(relative for relative, _lower, _identity in state.git_objects)
+
+
+def _git_object_mapping_errors(state) -> tuple[str, ...]:
+    problems = []
+    for relative, lower, identity in state.git_objects:
+        link = state.target_root / relative
+        try:
+            matches = (is_windows_junction(link) and link.resolve(strict=True) == lower
+                       and tree_object_identity(lower) == identity)
+        except (OSError, ValueError, RuntimeError):
+            matches = False
+        if not matches:
+            problems.append(f"guarded Git object mapping changed: {relative}")
+    return tuple(problems)
+
+
+def peek_guarded_clone(target: Path) -> GuardResult:
+    """Keep the lower watcher and exclusive lease alive BETWEEN commands.
+
+    This is provisional evidence only. The final command must stop the guard
+    and validate its complete accumulated stream before publishing any proof.
+    """
+    with _ACTIVE_LOCK:
+        state = _ACTIVE.get(_key(target))
+    if state is None or state.stopped is not None:
+        return GuardResult(errors=("guarded lower continuity unavailable",))
+    errors = [*_git_object_mapping_errors(state), *state.guard.drain_strict()]
+    notifications = []
+    for watcher in state.guard.watchers:
+        if watcher._thread is None or not watcher._thread.is_alive():
+            errors.append(f"guarded lower watcher stopped: {watcher.root}")
+        errors.extend(watcher.errors)
+        notifications.extend(f"{watcher.root}:{action}:{name}" for action, name in list(watcher.events)
+                             if not state.guard.ignores(watcher, name))
+    return GuardResult(errors=tuple(errors), notification_only=tuple(sorted(set(notifications))))
+
+
+def stop_guarded_clone(target: Path) -> GuardResult:
+    with _ACTIVE_LOCK:
+        state = _ACTIVE.get(_key(target))
+    if state is None:
+        return GuardResult()
+    if state.stopped is None:
+        result = state.guard.stop()
+        state.stopped = dataclasses.replace(result, errors=result.errors + _git_object_mapping_errors(state))
+    return state.stopped
+
+
+def cleanup_guarded_clone(target: Path) -> GuardResult:
+    with _ACTIVE_LOCK:
+        state = _ACTIVE.pop(_key(target), None)
+    if state is None:
+        return GuardResult()
+    result = state.stopped if state.stopped is not None else state.guard.stop()
+    try:
+        for junction in sorted(state.junctions, key=lambda item: len(item.parts), reverse=True):
+            _remove_junction(junction)
+    finally:
+        # Lease survives watcher stop and the complete project command. It is
+        # released only after every junction from this consumer is gone.
+        state.lease.close()
+    return result

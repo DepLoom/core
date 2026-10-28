@@ -1,0 +1,38 @@
+name: headless-core-ci
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+jobs:
+  focused:
+    name: "core (${{ matrix.os }}, py${{ matrix.python }})"
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: "3.12"
+          - os: ubuntu-latest
+            python: "3.13"
+          - os: windows-latest
+            python: "3.12"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install headless Core
+        run: python -m pip install -e .
+      - name: Focused regression suite (no network, installs or migration)
+        run: |
+          python -m unittest discover -s tests -p "test_peer_solver_model.py" -v
+          python -m unittest discover -s tests -p "test_peer_solver_transition.py" -v
+          python -m unittest discover -s tests -p "test_required_transition.py" -v
+          python -m unittest discover -s tests -p "test_required_planner.py" -v
+          python -m unittest discover -s tests -p "test_draft_decision_contract.py" -v
+          python -m unittest discover -s tests -p "test_draft_input_identity.py" -v
+      - name: CLI and syntax smoke
+        run: |
+          python -m compileall -q peer_solver_transition.py dependency_live_roadmap_generator.py
+          python dependency_live_roadmap_generator.py --help

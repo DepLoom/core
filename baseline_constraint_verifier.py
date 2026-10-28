@@ -1,0 +1,5725 @@
+#!/usr/bin/env python3
+"""Pre-agent Baseline assignment verifier.
+
+The dependency solver proves metadata constraints.  This verifier proves that a
+chosen direct-version assignment can actually be materialized by the project's
+package manager before any migration branch or LLM worker is created.
+
+Hard failures (dependency resolution) are suitable for learned nogood
+constraints. Infrastructure failures are *never* learned: a missing yarn shim,
+network outage or temp-directory problem must not change the dependency plan.
+Project checks use an adaptive policy by default: ordinary source-migration
+failures remain Executor work, while deterministic package/loadability failures
+are fed back into planning before any Executor branch is created.
+"""
+from __future__ import annotations
+
+from semantic_version import NpmSpec, Version
+
+import atexit
+import contextlib
+import dataclasses
+import hashlib
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import tempfile
+import threading
+import time
+from pathlib import Path
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+
+
+from verification_proof import (
+    VerificationProofIdentity,
+    project_verification_environment,
+    VerificationProofStore,
+    bind_resolved_state_identity,
+    build_verification_proof_identity,
+    emit_verification_event,
+    fixed_resolver_input_fingerprint,
+    remote_fixed_resolver_input_fingerprint,
+    SourceIdentityUnavailable,
+    is_fixed_manifest_spec,
+)
+from resolved_dependency_state import (
+    ResolvedDependencyState,
+    ResolvedDependencyStateError,
+    assert_resolved_dependency_state,
+    capture_resolved_dependency_state,
+    load_resolved_dependency_state,
+    resolved_state_metadata,
+    restore_resolved_dependency_state,
+)
+from prepared_workspace_fastpath import (
+    acquire_snapshot_copy_lease,
+    build_dependency_integrity_manifest,
+    dependency_root_manifest,
+    WorkspaceChangeGuard,
+    try_acquire_snapshot_cleanup_lease,
+    cleanup_guarded_clone,
+    guarded_clone_authorized_roots,
+    guarded_clone_is_active,
+    stop_guarded_clone,
+    try_materialize_guarded_clone,
+)
+# BLOCK_U_VERIFICATION_SUBSTRATE_V1
+# BLOCK_OMEGA_VERIFICATION_SUBSTRATE_V2
+from verification_process_supervisor import run_supervised
+from verification_workspace_backend import (
+    materialize_private_tree,
+    workspace_backend_summary,
+)
+from source_snapshot import (
+    SourceCaptureError,
+    SourceSnapshot,
+    materialize_source_for_verification,
+    active_source_snapshot,
+    bind_source_snapshot,
+    verification_source_snapshot_scope,
+)
+from package_manager_profile import (
+    PackageManagerProfileError,
+    install_args_for_profile,
+    logical_resolution_without_materialization_supported,
+    resolver_seed_continuation_capability,
+)
+from block_psi57_yarn1_resolver_seed import (
+    AUTHORITY as RESOLVER_SEED_AUTHORITY,
+    ResolverSeedError,
+    prepare_yarn1_resolver_seed_for_lifecycle,
+    reset_same_run_resolver_seed_cache,
+    resolver_seed_identity,
+    same_run_resolver_seed_store,
+    validate_yarn1_lifecycle_completion,
+    yarn1_resolver_seed_runtime_supported,
+)
+from block_psi58_reuse_economics import (
+    resolver_seed_publication_decision,
+)
+from project_topology import (
+    ProjectTopologyError,
+    resolve_project_topology,
+)
+from reparse_materialization import (
+    ReparseLink,
+    ReparseMaterializationError,
+    inventory_reparse_plan,
+)
+# BLOCK_Z_PROJECT_TOPOLOGY_V1
+from verification_observability import (
+    emit_observability_event,
+    attempt_scope,
+    current_attempt_id,
+    new_observability_id,
+    pending_stage_finishes,
+    process_resource_snapshot,
+    request_scope,
+    run_summary_payload,
+)
+# BLOCK_V_DURABLE_VERIFICATION_V1
+from block_vex_storage import (
+    package_manager_cache_environment,
+    semantic_verification_environment,
+    storage_summary,
+)
+from block_psi55_resolver_overrides import (
+    ResolverOverrideMaterializationError,
+    apply_resolver_overrides,
+    normalized_resolver_overrides,
+    resolver_override_fingerprint,
+    resolver_override_log_label,
+)
+from block_v_prepared_artifact import (
+    configure_prepared_artifact_store,
+    invalidate_prepared_artifact_record,
+    is_durable_prepared_path,
+    pin_prepared_artifact_record,
+    unpin_prepared_artifact_record,
+    clear_prepared_artifact_pins,
+    load_prepared_artifact_record,
+    prepared_snapshot_storage_root,
+    publish_prepared_artifact_record,
+    verification_trial_parent,
+)
+
+@dataclasses.dataclass(frozen=True)
+class BaselineVerifyConfig:
+    enabled: bool = True
+    parallelism: int = 4
+    max_iterations: int = 8
+    max_delta_checks: int = 24
+    timeout_seconds: int = 600
+    # None inherits the legacy phase cap; 0 waits until completion/cancel.
+    project_check_timeout_seconds: Optional[int] = None
+    attempt_timeout_seconds: int = 3600
+    localization_timeout_seconds: int = 7200
+    progress_interval_seconds: int = 15
+    # Performance policy only. The low-level boolean is retained for legacy
+    # callers, while Baseline uses verification_purpose as the typed publication
+    # policy. Non-exact baseline-control assignments also use a separate declared
+    # selector proof contract; exact assignments retain their original authority.
+    publish_durable_prepared_artifact: bool = True
+    # BLOCK_PSI4_ROLE_BASED_PUBLICATION_V1
+    # legacy | intermediate-candidate | exact-failure-confirmation |
+    # diagnostic-probe | baseline-control | incumbent-promotion
+    verification_purpose: str = "legacy"
+    # Neighboring-assignment seeding is experimental and default-off.
+    enable_neighbor_resolver_seed: bool = False
+    snapshot_copy_timeout_seconds: int = 1800
+    # Interactive preparation may wait until completion/cancel. Resolver and
+    # lifecycle commands retain phase caps; project checks have their own policy.
+    # Explicit search budgets still bind. This grants no proof authority.
+    unbounded_preparation: bool = False
+    project_checks: str = "adaptive"  # off | diagnostic | adaptive | strict
+    commands: Tuple[str, ...] = ()
+    registry: str = ""
+    telemetry_path: str = ""
+    proof_cache_dir: str = ""
+    reuse_resolver_proof_key: str = ""
+    recovery_checkpoints: bool = False
+    recovery_journal_dir: str = ""
+    # Ψ.5.5: candidate-only package-manager controls. These are part of
+    # resolver/proof identity and are materialized only in private verification.
+    resolver_overrides: Mapping[str, str] = dataclasses.field(default_factory=dict)
+    # Ψ.5.8 performance hint only. It is intentionally not part of proof identity:
+    # it controls whether already-proven resolver bytes are copied for a known
+    # later lifecycle consumer.
+    resolver_seed_publication_hint: str = ""
+    # BLOCK_PSI_VERIFIED_BASELINE_FAST_BUDGET_V1
+    # Absolute monotonic wall-clock deadline shared by ALL phases of one
+    # expensive candidate (resolver install, lifecycle, adaptive screen, project
+    # checks, exact confirmation). When set, every phase timeout is clamped to
+    # the remaining seconds so a single candidate cannot consume unbounded time
+    # across phases on top of the anytime budget. `None`/`0` = legacy per-phase
+    # timeouts only. Performance policy only; never part of proof identity.
+    budget_phase_deadline: Optional[float] = None
+
+    @staticmethod
+    def from_mapping(value: Optional[Mapping[str, object]], *, fallback_commands: Sequence[str] = ()) -> "BaselineVerifyConfig":
+        raw = dict(value or {})
+        mode = str(raw.get("projectChecks", raw.get("project_checks", "adaptive"))).strip().lower()
+        if mode not in {"off", "diagnostic", "adaptive", "strict"}:
+            raise ValueError("CONSTRAINT_VERIFY_CONFIG_INVALID: projectChecks must be off, diagnostic, adaptive, or strict")
+        commands_raw = raw.get("commands")
+        if commands_raw is None:
+            commands = tuple(str(item).strip() for item in fallback_commands if str(item).strip())
+        elif isinstance(commands_raw, list) and all(isinstance(item, str) and item.strip() for item in commands_raw):
+            commands = tuple(item.strip() for item in commands_raw)
+        else:
+            raise ValueError("CONSTRAINT_VERIFY_CONFIG_INVALID: commands must be an array of non-empty strings")
+        # R2b: resolver overrides accepted with the verified incumbent must
+        # survive the RESTART boundary. They arrive here through the spec's
+        # constraint_verify_config (fed from the previous run's proven state /
+        # envelope) and must actually reach the verify config -- otherwise the
+        # first fresh incumbent starts with an empty set and finalization drops
+        # the previously accepted override map.
+        overrides_raw = raw.get("resolverOverrides", raw.get("resolver_overrides"))
+        if isinstance(overrides_raw, dict):
+            resolver_overrides = {
+                str(name): str(version)
+                for name, version in overrides_raw.items()
+                if str(name).strip()
+            }
+        else:
+            resolver_overrides = {}
+        return BaselineVerifyConfig(
+            enabled=_as_bool(raw.get("enabled"), True),
+            parallelism=max(1, min(_as_int(raw.get("parallelism"), 4), 16)),
+            max_iterations=max(1, min(_as_int(raw.get("maxIterations", raw.get("max_iterations")), 8), 32)),
+            max_delta_checks=max(1, min(_as_int(raw.get("maxDeltaChecks", raw.get("max_delta_checks")), 24), 128)),
+            timeout_seconds=max(30, min(_as_int(raw.get("timeoutSeconds", raw.get("timeout_seconds")), 600), 3600)),
+            project_check_timeout_seconds=(
+                max(0, _as_int(raw.get("projectCheckTimeoutSeconds", raw.get("project_check_timeout_seconds")), 0))
+                if "projectCheckTimeoutSeconds" in raw or "project_check_timeout_seconds" in raw
+                else None
+            ),
+            attempt_timeout_seconds=max(60, min(_as_int(raw.get("attemptTimeoutSeconds", raw.get("attempt_timeout_seconds")), 3600), 14400)),
+            localization_timeout_seconds=max(300, min(_as_int(raw.get("localizationTimeoutSeconds", raw.get("localization_timeout_seconds")), 7200), 21600)),
+            progress_interval_seconds=max(5, min(_as_int(raw.get("progressIntervalSeconds", raw.get("progress_interval_seconds")), 15), 60)),
+            snapshot_copy_timeout_seconds=max(
+                60,
+                min(
+                    _as_int(
+                        raw.get(
+                            "snapshotCopyTimeoutSeconds",
+                            raw.get("snapshot_copy_timeout_seconds"),
+                        ),
+                        1800,
+                    ),
+                    # Ψ.5.6: a prepared-artifact copy is production-adjacent; cap
+                    # it so runaway copies cannot hang a run behind the budget.
+                    7200,
+                ),
+            ),
+            project_checks=mode,
+            commands=commands,
+            recovery_checkpoints=_as_bool(raw.get("recoveryCheckpoints"), True),
+            resolver_overrides=resolver_overrides,
+            budget_phase_deadline=(
+                float(raw.get("budgetPhaseDeadline", raw.get("budget_phase_deadline")))
+                if raw.get("budgetPhaseDeadline", raw.get("budget_phase_deadline")) is not None
+                else None
+            ),
+        )
+
+
+_PSI4_VERIFICATION_PURPOSES = frozenset({
+    "legacy",
+    "intermediate-candidate",
+    "exact-failure-confirmation",
+    "diagnostic-probe",
+    "baseline-control",
+    "incumbent-promotion",
+})
+_PSI4_INTERMEDIATE_PURPOSES = frozenset({
+    "intermediate-candidate",
+    "exact-failure-confirmation",
+    "diagnostic-probe",
+})
+
+
+def _verification_purpose(config: BaselineVerifyConfig) -> str:
+    purpose = str(config.verification_purpose or "legacy").strip().lower()
+    return purpose if purpose in _PSI4_VERIFICATION_PURPOSES else "legacy"
+
+
+def _durable_prepared_publication_policy(
+    config: BaselineVerifyConfig,
+) -> Tuple[bool, str]:
+    """Choose durable publication by artifact role, never search depth."""
+    purpose = _verification_purpose(config)
+    if purpose in _PSI4_INTERMEDIATE_PURPOSES:
+        return False, "intermediate-role-private"
+    if config.recovery_checkpoints:
+        return bool(config.publish_durable_prepared_artifact), "durable-stage-recovery"
+    if purpose == "baseline-control":
+        return bool(config.publish_durable_prepared_artifact), "stable-baseline-control"
+    if purpose == "incumbent-promotion":
+        return bool(config.publish_durable_prepared_artifact), "verified-incumbent"
+    return bool(config.publish_durable_prepared_artifact), "legacy-explicit-policy"
+
+
+# BLOCK_PSI41_CONTROL_COST_POLICY_V1
+def _persistent_control_cross_run_enabled() -> bool:
+    """Cross-run control reuse is opt-in until its economics are proven.
+
+    Same-run Ψ.3 private reuse remains enabled. Setting
+    DEPLOOM_BASELINE_CONTROL_DURABLE_MODE=force is intended only for a
+    controlled benchmark/certification run.
+    """
+    return (
+        str(
+            os.environ.get("DEPLOOM_BASELINE_CONTROL_DURABLE_MODE")
+            or "same-run-only"
+        )
+        .strip()
+        .lower()
+        == "force"
+    )
+
+
+def project_proof_cache_reusable(commands: Sequence[str]) -> bool:
+    """Policy: arbitrary shell-command PASS has no durable external-tool closure."""
+    return not any(str(command).strip() for command in commands)
+
+def _as_int(value: object, default: int) -> int:
+    try:
+        return int(value) if value is not None else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_bool(value: object, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+@dataclasses.dataclass(frozen=True)
+class BaselineProjectFailure:
+    command: str
+    exit_code: int
+    output: str = ""
+
+
+@dataclasses.dataclass
+class BaselineVerifyResult:
+    ok: bool
+    kind: str  # passed | dependency | preparation | project | infrastructure | unknown | budget
+    summary: str
+    command: str = ""
+    output: str = ""
+    workspace: str = ""
+    project_failures: Tuple[BaselineProjectFailure, ...] = ()
+    observed_resolved_versions: Mapping[str, str] = dataclasses.field(default_factory=dict)
+    observed_resolved_hash: str = ""
+    resolved_state_key: str = ""
+    resolved_lockfile_path: str = ""
+    resolved_lockfile_hash: str = ""
+    resolved_state_artifact: str = ""
+    preparation_proof_key: str = ""
+    command_checkpoint_refs: Tuple[str, ...] = ()
+    verified_source_snapshot_key: str = ""
+    verified_assignment_fingerprint: str = ""
+
+    @property
+    def hard_failure(self) -> bool:
+        return self.kind in {"dependency", "preparation", "project"}
+
+
+class AssignmentMaterializationError(RuntimeError):
+    """Raised when the solver assignment cannot be represented by package.json."""
+
+
+class BaselineCandidateBudgetExceeded(RuntimeError):
+    """A candidate phase hit the shared wall-clock budget deadline.
+
+    Unlike a plain phase timeout (which is infrastructure), this means the
+    whole candidate ran out of the FAST/anytime wall-clock budget, so no proof
+    may be published and the outcome is an honest budget-exhausted stop.
+    """
+
+    def __init__(self, phase: str, progress_label: str, seconds: int) -> None:
+        super().__init__(
+            f"BASELINE_BUDGET_EXHAUSTED: phase={phase}; "
+            f"candidate could not be verified within the remaining wall-clock "
+            f"budget ({max(0, int(seconds))}s; {progress_label})"
+        )
+        self.phase = phase
+        self.progress_label = progress_label
+        self.seconds = max(0, int(seconds))
+
+
+def _budget_deadline_hit(config: "BaselineVerifyConfig") -> bool:
+    return bool(
+        config.budget_phase_deadline
+        and time.monotonic() >= config.budget_phase_deadline
+    )
+
+
+def _clamped_phase_seconds(
+    *,
+    attempt_remaining_seconds: float,
+    budget_remaining_seconds: Optional[float],
+    timeout_seconds: int,
+    attempt_timeout_seconds: int,
+    progress_label: str,
+) -> int:
+    """Per-phase timeout for one expensive candidate.
+
+    When a shared wall-clock budget deadline is present, its remaining seconds
+    bind the phase: a hung check is killed at deadline+cleanup instead of
+    consuming the per-phase timeout. `budget_remaining_seconds <= 0` means the
+    candidate has no time left at all and raises `BaselineCandidateBudgetExceeded`
+    (an honest budget outcome), while an exhausted per-attempt deadline raises a
+    plain `subprocess.TimeoutExpired` (infrastructure).
+    """
+    remaining = int(min(attempt_remaining_seconds, timeout_seconds))
+    if budget_remaining_seconds is not None:
+        if budget_remaining_seconds <= 0:
+            raise BaselineCandidateBudgetExceeded(
+                progress_label, progress_label, int(budget_remaining_seconds)
+            )
+        remaining = min(remaining, int(budget_remaining_seconds))
+    if remaining <= 0:
+        raise subprocess.TimeoutExpired(progress_label, attempt_timeout_seconds)
+    return max(1, min(timeout_seconds, remaining))
+
+
+def project_check_timeout(config: BaselineVerifyConfig, *, attempt_remaining_seconds: float,
+                          budget_remaining_seconds: Optional[float], progress_label: str) -> int:
+    limit = config.project_check_timeout_seconds
+    if limit is None:
+        limit = config.timeout_seconds
+    if limit == 0:
+        if budget_remaining_seconds is None and attempt_remaining_seconds == float("inf"):
+            return 0
+        # Explicit search/attempt budgets still bind an otherwise unbounded check.
+        limit = max(1, int(min(attempt_remaining_seconds,
+                              budget_remaining_seconds if budget_remaining_seconds is not None else float("inf"))))
+    return _clamped_phase_seconds(
+        attempt_remaining_seconds=attempt_remaining_seconds,
+        budget_remaining_seconds=budget_remaining_seconds,
+        timeout_seconds=limit, attempt_timeout_seconds=config.attempt_timeout_seconds,
+        progress_label=progress_label,
+    )
+
+
+class ObservedResolutionError(RuntimeError):
+    """Raised when the installed direct tree differs from the exact assignment."""
+
+
+INFRA_PATTERNS = re.compile(
+    r"(?:ENOENT|not recognized as an internal or external command|command not found|"
+    r"ECONNRESET|ECONNREFUSED|ETIMEDOUT|ESOCKETTIMEDOUT|EAI_AGAIN|ENETUNREACH|"
+    r"getaddrinfo\s+ENOTFOUND|socket hang up|"
+    r"There appears to be trouble with (?:your network connection|the npm registry)|"
+    r"(?:ResponseError:\s*)?Request failed [\"'](?:401 Unauthorized|403 Forbidden|"
+    r"408 Request Timeout|429 Too Many Requests|5\d\d [^\"']+)[\"']|"
+    r"SELF_SIGNED_CERT|unable to get local issuer|certificate has expired|"
+    r"ENOSPC|EPERM|EACCES|HTTP\s+(?:401|403|408|429|500|502|503|504)\b)",
+    re.IGNORECASE,
+)
+
+DEPENDENCY_PATTERNS = re.compile(
+    r"(?:ERESOLVE|unable to resolve dependency tree|could not resolve dependency|"
+    r"No matching version found|Couldn't find any versions|YN0082|"
+    r"conflicting peer dependency)",
+    re.IGNORECASE,
+)
+
+
+STRUCTURAL_PROJECT_FAILURE_PATTERNS = re.compile(
+    r"(?:ERR_REQUIRE_ESM|Must use import to load ES Module|Cannot use import statement outside a module|"
+    r"Unexpected token ['\"]?export|No \"exports\" main defined)",
+    re.IGNORECASE,
+)
+
+TS_MODULE_RESOLUTION_FAILURE = re.compile(
+    r"TS2307[^\n\r]*Cannot find module ['\"]([^'\"]+)['\"](?:(?!TS\d{4}).){0,1800}?"
+    r"(?:could not be resolved under your current ['\"]?moduleResolution['\"]? setting|"
+    r"Consider updating to ['\"]?node16['\"]?, ['\"]?nodenext['\"]?, or ['\"]?bundler['\"]?)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+TYPE_IDENTITY_FAILURE_PATTERNS = re.compile(
+    r"(?:TS2322|TS2345|TS2416|TS2430|TS2719|TS2769|Two different types with this name exist)",
+    re.IGNORECASE,
+)
+IMPORT_TYPE_PATH = re.compile(r"import\([\"']([^\"']*node_modules[\\/][^\"']+)[\"']\)", re.IGNORECASE)
+
+# Narrow evidence-backed runtime/toolchain incompatibility. This is intentionally
+# not a generic "x.y is not a function" classifier: only the already observed
+# Sass compiler API transition is promoted to solver evidence, and only after
+# candidate-vs-control differential comparison plus fresh reproduction.
+SASS_COMPILER_API_FAILURE = re.compile(
+    r"(?:TypeError:\s*)?sass\.initAsyncCompiler\s+is\s+not\s+a\s+function",
+    re.IGNORECASE,
+)
+
+EPHEMERAL_VERIFICATION_CACHE_PATHS = (
+    "node_modules/.vite",
+    "node_modules/.vitest",
+    "node_modules/.cache",
+    "src/node_modules/.vite",
+    "src/node_modules/.vitest",
+    "src/node_modules/.cache",
+)
+
+ProgressCallback = Callable[[str], None]
+
+
+def _package_from_node_modules_path(value: str) -> Tuple[str, str]:
+    normalized = value.replace("\\", "/")
+    markers = normalized.split("/node_modules/")
+    if len(markers) < 2:
+        return "", ""
+    tail = markers[-1]
+    parts = [part for part in tail.split("/") if part]
+    if not parts:
+        return "", ""
+    package = "/".join(parts[:2]) if parts[0].startswith("@") and len(parts) >= 2 else parts[0]
+    package_root = normalized[: normalized.rfind("/node_modules/")] + "/node_modules/" + package
+    return package, package_root.lower()
+
+
+def duplicate_type_universe_packages(text: str) -> Tuple[str, ...]:
+    """Return packages referenced through two distinct node_modules roots."""
+    roots: Dict[str, set[str]] = {}
+    for raw_path in IMPORT_TYPE_PATH.findall(text):
+        package, root = _package_from_node_modules_path(raw_path)
+        if package and root:
+            roots.setdefault(package, set()).add(root)
+    return tuple(sorted(package for package, values in roots.items() if len(values) > 1))
+
+
+def _project_failure_records(result: BaselineVerifyResult) -> Tuple[BaselineProjectFailure, ...]:
+    if result.project_failures:
+        return result.project_failures
+    if result.kind == "project" and not result.ok:
+        return (BaselineProjectFailure(result.command or result.summary, 1, f"{result.summary}\n{result.output}"),)
+    return ()
+
+
+def _esm_loader_package(text: str) -> str:
+    # Prefer the package actually mentioned in a node_modules path.  This keeps
+    # the structural signature stable across temp-workspace roots while still
+    # distinguishing unrelated loader failures.
+    for raw in re.findall(r"[^\s'\"]*node_modules[\\/][^\s'\"]+", text, re.IGNORECASE):
+        package, _root = _package_from_node_modules_path(raw)
+        if package:
+            return package
+    return ""
+
+
+def structural_project_failure_signatures(result: BaselineVerifyResult) -> Tuple[str, ...]:
+    """Return stable structural diagnostics suitable for differential comparison.
+
+    A project command may already be red before migration for an unrelated API
+    problem.  Baseline must therefore compare *structural signatures*, not the
+    command's aggregate exit code.  Only narrow package/runtime identities are
+    emitted here; ordinary source API errors intentionally produce no signature.
+    """
+    if result.ok or result.kind != "project":
+        return ()
+    signatures: set[str] = set()
+    for failure in _project_failure_records(result):
+        text = failure.output or ""
+        for match in TS_MODULE_RESOLUTION_FAILURE.finditer(text):
+            signatures.add(f"ts-module-resolution:{match.group(1).lower()}")
+        if STRUCTURAL_PROJECT_FAILURE_PATTERNS.search(text):
+            package = _esm_loader_package(text)
+            signatures.add(f"esm-cjs:{package.lower()}" if package else "esm-cjs")
+        if TYPE_IDENTITY_FAILURE_PATTERNS.search(text):
+            for package in duplicate_type_universe_packages(text):
+                signatures.add(f"duplicate-type-universe:{package.lower()}")
+        if SASS_COMPILER_API_FAILURE.search(text):
+            signatures.add("toolchain-runtime-api:sass.initasynccompiler")
+    # Backwards-compatible fallback for callers constructing a synthetic result
+    # without project_failures (the helper above turns it into one record).
+    return tuple(sorted(signatures))
+
+
+def is_structural_project_failure(result: BaselineVerifyResult) -> bool:
+    """True for failures that version/source planning should prevent."""
+    return bool(structural_project_failure_signatures(result))
+
+
+def discover_baseline_project_checks(project_dir: Path) -> Tuple[str, ...]:
+    """Discover deterministic project checks useful before branch creation.
+
+    Adaptive classification means build/test failures are diagnostic unless a
+    narrow structural signature is newly introduced by the candidate assignment.
+    Running build/test here therefore catches runtime/toolchain incompatibilities
+    (for example Vitest/Vite/Sass) without turning ordinary source migration
+    failures into solver authority. Explicit commands still take precedence.
+    """
+    try:
+        manifest = json.loads((project_dir / "package.json").read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError, TypeError):
+        return ()
+    scripts = manifest.get("scripts")
+    if not isinstance(scripts, dict):
+        return ()
+    manager = detect_package_manager(project_dir)
+    # Keep checks deterministic and ordered. Build runs before tests because
+    # several real Vite/Vitest projects write caches during tests that can make a
+    # later build fail for environmental rather than dependency reasons.
+    focused = (
+        "lint:types", "typecheck",
+        "flow:check", "lint:flow", "typecheck:flow", "flow",
+        "lint:styles", "lint:scripts",
+    )
+    names = [name for name in focused if isinstance(scripts.get(name), str) and scripts.get(name, "").strip()]
+    plain_lint = scripts.get("lint")
+    plain_lint_text = plain_lint.strip() if isinstance(plain_lint, str) else ""
+    plain_lint_has_hooks = any(isinstance(scripts.get(hook), str) and scripts[hook].strip()
+                              for hook in ("prelint", "postlint"))
+    plain_lint_is_exact_duplicate = bool(
+        not plain_lint_has_hooks
+        and plain_lint_text
+        and any(
+            isinstance(scripts.get(name), str)
+            and scripts.get(name, "").strip() == plain_lint_text
+            for name in names
+        )
+    )
+    # Preserve the original shell order of a composite lint command. If it
+    # contains exactly the selected focused lint scripts (each once, without
+    # flags, substitutions or extra stages), run the composite *instead* of
+    # its constituents. This retains command semantics while avoiding duplicate
+    # typecheck/ESLint work and double-reporting the same baseline failure.
+    composite_parts = tuple(
+        part.strip() for part in plain_lint_text.split("&&")
+    ) if plain_lint_text else ()
+    def _plain_script_call(part: str) -> str:
+        prefixes = ("yarn run ", "yarn ") if manager == "yarn" else (
+            f"{manager} run ",
+        )
+        for prefix in prefixes:
+            if part.startswith(prefix):
+                return part[len(prefix):]
+        return ""
+    composite_scripts = tuple(_plain_script_call(part) for part in composite_parts)
+    redundant_composite = bool(
+        len(composite_scripts) > 1
+        and all(composite_scripts)
+        and len(composite_scripts) == len(set(composite_scripts))
+        and set(composite_scripts) == set(names)
+        and all(script in scripts for script in composite_scripts)
+    )
+    if redundant_composite:
+        names = [name for name in names if name not in set(composite_scripts)]
+        names.append("lint")
+    elif plain_lint_text and not plain_lint_is_exact_duplicate:
+        names.append("lint")
+    for name in ("build", "test:unit", "test"):
+        if isinstance(scripts.get(name), str) and scripts.get(name, "").strip():
+            names.append(name)
+    # Do not run two aliases for the same Flow checker in one Baseline. Prefer
+    # the most explicit script name above; this avoids starting/checking the
+    # same Flow server repeatedly in legacy projects.
+    flow_names = [name for name in names if name in {"flow:check", "lint:flow", "typecheck:flow", "flow"}]
+    if len(flow_names) > 1:
+        keep = flow_names[0]
+        names = [name for name in names if name not in set(flow_names) or name == keep]
+    # R7: only an EXACT duplicate of `test:unit` is skipped. A composite
+    # `test` script (for example `yarn test:unit && yarn test:build`) MUST keep
+    # its extra stage: dropping it because `test:unit` is already selected would
+    # silently lose `test:build` from the verification.
+    test_unit_text = scripts.get("test:unit")
+    test_text = scripts.get("test")
+    if (
+        "test:unit" in names
+        and "test" in names
+        and isinstance(test_unit_text, str)
+        and isinstance(test_text, str)
+        and test_text.strip() == test_unit_text.strip()
+        and not any(isinstance(scripts.get(hook), str) and scripts[hook].strip()
+                    for hook in ("pretest", "posttest"))
+    ):
+        names = [name for name in names if name != "test"]
+    commands: List[str] = []
+    for name in names:
+        if manager == "yarn":
+            commands.append(f"yarn {name}")
+        else:
+            commands.append(f"{manager} run {name}")
+    return tuple(commands)
+
+
+def _candidate_search_dirs() -> List[Path]:
+    env = os.environ
+    values: List[Path] = []
+    for key, suffix in (
+        ("NVM_SYMLINK", ""),
+        ("NVM_HOME", ""),
+        ("VOLTA_HOME", "bin"),
+        ("FNM_MULTISHELL_PATH", ""),
+        ("APPDATA", "npm"),
+    ):
+        raw = env.get(key)
+        if raw:
+            values.append(Path(raw) / suffix if suffix else Path(raw))
+    if os.name == "nt":
+        if env.get("ProgramFiles"):
+            values.append(Path(env["ProgramFiles"]) / "nodejs")
+        if env.get("LOCALAPPDATA"):
+            values.append(Path(env["LOCALAPPDATA"]) / "Programs" / "nodejs")
+        if env.get("USERPROFILE"):
+            values.append(Path(env["USERPROFILE"]) / "scoop" / "shims")
+    return values
+
+
+def resolve_executable(command: str) -> Optional[str]:
+    direct = shutil.which(command)
+    if direct:
+        return direct
+    extensions = [""] if os.name != "nt" else [".exe", ".com", ".cmd", ".bat", ""]
+    for directory in _candidate_search_dirs():
+        for extension in extensions:
+            candidate = directory / f"{command}{extension}"
+            if candidate.is_file():
+                return str(candidate)
+    return None
+
+
+def _command_prefix(executable: str, args: Sequence[str]) -> Tuple[List[str], bool]:
+    if os.name == "nt" and Path(executable).suffix.lower() in {".cmd", ".bat"}:
+        comspec = os.environ.get("COMSPEC") or "cmd.exe"
+        # subprocess(list) does not reliably CreateProcess a batch shim when the
+        # parent is a GUI app. cmd.exe is explicit and keeps shell=False here.
+        quoted = subprocess.list2cmdline([executable, *args])
+        return [comspec, "/d", "/s", "/c", quoted], False
+    return [executable, *args], False
+
+
+def project_check_command_argv(command: str, environment: Optional[Mapping[str, str]] = None) -> List[str]:
+    """Run configured shell commands identically in control and iterative checks."""
+    from migration_validation import internal_command_argv
+    internal = internal_command_argv(command)
+    if internal is not None:
+        return internal
+    if os.name == "nt":
+        return [(environment if environment is not None else os.environ).get("COMSPEC") or "cmd.exe", "/d", "/s", "/c", command]
+    return ["/bin/sh", "-c", command]
+
+
+def detect_package_manager(project_dir: Path) -> str:
+    package_json = project_dir / "package.json"
+    if package_json.exists():
+        try:
+            package_manager = str(
+                json.loads(package_json.read_text(encoding="utf-8-sig")).get("packageManager") or ""
+            )
+            if package_manager:
+                return package_manager.split("@", 1)[0].strip().lower()
+        except (OSError, ValueError, TypeError):
+            pass
+
+    try:
+        return resolve_project_topology(
+            project_dir,
+            allow_discovery=False,
+            require_supported=False,
+        ).profile.manager
+    except (ProjectTopologyError, PackageManagerProfileError):
+        if (project_dir / "yarn.lock").exists():
+            return "yarn"
+        if (project_dir / "pnpm-lock.yaml").exists():
+            return "pnpm"
+        return "npm"
+
+def install_args(
+    manager: str, *, ignore_scripts: bool, frozen: bool = False
+) -> List[str]:
+    if manager == "yarn":
+        # Resolver discovery may create/extend the lockfile. Every phase after
+        # ResolvedState capture is frozen to those exact bytes.
+        args = ["install"]
+        if frozen:
+            args.append("--frozen-lockfile")
+        if ignore_scripts:
+            args.append("--ignore-scripts")
+        return args
+    if manager == "pnpm":
+        args = ["install", "--frozen-lockfile" if frozen else "--no-frozen-lockfile"]
+        if ignore_scripts:
+            args.append("--ignore-scripts")
+        return args
+    if frozen:
+        args = ["ci", "--no-audit", "--no-fund"]
+    else:
+        args = ["install", "--no-audit", "--no-fund"]
+    if ignore_scripts:
+        args.append("--ignore-scripts")
+    return args
+
+
+def _emit_progress(progress: Optional[ProgressCallback], message: str) -> None:
+    if progress is not None:
+        progress(message)
+
+
+def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
+    """Terminate *process* and descendants; never leave npm/node children alive."""
+    if process.poll() is not None:
+        return
+    if os.name == "nt" and process.pid:
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10, check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+    elif process.pid:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            pass
+    if process.poll() is None:
+        try:
+            process.kill()
+        except OSError:
+            pass
+
+
+def _run(
+    argv: Sequence[str],
+    cwd: Path,
+    *,
+    timeout_seconds: int,
+    env: Optional[Mapping[str, str]] = None,
+    base_env: Optional[Mapping[str, str]] = None,
+    progress: Optional[ProgressCallback] = None,
+    progress_label: str = "command",
+    progress_interval_seconds: int = 15,
+) -> subprocess.CompletedProcess[str]:
+    """Run a verifier child with bounded output and full-stream infra detection."""
+    from package_manager_telemetry import PackageManagerTelemetry
+    package_telemetry = PackageManagerTelemetry(progress_label)
+    infra_seen = False
+    rolling = ""
+    latest_output = ""
+    reported_output = ""
+
+    def report_progress(message: str) -> None:
+        nonlocal reported_output
+        if progress is None:
+            return
+        progress(message)
+        # Bounded, throttled by the supervisor heartbeat on its main thread.
+        if latest_output and latest_output != reported_output:
+            progress(f"{progress_label}: output:\n{latest_output}")
+            reported_output = latest_output
+
+    def observe_output(chunk: str) -> None:
+        nonlocal infra_seen, rolling, latest_output
+        latest_output = (latest_output + str(chunk))[-2000:]
+        package_telemetry.consume(chunk)
+        if infra_seen:
+            return
+        # Pattern boundaries may cross reader chunks. A small rolling prefix is
+        # enough for the finite infrastructure regex while avoiding full output
+        # retention in RAM.
+        candidate = rolling + str(chunk)
+        if INFRA_PATTERNS.search(candidate):
+            infra_seen = True
+        rolling = candidate[-4096:]
+
+    try:
+        from cross_process_io import shared_io_slot
+        admission = (shared_io_slot("pm", progress=progress, label=progress_label, timeout_seconds=timeout_seconds)
+                     if progress_label in {"package-manager resolver install", "package-manager lifecycle install"}
+                     else contextlib.nullcontext(0))
+        with admission as waited_ms:
+            remaining = max(1, timeout_seconds - int(waited_ms / 1000)) if timeout_seconds else 0
+            completed = run_supervised(
+                argv,
+                cwd,
+                timeout_seconds=remaining,
+                env=env,
+                base_env=base_env,
+                progress=report_progress if progress is not None else None,
+                progress_label=progress_label,
+                progress_interval_seconds=progress_interval_seconds,
+                output_observer=observe_output,
+            )
+    except BaseException:
+        package_telemetry.finish(None)
+        raise
+    setattr(completed, "deploom_infra_detected", bool(infra_seen))
+    setattr(completed, "deploom_package_manager_telemetry", package_telemetry.finish(completed.returncode))
+    return completed
+
+
+def _run_preparation_install(argv, cwd, *, config, timeout_factory, **kwargs):
+    """Queue without spending active-install time; keep the run/attempt deadline."""
+    from cross_process_io import shared_io_slot
+    initial_timeout = timeout_factory()  # Refuse already-exhausted work before admission.
+    queue_timeout = (max(0.001, config.budget_phase_deadline - time.monotonic())
+                     if config.unbounded_preparation and config.budget_phase_deadline
+                     else 0 if config.unbounded_preparation else initial_timeout)
+    try:
+        with shared_io_slot("pm", progress=kwargs.get("progress"),
+                            label=kwargs.get("progress_label", "package-manager install"),
+                            timeout_seconds=queue_timeout):
+            return _run(argv, cwd, timeout_seconds=timeout_factory(), **kwargs)
+    except TimeoutError:
+        timeout_factory()  # Preserve typed overall/attempt budget exhaustion.
+        raise
+
+
+def _process_failure_output(error: BaseException) -> str:
+    output = getattr(error, "output", "") or ""
+    if isinstance(output, bytes):
+        output = output.decode("utf-8", errors="replace")
+    return str(output)[-16000:]
+
+
+def _durable_proof_publication_allowed(
+    completed: subprocess.CompletedProcess[str],
+) -> bool:
+    """Require a closed, guaranteed process tree before publishing reusable proof."""
+    supervision = getattr(completed, "supervision", None)
+    return bool(
+        supervision is not None
+        and str(getattr(supervision, "quality", "")) == "guaranteed-tree"
+        and int(getattr(supervision, "descendants_remaining", 0) or 0) == 0
+    )
+
+
+def clean_ephemeral_verification_caches(
+    project_dir: Path,
+    dependency_roots: Iterable[str] = (),
+) -> Tuple[str, ...]:
+    """Remove only known cache directories below canonical dependency roots."""
+    root = project_dir.resolve()
+    normalized_roots = [
+        str(value).replace("\\", "/").strip("/")
+        for value in dependency_roots
+        if str(value).strip()
+    ]
+    if not normalized_roots:
+        # Backward-compatible standalone behaviour. Production PreparedSnapshot
+        # callers pass the canonical dependency roots explicitly.
+        normalized_roots = ["node_modules", "src/node_modules"]
+    removed: List[str] = []
+    for dependency_root in sorted(set(normalized_roots)):
+        relative_root = Path(*dependency_root.split("/"))
+        if relative_root.is_absolute() or ".." in relative_root.parts:
+            continue
+        from prepared_workspace_fastpath import EPHEMERAL_CACHE_DIR_NAMES
+        for cache_name in EPHEMERAL_CACHE_DIR_NAMES:
+            relative = (relative_root / cache_name).as_posix()
+            target = root / relative_root / cache_name
+            if not target.exists():
+                continue
+            try:
+                shutil.rmtree(target, ignore_errors=False)
+                removed.append(relative)
+            except OSError:
+                # Cache cleanup is performance hygiene; the following command
+                # remains authoritative and mutation guards stay fail-closed.
+                pass
+    return tuple(removed)
+
+
+@dataclasses.dataclass(frozen=True)
+class PreparedWorkspaceSnapshot:
+    key: str
+    workspace_root: Path
+    project_relative: Path
+    source_project: Path
+    storage_mode: str
+    observed_resolved_versions: Mapping[str, str]
+    observed_resolved_hash: str
+    dependency_roots: Tuple[str, ...] = ()
+    # Legacy field retained for old tests/artifacts. Ω does not populate or
+    # consult it on the authoritative production path.
+    dependency_integrity: Mapping[str, str] = dataclasses.field(default_factory=dict)
+    # Same-call performance receipt only. True means this exact invocation of
+    # _publish_prepared_workspace_snapshot completed the existing strong durable
+    # seal and atomically published its locator. It is never deserialized and
+    # never substitutes cross-process continuity validation.
+    durable_publication_confirmed: bool = False
+    # Ψ.4.1: exact cost of the strong durable integrity-seal substage only.
+    # Performance metadata; never proof/cache identity.
+    durable_seal_duration_ms: int = 0
+    # Source subset is derived by the same strong PreparedArtifact seal.
+    source_closure_content_key: str = ""
+    source_closure_entries: tuple[dict[str, object], ...] = ()
+
+
+_PREPARED_SNAPSHOT_LOCK = threading.Lock()
+_PREPARED_SNAPSHOT_ROOT: Optional[Path] = None
+_PREPARED_SNAPSHOTS: Dict[Tuple[str, str], PreparedWorkspaceSnapshot] = {}
+_PREPARED_SNAPSHOT_MAX_COUNT = 2
+_PREPARED_FASTPATH_DISABLED: set[Tuple[str, str]] = set()
+
+# BLOCK_U_TIME_TO_RESULT_V1
+# Process-local optimization state only. It is never proof/Solver authority.
+_PREPARED_FASTPATH_COMMAND_DISABLED: set[Tuple[str, str]] = set()
+
+# BLOCK_X_SAME_RUN_REUSE_V1
+# Coordination may serialize equivalent requests but never grants reuse. After
+# waiting, callers re-enter exact proof lookup and watcher-backed validation.
+_PREPARATION_COORDINATION_LOCK = threading.Lock()
+_PREPARATION_COORDINATION: Dict[Tuple[object, ...], threading.Lock] = {}
+_PREPARED_SNAPSHOT_PRODUCERS: Dict[Tuple[str, str], str] = {}
+
+# BLOCK_PSI3_PRIVATE_PREPARED_V1
+# Performance-only same-process tier. Reuse still requires the exact
+# PreparationProofKey plus clean watcher continuity between verify requests.
+# Nothing in this tier is cross-process/durable authority.
+_SAME_RUN_PRIVATE_PREPARED_ROOT: Optional[Path] = None
+_SAME_RUN_PRIVATE_PREPARED_SNAPSHOTS: Dict[Tuple[str, str], PreparedWorkspaceSnapshot] = {}
+_SAME_RUN_PRIVATE_PREPARED_GUARDS: Dict[Tuple[str, str], WorkspaceChangeGuard] = {}
+_SAME_RUN_PRIVATE_PREPARED_PRODUCERS: Dict[Tuple[str, str], str] = {}
+# BLOCK_PSI32_ATTEMPT_SCOPED_PRIVATE_CLEANUP_V1
+# slot -> verification attempt currently owning unparked/claimed private bytes.
+# Parked snapshots have no active owner. This is performance/safety state only.
+_SAME_RUN_PRIVATE_PREPARED_ACTIVE_ATTEMPTS: Dict[Tuple[str, str], str] = {}
+_SAME_RUN_PRIVATE_PREPARED_MAX_COUNT = 2
+
+
+def _preparation_coordination_key(
+    project_dir: Path,
+    assignment: Mapping[str, str],
+    remove_packages: Iterable[str],
+    config: "BaselineVerifyConfig",
+) -> Tuple[object, ...]:
+    return (
+        os.path.normcase(str(project_dir.resolve())),
+        tuple(sorted((str(name), str(version)) for name, version in assignment.items())),
+        tuple(sorted(str(item) for item in remove_packages)),
+        tuple(sorted(normalized_resolver_overrides(config.resolver_overrides).items())),
+        str(config.registry or "").rstrip("/"),
+        tuple(sorted(semantic_verification_environment(os.environ).items())),
+    )
+
+
+@contextlib.contextmanager
+def _coalesce_same_run_preparation(key: Tuple[object, ...]):
+    with _PREPARATION_COORDINATION_LOCK:
+        lock = _PREPARATION_COORDINATION.setdefault(key, threading.Lock())
+    waited = lock.locked()
+    lock.acquire()
+    try:
+        yield waited
+    finally:
+        lock.release()
+
+
+
+def _same_run_private_prepared_root(parent: Optional[Path] = None) -> Path:
+    global _SAME_RUN_PRIVATE_PREPARED_ROOT
+    with _PREPARED_SNAPSHOT_LOCK:
+        current = _SAME_RUN_PRIVATE_PREPARED_ROOT
+        if current is not None and current.is_dir():
+            return current
+        base = parent.resolve() if parent is not None else None
+        if base is not None:
+            base.mkdir(parents=True, exist_ok=True)
+        created = Path(tempfile.mkdtemp(
+            prefix="dependency-flow-same-run-prepared-",
+            dir=str(base) if base is not None else None,
+        ))
+        from verification_storage_maintenance import register_trial_owner
+        register_trial_owner(created)
+        _SAME_RUN_PRIVATE_PREPARED_ROOT = created
+        return created
+
+
+def _same_run_private_snapshot_exists(key: str, source_project: Path) -> bool:
+    slot = _prepared_snapshot_slot(key, source_project)
+    with _PREPARED_SNAPSHOT_LOCK:
+        snapshot = _SAME_RUN_PRIVATE_PREPARED_SNAPSHOTS.get(slot)
+    return bool(snapshot is not None and snapshot.workspace_root.is_dir())
+
+
+def _evict_same_run_private_prepared_snapshot(
+    key: str,
+    source_project: Path,
+    *,
+    reason: str = "",
+) -> None:
+    slot = _prepared_snapshot_slot(key, source_project)
+    with _PREPARED_SNAPSHOT_LOCK:
+        guard = _SAME_RUN_PRIVATE_PREPARED_GUARDS.pop(slot, None)
+        snapshot = _SAME_RUN_PRIVATE_PREPARED_SNAPSHOTS.pop(slot, None)
+        producer = _SAME_RUN_PRIVATE_PREPARED_PRODUCERS.pop(slot, None)
+        _SAME_RUN_PRIVATE_PREPARED_ACTIVE_ATTEMPTS.pop(slot, None)
+    if guard is not None:
+        try:
+            guard.stop()
+        except Exception:
+            pass
+    if snapshot is not None:
+        _retire_prepared_workspace_snapshot(snapshot)
+    if snapshot is not None or producer is not None:
+        emit_observability_event(
+            "same-run.private-prepared.invalidated",
+            identity=str(key),
+            sourceProject=str(source_project.resolve()),
+            originalProducer=str(producer or ""),
+            reason=str(reason or "evicted"),
+        )
+
+
+def _enforce_same_run_private_prepared_budget(
+    protected_slot: Optional[Tuple[str, str]] = None,
+) -> None:
+    victims: list[
+        tuple[
+            Tuple[str, str],
+            PreparedWorkspaceSnapshot,
+            WorkspaceChangeGuard,
+            Optional[str],
+        ]
+    ] = []
+    budget_deferred = False
+    cache_size = 0
+    with _PREPARED_SNAPSHOT_LOCK:
+        while (
+            len(_SAME_RUN_PRIVATE_PREPARED_SNAPSHOTS)
+            > _SAME_RUN_PRIVATE_PREPARED_MAX_COUNT
+        ):
+            victim_slot: Optional[Tuple[str, str]] = None
+            for candidate_slot in _SAME_RUN_PRIVATE_PREPARED_SNAPSHOTS:
+                if candidate_slot == protected_slot:
+                    continue
+                # A parked guard is the explicit idle marker. _claim() removes
+                # it before handing the tree to a consumer, so active snapshots
+                # are fail-closed against budget retirement.
+                if candidate_slot not in _SAME_RUN_PRIVATE_PREPARED_GUARDS:
+                    continue
+                victim_slot = candidate_slot
+                break
+
+            if victim_slot is None:
+                budget_deferred = True
+                break
+
+            snapshot = _SAME_RUN_PRIVATE_PREPARED_SNAPSHOTS.pop(victim_slot)
+            guard = _SAME_RUN_PRIVATE_PREPARED_GUARDS.pop(victim_slot)
+            producer = _SAME_RUN_PRIVATE_PREPARED_PRODUCERS.pop(
+                victim_slot, None
+            )
+            _SAME_RUN_PRIVATE_PREPARED_ACTIVE_ATTEMPTS.pop(
+                victim_slot, None
+            )
+            victims.append((victim_slot, snapshot, guard, producer))
+        cache_size = len(_SAME_RUN_PRIVATE_PREPARED_SNAPSHOTS)
+
+    for slot, snapshot, guard, producer in victims:
+        try:
+            guard.stop()
+        except Exception:
+            pass
+        _retire_prepared_workspace_snapshot(snapshot)
+        emit_observability_event(
+            "same-run.private-prepared.invalidated",
+            operationId=new_observability_id("private-prepared-evict"),
+            identity=slot[0],
+            sourceProject=slot[1],
+            originalProducer=str(producer or ""),
+            reason="same-run-private-budget",
+        )
+
+    if budget_deferred:
+        emit_observability_event(
+            "same-run.private-prepared.budget-deferred",
+            operationId=new_observability_id("private-prepared-budget"),
+            cacheSize=cache_size,
+            maxCount=_SAME_RUN_PRIVATE_PREPARED_MAX_COUNT,
+            reason="all-nonprotected-snapshots-active-or-unparked",
+        )
+
+
+def _register_same_run_private_prepared_snapshot(
+    snapshot: PreparedWorkspaceSnapshot,
+    *,
+    producer: str,
+) -> None:
+    if is_durable_prepared_path(snapshot.workspace_root):
+        raise RuntimeError(
+            "SAME_RUN_PRIVATE_PREPARED_DURABLE_ESCAPE: "
+            "private tier cannot register a durable path"
+        )
+    slot = _prepared_snapshot_slot(snapshot.key, snapshot.source_project)
+    _evict_same_run_private_prepared_snapshot(
+        snapshot.key,
+        snapshot.source_project,
+        reason="same-run-private-replaced",
+    )
+    active_attempt = current_attempt_id()
+    with _PREPARED_SNAPSHOT_LOCK:
+        _SAME_RUN_PRIVATE_PREPARED_SNAPSHOTS[slot] = snapshot
+        _SAME_RUN_PRIVATE_PREPARED_PRODUCERS[slot] = str(producer)
+        if active_attempt:
+            _SAME_RUN_PRIVATE_PREPARED_ACTIVE_ATTEMPTS[slot] = active_attempt
+        else:
+            _SAME_RUN_PRIVATE_PREPARED_ACTIVE_ATTEMPTS.pop(slot, None)
+    _enforce_same_run_private_prepared_budget(slot)
+    emit_observability_event(
+        "same-run.private-prepared.created",
+        operationId=new_observability_id("private-prepared-create"),
+        identity=snapshot.key,
+        sourceProject=str(snapshot.source_project),
+        originalProducer=str(producer),
+        durable=False,
+        durableSealAvoided=True,
+    )
+
+
+def _park_same_run_private_prepared_snapshot(
+    key: str,
+    source_project: Path,
+) -> bool:
+    """Arm continuity evidence after the current request stops using the tree."""
+    slot = _prepared_snapshot_slot(key, source_project)
+    with _PREPARED_SNAPSHOT_LOCK:
+        snapshot = _SAME_RUN_PRIVATE_PREPARED_SNAPSHOTS.get(slot)
+        existing_guard = _SAME_RUN_PRIVATE_PREPARED_GUARDS.get(slot)
+    if snapshot is None:
+        return False
+    if existing_guard is not None:
+        return True
+    if not snapshot.workspace_root.is_dir():
+        _evict_same_run_private_prepared_snapshot(
+            key, source_project, reason="same-run-private-path-missing"
+        )
+        return False
+
+    guard = WorkspaceChangeGuard(snapshot.workspace_root)
+    try:
+        started = bool(guard.start())
+    except Exception:
+        started = False
+    if not started:
+        try:
+            guard.stop()
+        except Exception:
+            pass
+        _evict_same_run_private_prepared_snapshot(
+            key, source_project, reason="same-run-private-watcher-unavailable"
+        )
+        return False
+
+    with _PREPARED_SNAPSHOT_LOCK:
+        if _SAME_RUN_PRIVATE_PREPARED_SNAPSHOTS.get(slot) is not snapshot:
+            try:
+                guard.stop()
+            except Exception:
+                pass
+            return False
+        _SAME_RUN_PRIVATE_PREPARED_GUARDS[slot] = guard
+        _SAME_RUN_PRIVATE_PREPARED_ACTIVE_ATTEMPTS.pop(slot, None)
+    emit_observability_event(
+        "same-run.private-prepared.parked",
+        operationId=new_observability_id("private-prepared-park"),
+        identity=str(key),
+        sourceProject=str(source_project.resolve()),
+    )
+    # A prior registration may have deferred budget enforcement because every
+    # candidate was active. Parking creates a safe idle victim, so retry now.
+    _enforce_same_run_private_prepared_budget()
+    return True
+
+
+def _claim_same_run_private_prepared_snapshot(
+    key: str,
+    source_project: Path,
+) -> Tuple[Optional[PreparedWorkspaceSnapshot], Optional[str], str]:
+    """Consume watcher evidence and claim an exact same-run private tree."""
+    slot = _prepared_snapshot_slot(key, source_project)
+    with _PREPARED_SNAPSHOT_LOCK:
+        snapshot = _SAME_RUN_PRIVATE_PREPARED_SNAPSHOTS.get(slot)
+        guard = _SAME_RUN_PRIVATE_PREPARED_GUARDS.pop(slot, None)
+        producer = _SAME_RUN_PRIVATE_PREPARED_PRODUCERS.get(slot)
+
+    if snapshot is None:
+        return None, None, "missing"
+    if guard is None:
+        return None, producer, "busy"
+    try:
+        continuity = guard.stop()
+    except Exception:
+        _evict_same_run_private_prepared_snapshot(
+            key, source_project, reason="same-run-private-watcher-stop"
+        )
+        return None, producer, "watcher-error"
+
+    if continuity.errors:
+        _evict_same_run_private_prepared_snapshot(
+            key, source_project, reason="same-run-private-watcher-error"
+        )
+        return None, producer, "watcher-error"
+    if continuity.changes:
+        _evict_same_run_private_prepared_snapshot(
+            key, source_project, reason="same-run-private-mutated"
+        )
+        return None, producer, "workspace-mutated"
+    if not snapshot.workspace_root.is_dir():
+        _evict_same_run_private_prepared_snapshot(
+            key, source_project, reason="same-run-private-path-missing"
+        )
+        return None, producer, "path-missing"
+    active_attempt = current_attempt_id()
+    with _PREPARED_SNAPSHOT_LOCK:
+        if _SAME_RUN_PRIVATE_PREPARED_SNAPSHOTS.get(slot) is snapshot:
+            if active_attempt:
+                _SAME_RUN_PRIVATE_PREPARED_ACTIVE_ATTEMPTS[slot] = active_attempt
+            else:
+                _SAME_RUN_PRIVATE_PREPARED_ACTIVE_ATTEMPTS.pop(slot, None)
+    return snapshot, producer, "hit"
+
+
+def _evict_same_run_private_prepared_for_attempt(
+    attempt_id: str,
+    *,
+    reason: str,
+) -> int:
+    """Retire private trees actually held by one verification attempt."""
+    owner = str(attempt_id or "").strip()
+    if not owner:
+        return 0
+    with _PREPARED_SNAPSHOT_LOCK:
+        slots = [
+            slot
+            for slot, active_owner
+            in _SAME_RUN_PRIVATE_PREPARED_ACTIVE_ATTEMPTS.items()
+            if active_owner == owner
+        ]
+    for key, source_project in slots:
+        _evict_same_run_private_prepared_snapshot(
+            key,
+            Path(source_project),
+            reason=reason,
+        )
+    if slots:
+        emit_observability_event(
+            "same-run.private-prepared.attempt-cleanup",
+            operationId=new_observability_id(
+                "private-prepared-attempt-cleanup"
+            ),
+            attemptId=owner,
+            count=len(slots),
+            reason=reason,
+        )
+    return len(slots)
+
+
+def _cleanup_same_run_private_prepared_snapshots() -> None:
+    global _SAME_RUN_PRIVATE_PREPARED_ROOT
+    with _PREPARED_SNAPSHOT_LOCK:
+        guards = list(_SAME_RUN_PRIVATE_PREPARED_GUARDS.values())
+        root = _SAME_RUN_PRIVATE_PREPARED_ROOT
+        _SAME_RUN_PRIVATE_PREPARED_GUARDS.clear()
+        _SAME_RUN_PRIVATE_PREPARED_SNAPSHOTS.clear()
+        _SAME_RUN_PRIVATE_PREPARED_PRODUCERS.clear()
+        _SAME_RUN_PRIVATE_PREPARED_ACTIVE_ATTEMPTS.clear()
+        _SAME_RUN_PRIVATE_PREPARED_ROOT = None
+    for guard in guards:
+        try:
+            guard.stop()
+        except Exception:
+            pass
+    if root is not None:
+        shutil.rmtree(root, ignore_errors=True)
+        if root.exists():
+            from verification_storage_maintenance import retire_trial
+            retire_trial(root)
+
+def reset_same_run_verification_reuse() -> None:
+    """Start a new Baseline run without restoring process-local trust."""
+    _cleanup_same_run_private_prepared_snapshots()
+    reset_same_run_resolver_seed_cache()
+    clear_prepared_artifact_pins()
+    with _PREPARATION_COORDINATION_LOCK:
+        _PREPARATION_COORDINATION.clear()
+    with _PREPARED_SNAPSHOT_LOCK:
+        _PREPARED_SNAPSHOT_PRODUCERS.clear()
+
+
+def _cleanup_prepared_snapshot_root() -> None:
+    global _PREPARED_SNAPSHOT_ROOT
+    _cleanup_same_run_private_prepared_snapshots()
+    root = _PREPARED_SNAPSHOT_ROOT
+    # Block V durable PreparedArtifacts intentionally survive process exit.
+    # Only the historical process-local temporary root is deleted here.
+    if root is not None and not is_durable_prepared_path(root):
+        shutil.rmtree(root, ignore_errors=True)
+    _PREPARED_SNAPSHOT_ROOT = None
+    _PREPARED_SNAPSHOTS.clear()
+    _PREPARED_FASTPATH_DISABLED.clear()
+    _PREPARED_FASTPATH_COMMAND_DISABLED.clear()
+    _PREPARED_SNAPSHOT_PRODUCERS.clear()
+    clear_prepared_artifact_pins()
+    with _PREPARATION_COORDINATION_LOCK:
+        _PREPARATION_COORDINATION.clear()
+
+
+atexit.register(_cleanup_prepared_snapshot_root)
+
+
+def _prepared_snapshot_root() -> Path:
+    global _PREPARED_SNAPSHOT_ROOT
+    with _PREPARED_SNAPSHOT_LOCK:
+        # The configured store can change between requests in a long-lived
+        # worker. A stale root must not route a new subject to retired storage.
+        durable = prepared_snapshot_storage_root()
+        if durable is not None:
+            _PREPARED_SNAPSHOT_ROOT = durable.resolve()
+        elif _PREPARED_SNAPSHOT_ROOT is None or not _PREPARED_SNAPSHOT_ROOT.is_dir():
+            _PREPARED_SNAPSHOT_ROOT = Path(
+                tempfile.mkdtemp(prefix="dependency-flow-prepared-snapshots-")
+            ).resolve()
+        return _PREPARED_SNAPSHOT_ROOT
+
+
+def _run_snapshot_copy(
+    argv: Sequence[str],
+    cwd: Path,
+    *,
+    timeout_seconds: int,
+    progress: Optional[ProgressCallback] = None,
+    progress_label: str = "snapshot copy",
+    progress_interval_seconds: int = 15,
+) -> subprocess.CompletedProcess[str]:
+    return run_supervised(
+        argv,
+        cwd,
+        timeout_seconds=timeout_seconds,
+        progress=progress,
+        progress_label=progress_label,
+        progress_interval_seconds=progress_interval_seconds,
+    )
+
+
+def _is_windows_junction(path: Path) -> bool:
+    if os.name != "nt":
+        return False
+    checker = getattr(os.path, "isjunction", None)
+    if callable(checker):
+        try:
+            return bool(checker(path))
+        except OSError:
+            return False
+    method = getattr(path, "is_junction", None)
+    if callable(method):
+        try:
+            return bool(method())
+        except OSError:
+            return False
+    return False
+
+
+def _candidate_workspace_junctions(
+    workspace_root: Path,
+    workspace_project: Path,
+) -> Tuple[Path, ...]:
+    """Find only relocation-sensitive ancestor node_modules junctions.
+
+    This is O(project-depth + immediate node_modules entries), not a tree walk.
+    Generic prepared snapshots without junctions remain independent from
+    package-manager topology/lockfile authority.
+    """
+    if os.name != "nt":
+        return ()
+
+    workspace_root = workspace_root.resolve()
+    workspace_project = workspace_project.resolve()
+    try:
+        workspace_project.relative_to(workspace_root)
+    except ValueError as exc:
+        raise RuntimeError(
+            "WORKSPACE_JUNCTION_PROJECT_OUTSIDE_ROOT: "
+            f"project={workspace_project}; root={workspace_root}"
+        ) from exc
+
+    node_modules_roots: list[Path] = []
+    current = workspace_project
+    while True:
+        candidate = current / "node_modules"
+        if candidate.is_dir():
+            node_modules_roots.append(candidate)
+        if current == workspace_root:
+            break
+        if current.parent == current:
+            break
+        current = current.parent
+
+    junctions: list[Path] = []
+    for node_modules in node_modules_roots:
+        try:
+            entries = sorted(
+                node_modules.iterdir(),
+                key=lambda item: item.name.lower(),
+            )
+        except OSError as exc:
+            raise RuntimeError(
+                f"WORKSPACE_NODE_MODULES_UNREADABLE: {node_modules}: {exc}"
+            ) from exc
+
+        for entry in entries:
+            if _is_windows_junction(entry):
+                junctions.append(entry)
+                continue
+
+            # Scoped workspace packages are one level below @scope.
+            if (
+                entry.name.startswith("@")
+                and entry.is_dir()
+                and not entry.is_symlink()
+                and not _is_windows_junction(entry)
+            ):
+                try:
+                    scoped = sorted(
+                        entry.iterdir(),
+                        key=lambda item: item.name.lower(),
+                    )
+                except OSError as exc:
+                    raise RuntimeError(
+                        f"WORKSPACE_SCOPE_UNREADABLE: {entry}: {exc}"
+                    ) from exc
+                junctions.extend(
+                    item
+                    for item in scoped
+                    if _is_windows_junction(item)
+                )
+
+    unique = {
+        os.path.normcase(str(path.resolve(strict=False))): path
+        for path in junctions
+    }
+    return tuple(unique[key] for key in sorted(unique))
+
+
+def _workspace_package_targets(workspace_project: Path) -> Dict[str, Path]:
+    try:
+        topology = resolve_project_topology(
+            workspace_project,
+            allow_discovery=False,
+            require_supported=True,
+        )
+    except ProjectTopologyError as exc:
+        raise RuntimeError(
+            f"WORKSPACE_JUNCTION_TOPOLOGY_UNAVAILABLE: {exc}"
+        ) from exc
+
+    manager_root = topology.package_manager_root.resolve()
+    targets: Dict[str, Path] = {}
+    manifests: list[tuple[Path, dict]] = []
+    for manifest_path in topology.workspace_member_manifests:
+        member_root = manifest_path.parent.resolve()
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError, TypeError) as exc:
+            raise RuntimeError(
+                f"WORKSPACE_JUNCTION_MANIFEST_UNREADABLE: {manifest_path}: {exc}"
+            ) from exc
+        if not isinstance(manifest, dict):
+            raise RuntimeError(
+                f"WORKSPACE_JUNCTION_MANIFEST_INVALID: {manifest_path}"
+            )
+        manifests.append((member_root, manifest))
+        package_name = str(manifest.get("name") or "").strip()
+        if package_name:
+            previous = targets.get(package_name)
+            if previous is not None and previous != member_root:
+                raise RuntimeError(
+                    f"WORKSPACE_JUNCTION_DUPLICATE_PACKAGE_NAME: {package_name}: "
+                    f"{previous} and {member_root}"
+                )
+            targets[package_name] = member_root
+
+    # Yarn node-modules can link local packages outside workspace globs.
+    # Their authority must come from an explicit manifest dependency and an
+    # exact internal target, not merely from their node_modules location.
+    for member_root, manifest in manifests:
+        for section in ("dependencies", "devDependencies", "optionalDependencies"):
+            declarations = manifest.get(section)
+            if not isinstance(declarations, dict):
+                continue
+            for dependency_name, raw_spec in declarations.items():
+                if not isinstance(dependency_name, str) or not isinstance(raw_spec, str):
+                    continue
+                protocol, sep, remainder = raw_spec.partition(":")
+                if not sep or protocol not in ("portal", "link", "file"):
+                    continue
+                relative_spec = remainder.split("#", 1)[0].split("?", 1)[0]
+                if not relative_spec or "%" in relative_spec or "\x00" in relative_spec:
+                    continue
+                if relative_spec != "." and not relative_spec.startswith(("./", "../")):
+                    continue
+                candidate = (member_root / relative_spec).resolve()
+                try:
+                    candidate.relative_to(manager_root)
+                except ValueError:
+                    continue
+                package_manifest_path = candidate / "package.json"
+                if not package_manifest_path.is_file():
+                    continue
+                try:
+                    package_manifest = json.loads(
+                        package_manifest_path.read_text(encoding="utf-8-sig")
+                    )
+                except (OSError, ValueError, TypeError) as exc:
+                    raise RuntimeError(
+                        f"WORKSPACE_LOCAL_LINK_MANIFEST_UNREADABLE: "
+                        f"{package_manifest_path}: {exc}"
+                    ) from exc
+                if not isinstance(package_manifest, dict):
+                    continue
+                if package_manifest.get("name") != dependency_name and candidate != member_root:
+                    continue
+                previous = targets.get(dependency_name)
+                if previous is not None and previous != candidate:
+                    raise RuntimeError(
+                        f"WORKSPACE_LOCAL_LINK_AMBIGUOUS_TARGET: {dependency_name}: "
+                        f"{previous} and {candidate}"
+                    )
+                targets[dependency_name] = candidate
+    return targets
+
+
+def _canonical_workspace_reparse_plan(
+    workspace_root: Path,
+    workspace_project: Path,
+) -> tuple[ReparseLink, ...]:
+    if os.name != "nt":
+        return ()
+    workspace_root = workspace_root.resolve()
+    workspace_project = workspace_project.resolve()
+    try:
+        workspace_project.relative_to(workspace_root)
+    except ValueError as exc:
+        raise RuntimeError(
+            "WORKSPACE_JUNCTION_PROJECT_OUTSIDE_ROOT: "
+            f"project={workspace_project}; root={workspace_root}"
+        ) from exc
+    try:
+        preliminary = inventory_reparse_plan(workspace_root)
+        if not preliminary:
+            return ()
+        if not any(item.package_name for item in preliminary):
+            return preliminary
+
+        # The first inventory already proved that every reparse target is
+        # internal and cycle-free. Older code walked the complete prepared
+        # workspace a second time only to attach workspace-package authority.
+        # Validate that authority against the already captured relative targets
+        # instead: same correctness, no second O(tree) traversal.
+        workspace_targets = _workspace_package_targets(workspace_project)
+        validated: list[ReparseLink] = []
+        for item in preliminary:
+            if not item.package_name:
+                validated.append(item)
+                continue
+            expected = workspace_targets.get(item.package_name)
+            if expected is None:
+                raise ReparseMaterializationError(
+                    "REPARSE_UNDECLARED_WORKSPACE_LINK: "
+                    f"{item.link_relative}; package={item.package_name}"
+                )
+            target_path = workspace_root.joinpath(*Path(item.target_relative).parts)
+            try:
+                resolved_target = target_path.resolve(strict=True)
+                resolved_target.relative_to(workspace_root)
+                matches = resolved_target.samefile(expected)
+            except (OSError, ValueError, RuntimeError):
+                matches = False
+            if not matches:
+                raise ReparseMaterializationError(
+                    "REPARSE_WORKSPACE_TARGET_MISMATCH: "
+                    f"{item.link_relative} -> {target_path}; expected={expected}"
+                )
+            validated.append(ReparseLink(
+                item.link_relative,
+                item.target_relative,
+                item.link_kind,
+                "workspace-private-upper",
+                item.package_name,
+            ))
+        return tuple(validated)
+    except ReparseMaterializationError as exc:
+        raise RuntimeError(f"WORKSPACE_REPARSE_PLAN_REJECTED: {exc}") from exc
+
+
+def _workspace_junction_rebase_plan(
+    workspace_root: Path,
+    workspace_project: Path,
+) -> Dict[str, str]:
+    return {
+        item.link_relative: item.target_relative
+        for item in _canonical_workspace_reparse_plan(
+            workspace_root,
+            workspace_project,
+        )
+    }
+
+
+def _remove_reparse_or_tree(path: Path) -> None:
+    if not os.path.lexists(path):
+        return
+    if _is_windows_junction(path):
+        os.rmdir(path)
+        return
+    if path.is_symlink():
+        path.unlink()
+        return
+    if path.is_dir():
+        shutil.rmtree(path)
+        return
+    path.unlink()
+
+
+def _create_windows_junction(link: Path, target: Path) -> None:
+    comspec = os.environ.get("COMSPEC") or shutil.which("cmd.exe")
+    if not comspec:
+        raise RuntimeError(
+            "WORKSPACE_JUNCTION_CREATE_FAILED: cmd.exe unavailable"
+        )
+    link.parent.mkdir(parents=True, exist_ok=True)
+    command = subprocess.list2cmdline(
+        ["mklink", "/J", str(link), str(target)]
+    )
+    result = subprocess.run(
+        [comspec, "/d", "/s", "/c", command],
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=30,
+        check=False,
+    )
+    if result.returncode != 0 or not _is_windows_junction(link):
+        raise RuntimeError(
+            "WORKSPACE_JUNCTION_CREATE_FAILED: "
+            f"{link} -> {target}; exit={result.returncode}; "
+            f"{(result.stdout or '')[-1000:]}"
+        )
+
+
+def _rebase_workspace_junctions(
+    workspace_root: Path,
+    plan: Mapping[str, str],
+) -> None:
+    if os.name != "nt" or not plan:
+        return
+
+    workspace_root = workspace_root.resolve()
+    for link_relative, target_relative in sorted(plan.items()):
+        link = workspace_root.joinpath(
+            *[part for part in link_relative.split("/") if part]
+        )
+        target = workspace_root.joinpath(
+            *[part for part in target_relative.split("/") if part]
+        )
+        try:
+            link.relative_to(workspace_root)
+            target.relative_to(workspace_root)
+        except ValueError as exc:
+            raise RuntimeError(
+                "WORKSPACE_JUNCTION_REBASE_ESCAPE: "
+                f"link={link}; target={target}"
+            ) from exc
+        if not target.is_dir():
+            raise RuntimeError(
+                "WORKSPACE_JUNCTION_REBASE_TARGET_MISSING: "
+                f"{target}"
+            )
+
+        _remove_reparse_or_tree(link)
+        _create_windows_junction(link, target)
+
+        try:
+            rebound = link.resolve(strict=True)
+            matches = rebound.samefile(target)
+        except OSError:
+            matches = False
+        if not matches:
+            raise RuntimeError(
+                "WORKSPACE_JUNCTION_REBASE_VERIFY_FAILED: "
+                f"{link} -> {target}"
+            )
+
+
+def _copy_tree_snapshot(
+    source: Path,
+    target: Path,
+    *,
+    progress: Optional[ProgressCallback] = None,
+    progress_label: str = "prepared snapshot copy",
+    timeout_seconds: int = 1800,
+    progress_interval_seconds: int = 15,
+    reparse_plan: Optional[tuple[ReparseLink, ...]] = None,
+) -> None:
+    """Materialize a proof-safe private tree through the platform backend."""
+    mode = materialize_private_tree(
+        source,
+        target,
+        timeout_seconds=timeout_seconds,
+        progress=progress,
+        progress_label=progress_label,
+        progress_interval_seconds=progress_interval_seconds,
+        # Preserve the verifier-level heartbeat/timeout hook. WorkspaceBackend
+        # still owns platform selection; the caller owns command supervision.
+        runner=_run_snapshot_copy,
+        reparse_plan=reparse_plan,
+    )
+    _emit_progress(
+        progress,
+        f"{progress_label}: materialization backend={mode}",
+    )
+
+
+def _prepared_snapshot_slot(key: str, source_project: Path) -> Tuple[str, str]:
+    return str(key), str(source_project.resolve())
+
+
+def _disable_prepared_snapshot_fastpath(key: str, source_project: Path) -> None:
+    slot = _prepared_snapshot_slot(key, source_project)
+    with _PREPARED_SNAPSHOT_LOCK:
+        _PREPARED_FASTPATH_DISABLED.add(slot)
+
+
+def _prepared_snapshot_fastpath_allowed(key: str, source_project: Path) -> bool:
+    slot = _prepared_snapshot_slot(key, source_project)
+    with _PREPARED_SNAPSHOT_LOCK:
+        return slot not in _PREPARED_FASTPATH_DISABLED
+
+
+def _prepared_command_fastpath_slot(
+    source_project: Path, command: str
+) -> Tuple[str, str]:
+    return str(source_project.resolve()), str(command).strip()
+
+
+def _disable_prepared_command_fastpath(
+    source_project: Path, command: str
+) -> None:
+    slot = _prepared_command_fastpath_slot(source_project, command)
+    with _PREPARED_SNAPSHOT_LOCK:
+        _PREPARED_FASTPATH_COMMAND_DISABLED.add(slot)
+
+
+def _prepared_command_fastpath_allowed(
+    source_project: Path, command: str
+) -> bool:
+    slot = _prepared_command_fastpath_slot(source_project, command)
+    with _PREPARED_SNAPSHOT_LOCK:
+        return slot not in _PREPARED_FASTPATH_COMMAND_DISABLED
+
+
+def _ntfs_fastpath_min_commands() -> int:
+    # Ω removed the O(files) dependency hashing tax. Even one project command
+    # can now profit from the guarded lower path.
+    raw = str(os.environ.get("DEPLOOM_NTFS_FASTPATH_MIN_COMMANDS") or "").strip()
+    if raw:
+        try:
+            return max(1, min(32, int(raw)))
+        except ValueError:
+            pass
+    return 1
+
+
+def _prepared_snapshot_fastpath_worth_sealing(
+    commands: Sequence[str], source_project: Path
+) -> bool:
+    if os.name != "nt":
+        return False
+    eligible = tuple(
+        command
+        for command in commands
+        if _prepared_command_fastpath_allowed(source_project, command)
+    )
+    return len(eligible) >= _ntfs_fastpath_min_commands()
+
+
+def _lookup_prepared_workspace_snapshot(
+    key: str, source_project: Path,
+    *, progress: Optional[ProgressCallback] = None,
+) -> Optional[PreparedWorkspaceSnapshot]:
+    slot = _prepared_snapshot_slot(key, source_project)
+    # A process-local object is never sufficient authority. Another process may
+    # have invalidated the durable index or changed/quarantined its tree since
+    # the previous lookup. Drop the LRU entry first and force the durable loader
+    # to re-read the record, re-hash the complete tree, and verify continuity.
+    with _PREPARED_SNAPSHOT_LOCK:
+        _PREPARED_SNAPSHOTS.pop(slot, None)
+
+    # Cross-process Block V lookup. The locator itself is PRECONDITION_CACHE
+    # only; the caller separately requires an exact PreparationProof HIT before
+    # allowing this tree to skip lifecycle preparation.
+    _emit_progress(progress, "prepared artifact continuity validation started")
+    record = load_prepared_artifact_record(key, source_project, progress=progress)
+    _emit_progress(progress, "prepared artifact continuity validation " + ("HIT" if record else "MISS"))
+    if record is None:
+        return None
+    snapshot = PreparedWorkspaceSnapshot(
+        key=str(record["key"]),
+        workspace_root=Path(record["workspaceRoot"]),
+        project_relative=Path(record["projectRelative"]),
+        source_project=source_project.resolve(),
+        storage_mode=str(record["storageMode"]),
+        observed_resolved_versions=dict(record["observedResolvedVersions"]),
+        observed_resolved_hash=str(record["observedResolvedHash"]),
+        dependency_roots=tuple(
+            str(item) for item in (record.get("dependencyRoots") or ())
+        ),
+        dependency_integrity={},
+        source_closure_content_key=str(record.get("sourceClosureContentKey") or ""),
+        source_closure_entries=tuple(record.get("sourceClosureEntries") or ()),
+    )
+    with _PREPARED_SNAPSHOT_LOCK:
+        _PREPARED_SNAPSHOTS[slot] = snapshot
+    return snapshot
+
+
+def _retire_prepared_workspace_snapshot(snapshot: PreparedWorkspaceSnapshot) -> bool:
+    # Memory-budget eviction must not delete a durable cross-process artifact.
+    if is_durable_prepared_path(snapshot.workspace_root):
+        return True
+    if os.name != "nt":
+        shutil.rmtree(snapshot.workspace_root.parent, ignore_errors=True)
+        return True
+    lease = try_acquire_snapshot_cleanup_lease(snapshot.workspace_root)
+    if lease is None:
+        # A live reader owns the snapshot (or the lease substrate itself is
+        # uncertain). Deleting it would be less safe than leaking a temp tree.
+        return False
+    try:
+        shutil.rmtree(snapshot.workspace_root.parent, ignore_errors=True)
+        return True
+    finally:
+        lease.close()
+
+
+def _evict_prepared_workspace_snapshot(key: str, source_project: Path) -> None:
+    _evict_same_run_private_prepared_snapshot(key, source_project, reason="prepared-artifact-evicted")
+    slot = _prepared_snapshot_slot(key, source_project)
+    unpin_prepared_artifact_record(key)
+    with _PREPARED_SNAPSHOT_LOCK:
+        snapshot = _PREPARED_SNAPSHOTS.pop(slot, None)
+    durable = bool(snapshot is not None and is_durable_prepared_path(snapshot.workspace_root))
+    if snapshot is not None and not durable:
+        _retire_prepared_workspace_snapshot(snapshot)
+    # Eviction is used only when the prepared state became suspect or mismatched.
+    # Remove the durable locator only. Another process may still be reading the
+    # immutable tree; lazy garbage collection is safer than deleting it here.
+    invalidate_prepared_artifact_record(key, remove_tree=False)
+    with _PREPARED_SNAPSHOT_LOCK:
+        _PREPARED_SNAPSHOT_PRODUCERS.pop(slot, None)
+    emit_observability_event(
+        "same-run.prepared-artifact.invalidated",
+        identity=key,
+        sourceProject=str(source_project.resolve()),
+    )
+
+
+def _enforce_prepared_snapshot_budget(protected_slot: Tuple[str, str]) -> None:
+    victims: List[PreparedWorkspaceSnapshot] = []
+    with _PREPARED_SNAPSHOT_LOCK:
+        while len(_PREPARED_SNAPSHOTS) > _PREPARED_SNAPSHOT_MAX_COUNT:
+            slot = next(iter(_PREPARED_SNAPSHOTS))
+            if slot == protected_slot and len(_PREPARED_SNAPSHOTS) > 1:
+                snapshot = _PREPARED_SNAPSHOTS.pop(slot)
+                _PREPARED_SNAPSHOTS[slot] = snapshot
+                slot = next(iter(_PREPARED_SNAPSHOTS))
+            victim = _PREPARED_SNAPSHOTS.pop(slot, None)
+            if victim is not None:
+                victims.append(victim)
+    for victim in victims:
+        _retire_prepared_workspace_snapshot(victim)
+
+
+@contextlib.contextmanager
+def _publish_stage(
+    name: str,
+    *,
+    operation_id: str,
+    progress: Optional[ProgressCallback],
+    progress_label: str,
+    totals: Optional[Mapping[str, object]] = None,
+):
+    """Time one snapshot-publish substage and make it externally visible.
+
+    "zero-copy promotion complete" used to be followed by many minutes of
+    unrelated synchronous work with no output at all. Every substage now
+    reports its own start/finish with a duration, so a slow stage is
+    attributable instead of being an unexplained silence.
+    """
+    started = time.monotonic()
+    emit_observability_event(
+        "snapshot-publish.stage.start",
+        operationId=operation_id,
+        stage=name,
+        **{str(k): v for k, v in (totals or {}).items()},
+    )
+    _emit_progress(progress, f"{progress_label}: {name} started")
+    try:
+        yield
+    finally:
+        duration_ms = max(0, int((time.monotonic() - started) * 1000))
+        emit_observability_event(
+            "snapshot-publish.stage.finish",
+            operationId=operation_id,
+            stage=name,
+            durationMs=duration_ms,
+        )
+        _emit_progress(
+            progress,
+            f"{progress_label}: {name} complete in {duration_ms // 1000}s",
+        )
+
+
+def _publish_prepared_workspace_snapshot(
+    workspace_root: Path,
+    workspace_project: Path,
+    *,
+    key: str,
+    observed_versions: Mapping[str, str],
+    observed_hash: str,
+    source_project: Path,
+    seal_dependency_integrity: bool = True,
+    shared_reuse_allowed: bool = True,
+    publication_root: Optional[Path] = None,
+    progress: Optional[ProgressCallback] = None,
+    progress_label: str = "prepared snapshot publish copy",
+    timeout_seconds: int = 1800,
+    progress_interval_seconds: int = 15,
+) -> PreparedWorkspaceSnapshot:
+    slot = _prepared_snapshot_slot(key, source_project)
+    if shared_reuse_allowed:
+        existing = _lookup_prepared_workspace_snapshot(key, source_project, progress=progress)
+        if existing is not None:
+            return existing
+        root = _prepared_snapshot_root()
+    else:
+        if publication_root is None:
+            raise ValueError("PRIVATE_PREPARED_SNAPSHOT_ROOT_REQUIRED")
+        root = publication_root.resolve()
+        root.mkdir(parents=True, exist_ok=True)
+    stage = Path(tempfile.mkdtemp(prefix=f"{key[:12]}-", dir=root))
+    stage_workspace = stage / "workspace"
+    relative = workspace_project.resolve().relative_to(workspace_root.resolve())
+    storage_mode = "copied-sealed-workspace"
+    publish_operation_id = new_observability_id("snapshot-publish")
+    publish_started = time.monotonic()
+    with _publish_stage(
+        "prepare:reparse-plan",
+        operation_id=publish_operation_id,
+        progress=progress,
+        progress_label=progress_label,
+    ):
+        canonical_reparse_plan = _canonical_workspace_reparse_plan(
+            workspace_root,
+            workspace_project,
+        )
+    junction_rebases = {
+        item.link_relative: item.target_relative
+        for item in canonical_reparse_plan
+    }
+    publication_lease = None
+    try:
+        publication_lease = acquire_snapshot_copy_lease(
+            stage_workspace, timeout_seconds=max(1, timeout_seconds), progress=progress
+        )
+        # On the normal Windows path both directories live under the same temp
+        # volume. Renaming the already-prepared tree publishes the immutable
+        # snapshot in O(metadata), instead of physically copying node_modules.
+        moved = False
+        if os.name == "nt":
+            try:
+                with _publish_stage(
+                    "promotion",
+                    operation_id=publish_operation_id,
+                    progress=progress,
+                    progress_label=progress_label,
+                ):
+                    os.replace(workspace_root, stage_workspace)
+                with _publish_stage(
+                    "tree-index:junction-rebase",
+                    operation_id=publish_operation_id,
+                    progress=progress,
+                    progress_label=progress_label,
+                    totals={"junctions": len(junction_rebases)},
+                ):
+                    _rebase_workspace_junctions(
+                        stage_workspace,
+                        junction_rebases,
+                    )
+                moved = True
+                storage_mode = "moved-sealed-workspace"
+                _emit_progress(
+                    progress,
+                    f"{progress_label}: zero-copy snapshot promotion complete",
+                )
+            except OSError:
+                moved = False
+        if not moved:
+            _copy_tree_snapshot(
+                workspace_root,
+                stage_workspace,
+                progress=progress,
+                progress_label=progress_label,
+                timeout_seconds=timeout_seconds,
+                progress_interval_seconds=progress_interval_seconds,
+                reparse_plan=canonical_reparse_plan,
+            )
+            _rebase_workspace_junctions(
+                stage_workspace,
+                junction_rebases,
+            )
+
+        # Ω: discover only dependency-root topology. Do not read/hash every
+        # dependency payload byte merely to enable the guarded lower.
+        dependency_roots: Tuple[str, ...] = ()
+        dependency_integrity: Mapping[str, str] = {}
+        if os.name == "nt" and seal_dependency_integrity:
+            with _publish_stage(
+                "dependency-lower-discovery",
+                operation_id=publish_operation_id,
+                progress=progress,
+                progress_label=progress_label,
+            ):
+                dependency_roots = dependency_root_manifest(
+                    stage_workspace,
+                    progress=progress,
+                )
+
+        normalized = clean_ephemeral_verification_caches(stage_workspace, dependency_roots)
+        if normalized:
+            _emit_progress(progress, f"{progress_label}: normalized dependency caches before seal: {', '.join(normalized)}")
+            emit_observability_event("verify.preparation.dependency-cache-normalized", removedCaches=list(normalized))
+
+        snapshot = PreparedWorkspaceSnapshot(
+            key=str(key),
+            workspace_root=stage_workspace,
+            project_relative=relative,
+            source_project=source_project.resolve(),
+            storage_mode=storage_mode,
+            observed_resolved_versions=dict(sorted(
+                (str(name), str(version)) for name, version in observed_versions.items()
+            )),
+            observed_resolved_hash=str(observed_hash),
+            dependency_roots=tuple(dependency_roots),
+            dependency_integrity=dict(dependency_integrity),
+        )
+        published = snapshot
+
+        durable_published = False
+        source_closure_receipt: dict[str, object] = {}
+        durable_seal_duration_ms = 0
+        if shared_reuse_allowed and is_durable_prepared_path(published.workspace_root):
+            # This performs a FULL whole-tree content hash of the durable
+            # artifact. Measure ONLY this substage; snapshot copy/rebase/finalize
+            # are reported separately and must not inflate durableSealMsByRole.
+            durable_seal_started = time.monotonic()
+            with _publish_stage(
+                "durable-record:integrity-seal",
+                operation_id=publish_operation_id,
+                progress=progress,
+                progress_label=progress_label,
+            ):
+                durable_published = publish_prepared_artifact_record(
+                    key=published.key,
+                    workspace_root=published.workspace_root,
+                    project_relative=published.project_relative,
+                    source_project=published.source_project,
+                    storage_mode=published.storage_mode,
+                    observed_resolved_versions=published.observed_resolved_versions,
+                    observed_resolved_hash=published.observed_resolved_hash,
+                    dependency_roots=published.dependency_roots,
+                    source_closure_receipt=source_closure_receipt,
+                    reparse_plan=canonical_reparse_plan,
+                    progress=progress,
+                    progress_interval_seconds=progress_interval_seconds,
+                )
+            durable_seal_duration_ms = max(
+                0, int((time.monotonic() - durable_seal_started) * 1000)
+            )
+        if shared_reuse_allowed and is_durable_prepared_path(published.workspace_root) and not durable_published:
+            raise RuntimeError("PREPARED_ARTIFACT_PUBLICATION_REJECTED: " + str(
+                source_closure_receipt.get("publicationError") or "durable integrity evidence unavailable"
+            ))
+        if durable_published:
+            confirmed = dataclasses.replace(
+                published,
+                durable_publication_confirmed=True,
+                durable_seal_duration_ms=durable_seal_duration_ms,
+                source_closure_content_key=str(source_closure_receipt.get("key") or ""),
+                source_closure_entries=tuple(source_closure_receipt.get("entries") or ()),
+            )
+            if shared_reuse_allowed:
+                with _PREPARED_SNAPSHOT_LOCK:
+                    if _PREPARED_SNAPSHOTS.get(slot) is published:
+                        _PREPARED_SNAPSHOTS[slot] = confirmed
+            published = confirmed
+        elif shared_reuse_allowed:
+            with _PREPARED_SNAPSHOT_LOCK:
+                if _PREPARED_SNAPSHOTS.get(slot) is published:
+                    _PREPARED_SNAPSHOTS.pop(slot, None)
+        emit_observability_event(
+            "snapshot-publish.finish",
+            operationId=publish_operation_id,
+            storageMode=storage_mode,
+            durablePublished=bool(durable_published),
+            totalMs=max(0, int((time.monotonic() - publish_started) * 1000)),
+        )
+        if not published.source_closure_content_key:
+            # Private preparation has no durable whole-tree seal; seal its
+            # source subset once before any project clone can consume it.
+            from artifact_integrity import build_artifact_tree_integrity
+            source_integrity = build_artifact_tree_integrity(published.workspace_root, source_only=True,
+                progress=progress, progress_label="prepared source closure integrity",
+                progress_interval_seconds=progress_interval_seconds)
+            published = dataclasses.replace(published, source_closure_content_key=source_integrity.source_content_key,
+                source_closure_entries=source_integrity.source_entries)
+        if shared_reuse_allowed:
+            with _PREPARED_SNAPSHOT_LOCK:
+                _PREPARED_SNAPSHOTS[slot] = published
+        if shared_reuse_allowed:
+            with _publish_stage(
+                "finalize:budget",
+                operation_id=publish_operation_id,
+                progress=progress,
+                progress_label=progress_label,
+            ):
+                _enforce_prepared_snapshot_budget(slot)
+        return published
+    except Exception:
+        shutil.rmtree(stage, ignore_errors=True)
+        raise
+    finally:
+        if publication_lease is not None:
+            publication_lease.close()
+
+
+def _materialize_prepared_workspace_snapshot(
+    snapshot: PreparedWorkspaceSnapshot,
+    target: Path,
+    *,
+    allow_fastpath: bool = True,
+    progress: Optional[ProgressCallback] = None,
+    progress_label: str = "prepared snapshot clone copy",
+    timeout_seconds: int = 1800,
+    progress_interval_seconds: int = 15,
+) -> Path:
+    # Zero-config Windows/NTFS fast path: clone only source/config, then expose
+    # the immutable prepared dependency bytes through junctions guarded by
+    # ReadDirectoryChangesW. Any package-tree notification invalidates this
+    # optimization and is retried through proof-safe private copies.
+    fastpath_allowed = (
+        allow_fastpath
+        and bool(snapshot.dependency_roots)
+        and _prepared_snapshot_fastpath_allowed(
+            snapshot.key,
+            snapshot.source_project,
+        )
+    )
+    if fastpath_allowed:
+        fast = try_materialize_guarded_clone(
+            source_project=snapshot.source_project,
+            prepared_workspace_root=snapshot.workspace_root,
+            project_relative=snapshot.project_relative,
+            target=target,
+            dependency_roots=snapshot.dependency_roots,
+            dependency_integrity=snapshot.dependency_integrity,
+            progress=progress,
+        )
+        if fast is not None:
+            return fast
+    elif progress and allow_fastpath:
+        progress(
+            "NTFS fast clone disabled for this preparation identity after a prior "
+            "shared-tree notification; using proof-safe full copy"
+        )
+
+    copy_lease = acquire_snapshot_copy_lease(
+        snapshot.workspace_root,
+        timeout_seconds=timeout_seconds,
+        progress=progress,
+    ) if os.name == "nt" else None
+    try:
+        # A durable PreparedArtifact record can be retired by background GC
+        # after lookup but before this consumer obtains the reader lease. Once
+        # the lease is held cleanup cannot remove the tree, so re-check the
+        # published root here and fail with a precise substrate error instead
+        # of handing a stale path to robocopy. The caller performs one bounded
+        # exact-identity rebuild; this is never dependency evidence.
+        if not snapshot.workspace_root.is_dir():
+            raise RuntimeError(
+                "PREPARED_SNAPSHOT_RETIRED_DURING_CLONE: "
+                f"{snapshot.workspace_root}"
+            )
+        canonical_reparse_plan = _canonical_workspace_reparse_plan(
+            snapshot.workspace_root,
+            snapshot.workspace_root / snapshot.project_relative,
+        )
+        junction_rebases = {
+            item.link_relative: item.target_relative
+            for item in canonical_reparse_plan
+        }
+        _copy_tree_snapshot(
+            snapshot.workspace_root,
+            target,
+            progress=progress,
+            progress_label=progress_label,
+            timeout_seconds=timeout_seconds,
+            progress_interval_seconds=progress_interval_seconds,
+            reparse_plan=canonical_reparse_plan,
+        )
+        _rebase_workspace_junctions(
+            target,
+            junction_rebases,
+        )
+    finally:
+        if copy_lease is not None:
+            copy_lease.close()
+    project = target / snapshot.project_relative
+    if not project.is_dir():
+        raise RuntimeError(
+            f"PREPARED_SNAPSHOT_PROJECT_MISSING: {snapshot.project_relative}"
+        )
+    return project
+
+
+def _package_manager_cache_environment(
+    config: BaselineVerifyConfig,
+    manager: str,
+) -> Dict[str, str]:
+    """Configure performance-only package caches."""
+    return package_manager_cache_environment(
+        manager=manager,
+        proof_cache_dir=config.proof_cache_dir or None,
+        inherited_environment=os.environ,
+    )
+
+def _git_root_and_relative(project_dir: Path) -> Tuple[Optional[Path], Path]:
+    from git_identity import git_toplevel
+
+    root = git_toplevel(project_dir)
+    if root is None:
+        return None, Path(".")
+    try:
+        return root, Path(project_dir).resolve().relative_to(root)
+    except ValueError:
+        return root, Path(".")
+
+
+
+# BLOCK_X_SOURCE_TRUTH_V1
+def _materialize_workspace(
+    project_dir: Path,
+    target: Path,
+    *,
+    timeout_seconds: int,
+    progress: Optional[ProgressCallback] = None,
+    progress_label: str = "source snapshot materialization",
+    progress_interval_seconds: int = 15,
+) -> Tuple[Path, SourceSnapshot, str]:
+    """Materialize the sealed SourceSnapshot, never reconstruct source via Git."""
+    return materialize_source_for_verification(
+        project_dir,
+        target,
+        timeout_seconds=timeout_seconds,
+        progress=progress,
+        progress_label=progress_label,
+        progress_interval_seconds=progress_interval_seconds,
+    )
+
+
+def _validate_assignment_materialization(
+    project_dir: Path,
+    assignment: Mapping[str, str],
+    *,
+    remove_packages: Iterable[str] = (),
+) -> Dict[str, object]:
+    package_json = project_dir / "package.json"
+    manifest = json.loads(package_json.read_text(encoding="utf-8-sig"))
+    if not isinstance(manifest, dict):
+        raise ValueError(
+            f"ASSIGNMENT_MANIFEST_INVALID: {package_json}: root must be an object"
+        )
+
+    sections = (
+        "dependencies",
+        "devDependencies",
+        "optionalDependencies",
+        "peerDependencies",
+    )
+    removals = {str(name) for name in remove_packages}
+
+    for name in sorted(set(assignment) | removals):
+        declarations: List[Tuple[str, str]] = []
+        for section in sections:
+            deps = manifest.get(section)
+            if isinstance(deps, dict) and name in deps:
+                declarations.append((section, str(deps[name])))
+
+        fixed_declarations = [
+            (section, spec)
+            for section, spec in declarations
+            if is_fixed_manifest_spec(spec)
+        ]
+        managed_declarations = [
+            (section, spec)
+            for section, spec in declarations
+            if not is_fixed_manifest_spec(spec)
+        ]
+
+        if fixed_declarations:
+            detail = ", ".join(
+                f"{section}={spec}" for section, spec in declarations
+            )
+            if managed_declarations:
+                raise AssignmentMaterializationError(
+                    f"ASSIGNMENT_HETEROGENEOUS_SOURCE_CONFLICT: {name}: "
+                    f"fixed and registry declarations cannot be materialized as one exact version; {detail}"
+                )
+            if name in removals:
+                raise AssignmentMaterializationError(
+                    f"ASSIGNMENT_REMOVES_FIXED_INPUT: {name}: fixed declaration is immutable; {detail}"
+                )
+            if name in assignment:
+                raise AssignmentMaterializationError(
+                    f"ASSIGNMENT_TARGETS_FIXED_INPUT: {name}: fixed declaration is immutable; {detail}"
+                )
+
+        if name in assignment and name not in removals and not declarations:
+            raise AssignmentMaterializationError(
+                f"ASSIGNMENT_PACKAGE_NOT_DECLARED: {name} is absent from all direct dependency sections"
+            )
+
+    return manifest
+
+
+def _apply_assignment(
+    project_dir: Path,
+    assignment: Mapping[str, str],
+    *,
+    remove_packages: Iterable[str] = (),
+) -> List[str]:
+    manifest = _validate_assignment_materialization(
+        project_dir,
+        assignment,
+        remove_packages=remove_packages,
+    )
+    changed: List[str] = []
+    sections = (
+        "dependencies",
+        "devDependencies",
+        "optionalDependencies",
+        "peerDependencies",
+    )
+    removals = {str(name) for name in remove_packages}
+
+    for name in sorted(set(assignment) | removals):
+        package_changed = False
+        for section in sections:
+            deps = manifest.get(section)
+            if not isinstance(deps, dict) or name not in deps:
+                continue
+            if name in removals:
+                del deps[name]
+                package_changed = True
+                continue
+            version = assignment[name]
+            if deps[name] != version:
+                deps[name] = version
+                package_changed = True
+        if package_changed:
+            changed.append(name)
+
+    (project_dir / "package.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return changed
+
+OBSERVED_REMOVED = "<removed>"
+OBSERVED_PEER_ONLY = "<peer-only>"
+OBSERVED_OPTIONAL_NOT_INSTALLED = "<optional-not-installed>"
+DIRECT_DEPENDENCY_SECTIONS = (
+    "dependencies",
+    "devDependencies",
+    "optionalDependencies",
+    "peerDependencies",
+)
+
+
+def _within_any_root(path: Path, roots: Iterable[Path]) -> bool:
+    """True when `path` resolves inside one of `roots` (case-insensitive on NT)."""
+    normalized = os.path.normcase(str(path))
+    for root in roots:
+        root_text = os.path.normcase(str(root))
+        if normalized == root_text or normalized.startswith(
+            root_text.rstrip(os.sep) + os.sep
+        ):
+            return True
+    return False
+
+
+def _installed_package_json_path(
+    project_dir: Path,
+    package_name: str,
+    *,
+    package_manager_root: Optional[Path] = None,
+    authorized_roots: Iterable[Path] = (),
+) -> Optional[Path]:
+    """Resolve hoisted packages without escaping the authoritative read set.
+
+    The authoritative read set is the trial root plus any sealed lower root
+    that the Ω guarded-lower plan deliberately mapped into this workspace by
+    junction. Those sealed roots are proof-authoritative but by construction
+    live outside the trial root, so resolving through such a junction is not
+    an escape. Anything resolving outside the whole set still is.
+    """
+    parts = package_name.split("/") if package_name.startswith("@") else [package_name]
+    cursor = project_dir.resolve()
+    boundary = (package_manager_root or project_dir).resolve()
+    try:
+        cursor.relative_to(boundary)
+    except ValueError:
+        raise ObservedResolutionError(
+            f"OBSERVED_RESOLVED_ASSIGNMENT_BOUNDARY_INVALID: project={cursor}, managerRoot={boundary}"
+        )
+    authorized = [boundary, *(Path(item).resolve() for item in authorized_roots)]
+    while True:
+        candidate = cursor.joinpath("node_modules", *parts, "package.json")
+        if candidate.is_file():
+            resolved = candidate.resolve()
+            if not _within_any_root(resolved, authorized):
+                raise ObservedResolutionError(
+                    f"OBSERVED_RESOLVED_ASSIGNMENT_ESCAPE: {package_name}: {candidate} "
+                    f"-> {resolved} is outside the authoritative read set "
+                    f"({', '.join(str(item) for item in authorized)})"
+                )
+            return candidate
+        if cursor == boundary:
+            return None
+        parent = cursor.parent
+        try:
+            parent.relative_to(boundary)
+        except ValueError:
+            return None
+        cursor = parent
+
+
+def _is_exact_assignment_version(target: str) -> bool:
+    try:
+        return str(Version(str(target))) == str(target)
+    except ValueError:
+        return False
+
+
+def _assignment_observation_semantics(config: BaselineVerifyConfig, assignment: Mapping[str, str]) -> str:
+    if (_verification_purpose(config) == "baseline-control"
+            and any(not _is_exact_assignment_version(target) for target in assignment.values())):
+        return "declared-selectors"
+    return "exact"
+
+
+def observed_resolved_assignment(
+    project_dir: Path,
+    assignment: Mapping[str, str],
+    *,
+    remove_packages: Iterable[str] = (),
+    package_manager_root: Optional[Path] = None,
+    authorized_roots: Iterable[Path] = (),
+    allow_declared_selectors: bool = False,
+) -> Dict[str, str]:
+    """Observe the installed assignment; control selectors resolve to exact versions."""
+    try:
+        manifest = json.loads((project_dir / "package.json").read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError, TypeError) as exc:
+        raise ObservedResolutionError(
+            f"OBSERVED_RESOLVED_ASSIGNMENT_MANIFEST_INVALID: {exc}"
+        ) from exc
+
+    removals = {str(name) for name in remove_packages}
+    observed: Dict[str, str] = {}
+    for name, target in sorted((str(k), str(v)) for k, v in assignment.items()):
+        if name in removals:
+            observed[name] = OBSERVED_REMOVED
+            continue
+
+        declared_sections = [
+            section
+            for section in DIRECT_DEPENDENCY_SECTIONS
+            if isinstance(manifest.get(section), dict)
+            and name in manifest[section]
+        ]
+        if not declared_sections:
+            raise ObservedResolutionError(
+                f"OBSERVED_RESOLVED_ASSIGNMENT_UNDECLARED: {name}@{target}"
+            )
+
+        if set(declared_sections) == {"peerDependencies"}:
+            observed[name] = OBSERVED_PEER_ONLY
+            continue
+
+        package_json = _installed_package_json_path(
+            project_dir,
+            name,
+            package_manager_root=package_manager_root,
+            authorized_roots=authorized_roots,
+        )
+        optional_only = (
+            "optionalDependencies" in declared_sections
+            and set(declared_sections).issubset(
+                {"optionalDependencies", "peerDependencies"}
+            )
+        )
+        if package_json is None:
+            if optional_only:
+                observed[name] = OBSERVED_OPTIONAL_NOT_INSTALLED
+                continue
+            raise ObservedResolutionError(
+                f"OBSERVED_RESOLVED_ASSIGNMENT_MISSING: {name}@{target}"
+            )
+
+        try:
+            package = json.loads(package_json.read_text(encoding="utf-8-sig"))
+            version = str(package.get("version") or "").strip()
+        except (OSError, ValueError, TypeError) as exc:
+            raise ObservedResolutionError(
+                f"OBSERVED_RESOLVED_ASSIGNMENT_INVALID: {name}: {exc}"
+            ) from exc
+        matches_target = version == target
+        if not matches_target and allow_declared_selectors and not _is_exact_assignment_version(target):
+            # Control checks start from manifest selectors, not solver-selected
+            # exact versions. Resolve once, then pin observed versions in the
+            # proof hash; lifecycle/project checks still reject any later drift.
+            declarations_match = all(str(manifest[section][name]) == target
+                                     for section in declared_sections)
+            if declarations_match:
+                try:
+                    matches_target = NpmSpec(target).match(Version(version))
+                except ValueError:
+                    # A registry tag has no local semver predicate. The package
+                    # manager resolves it; the resulting exact tree/lock is the
+                    # control subject, never a migration objective.
+                    try:
+                        Version(version)
+                        matches_target = not is_fixed_manifest_spec(target)
+                    except ValueError:
+                        matches_target = False
+        if not matches_target:
+            raise ObservedResolutionError(
+                f"OBSERVED_RESOLVED_ASSIGNMENT_DRIFT: "
+                f"{name} expected={target} observed={version or '<missing-version>'}"
+            )
+        observed[name] = version
+    return dict(sorted(observed.items()))
+
+
+def observed_resolved_hash(observed: Mapping[str, str]) -> str:
+    payload = json.dumps(
+        dict(sorted((str(k), str(v)) for k, v in observed.items())),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _classify_install_failure(output: str) -> str:
+    if INFRA_PATTERNS.search(output):
+        return "infrastructure"
+    if DEPENDENCY_PATTERNS.search(output):
+        return "dependency"
+    # Learning a hard package-version nogood from an unclassified resolver
+    # failure is unsound: auth/proxy/cache/PM-internal failures can look like a
+    # deterministic non-zero exit without being dependency constraints.
+    return "unknown"
+
+
+
+def reap_orphan_verification_trials(
+    parent: Optional[Path], *, max_age_seconds: int = 24 * 60 * 60,
+    max_candidates: int = 4,
+) -> Tuple[int, int]:
+    """Bounded cleanup for old tool-owned trial namespaces only.
+
+    Must never stall trial reuse: retries of already-detached garbage and the
+    dead-owner detach step use only O(1) renames plus a tiny traversal budget.
+    Trees that do not fit the budget are detached, not walked/deleted here.
+    """
+    if parent is None or not parent.is_dir():
+        return 0, 0
+    from verification_storage_maintenance import (
+        bounded_sweep_candidate, clean_retired_trials, dead_trial_owner,
+        _plain_directory, HOT_SWEEP_BYTES, HOT_SWEEP_FILES, HOT_SWEEP_SECONDS,
+    )
+    # Retry already-detached garbage too; failed deletion must not leak forever.
+    # A tiny budget means a multi-thousand-file remnant is deferred, never walked.
+    clean_retired_trials(
+        parent.parent, limit=max_candidates,
+        budget_bytes=HOT_SWEEP_BYTES, budget_files=HOT_SWEEP_FILES,
+        budget_seconds=HOT_SWEEP_SECONDS,
+    )
+    cutoff = time.time() - max(3600, int(max_age_seconds))
+    budget = {
+        "bytes_left": HOT_SWEEP_BYTES, "files_left": HOT_SWEEP_FILES,
+        "deadline": time.monotonic() + HOT_SWEEP_SECONDS,
+    }
+    candidates = 0
+    reclaimed = 0
+    try:
+        entries = sorted(parent.iterdir(), key=lambda item: item.stat().st_mtime)
+    except OSError:
+        return 0, 0
+    for item in entries:
+        if candidates >= max(1, int(max_candidates)):
+            break
+        if not item.is_dir() or not item.name.startswith("dependency-flow-baseline-verify-"):
+            continue
+        if not _plain_directory(item) or not dead_trial_owner(item):
+            continue
+        try:
+            if item.stat().st_mtime > cutoff:
+                continue
+        except OSError:
+            continue
+        candidates += 1
+        try:
+            # O(1) detach first: rename the dead-owner tree into the trash
+            # namespace, keeping the original mtime as the retirement timestamp
+            # so a deferred deletion stays retryable without a full walk.
+            trash = parent / f".deploom-trial-trash-{item.name}-{os.getpid()}-{int(item.stat().st_mtime * 1e9)}"
+            if trash.exists():
+                outcome = bounded_sweep_candidate(trash, budget)
+            else:
+                os.replace(item, trash)
+                outcome = bounded_sweep_candidate(trash, budget)
+        except OSError:
+            outcome = "failed"
+        if outcome == "removed":
+            reclaimed += 1
+    emit_observability_event(
+        "trial.reaper", candidates=candidates, reclaimed=reclaimed,
+        failures=max(0, candidates - reclaimed),
+    )
+    return candidates, reclaimed
+
+def _cleanup_trial_root(
+    path: Path,
+    *,
+    event: Optional[Callable[..., None]] = None,
+    command: str = "",
+    attempts: int = 5,
+) -> bool:
+    """Best-effort bounded cleanup; stale Windows handles never poison next trial."""
+    if not path.exists():
+        return True
+    for attempt in range(1, max(1, int(attempts)) + 1):
+        try:
+            shutil.rmtree(path, ignore_errors=False)
+        except OSError:
+            if attempt < attempts:
+                time.sleep(min(0.5, 0.05 * (2 ** (attempt - 1))))
+                continue
+        if not path.exists():
+            return True
+    if event is not None:
+        event(
+            "verify.workspace.cleanup-deferred",
+            command=command,
+            cleanupPath=str(path),
+            attempts=int(attempts),
+        )
+    return False
+
+
+def _fresh_project_check_root(
+    temp_root: Path,
+    command_index: int,
+    *,
+    event: Optional[Callable[..., None]] = None,
+    command: str = "",
+) -> Path:
+    """Allocate a never-merge target even when Windows defers prior cleanup."""
+    stem = f"project-check-{int(command_index):03d}"
+    for suffix in range(0, 1000):
+        name = stem if suffix == 0 else f"{stem}-{suffix:03d}"
+        candidate = temp_root / name
+        if candidate.exists():
+            _cleanup_trial_root(candidate, event=event, command=command)
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError(f"PROJECT_CHECK_NAMESPACE_EXHAUSTED: {temp_root / stem}")
+
+def verify_assignment(
+    project_dir: Path,
+    assignment: Mapping[str, str],
+    *,
+    config: BaselineVerifyConfig,
+    run_project_checks: bool = False,
+    remove_packages: Iterable[str] = (),
+    progress: Optional[ProgressCallback] = None,
+    progress_label: str = "assignment verification",
+    proof_identity: Optional[VerificationProofIdentity] = None,
+    runtime_env: Optional[Mapping[str, str]] = None,
+    _allow_prepared_fastpath: bool = True,
+) -> BaselineVerifyResult:
+    """Materialize one exact assignment over the sealed SourceSnapshot subject."""
+    project_dir = project_dir.resolve()
+    snapshot = active_source_snapshot(project_dir)
+    preflight_project = snapshot.project_path if snapshot is not None else project_dir
+    attempt_started = time.monotonic()
+    attempt_deadline = (float("inf") if config.unbounded_preparation
+                        else attempt_started + config.attempt_timeout_seconds)
+    base_env = project_verification_environment()
+    if runtime_env:
+        # An EXPLICIT project/CI Node runtime beats ambient PATH exactly where
+        # the runtime is the subject: proof/tool identity and subprocess PATH
+        # must reflect the requested Node, matching what CI would run. The host
+        # ambient runtime remains untouched.
+        base_env = project_verification_environment(runtime_env)
+    remove_packages = tuple(sorted({str(item) for item in remove_packages}))
+    telemetry_path = Path(config.telemetry_path).resolve() if config.telemetry_path else None
+    assignment_hash = assignment_fingerprint(assignment)
+
+    try:
+        _validate_assignment_materialization(
+            preflight_project,
+            assignment,
+            remove_packages=remove_packages,
+        )
+    except AssignmentMaterializationError as exc:
+        return BaselineVerifyResult(False, "unknown", str(exc))
+
+    # Cheap capability/topology preflight before SourceSnapshot copies any large
+    # tree. Authority is recomputed again from the sealed/materialized subject.
+    try:
+        live_topology = resolve_project_topology(
+            preflight_project,
+            allow_discovery=False,
+            require_supported=True,
+        )
+    except ProjectTopologyError as exc:
+        return BaselineVerifyResult(
+            False,
+            "infrastructure",
+            f"PROJECT_TOPOLOGY_UNSUPPORTED: {exc}",
+            workspace=str(project_dir),
+        )
+
+    def event(name: str, **fields: object) -> None:
+        payload = {
+            "projectPath": str(project_dir),
+            "label": progress_label,
+            "assignment": assignment_hash,
+            "elapsedMs": int((time.monotonic() - attempt_started) * 1000),
+            **fields,
+        }
+        if proof_identity is not None:
+            payload.update(proof_identity.event_fields())
+        emit_verification_event(telemetry_path, name, **payload)
+
+    def phase_timeout() -> int:
+        now = time.monotonic()
+        return _clamped_phase_seconds(
+            attempt_remaining_seconds=attempt_deadline - now,
+            budget_remaining_seconds=(
+                config.budget_phase_deadline - now
+                if config.budget_phase_deadline
+                else None
+            ),
+            timeout_seconds=config.timeout_seconds,
+            attempt_timeout_seconds=config.attempt_timeout_seconds,
+            progress_label=progress_label,
+        )
+
+    def snapshot_copy_timeout() -> int:
+        if config.unbounded_preparation and not config.budget_phase_deadline:
+            return 0
+        now = time.monotonic()
+        return _clamped_phase_seconds(
+            attempt_remaining_seconds=attempt_deadline - now,
+            budget_remaining_seconds=(
+                config.budget_phase_deadline - now
+                if config.budget_phase_deadline
+                else None
+            ),
+            timeout_seconds=config.snapshot_copy_timeout_seconds,
+            attempt_timeout_seconds=config.attempt_timeout_seconds,
+            progress_label=progress_label,
+        )
+
+    def phase_progress(phase: str) -> ProgressCallback:
+        return lambda message: _emit_progress(progress, f"{progress_label}: {phase}: {message}")
+
+    _emit_progress(progress, f"{progress_label}: started; attemptHardTimeout={0 if config.unbounded_preparation else config.attempt_timeout_seconds}s")
+    _emit_progress(progress, f"{progress_label}: prepared-artifact cache configure: started")
+    configure_prepared_artifact_store(config.proof_cache_dir or None)
+    _emit_progress(progress, f"{progress_label}: prepared-artifact cache configure: ready; cleanup=background")
+    _emit_progress(progress, f"{progress_label}: verification substrate: {workspace_backend_summary(prepared_snapshot_storage_root())}")
+    _emit_progress(progress, f"{progress_label}: verification storage: {storage_summary()}")
+    trial_parent = verification_trial_parent(config.proof_cache_dir or None)
+    reap_orphan_verification_trials(trial_parent)
+    temp_root = Path(tempfile.mkdtemp(
+        prefix="dependency-flow-baseline-verify-",
+        dir=str(trial_parent) if trial_parent is not None else None,
+    )).resolve()
+    from verification_storage_maintenance import register_trial_owner, retire_trial
+    register_trial_owner(temp_root)
+    source_binding = contextlib.ExitStack()
+    guarded_trial_roots: set[Path] = set()
+    try:
+        workspace_root = temp_root / "repo"
+        workspace_started = time.monotonic()
+        event("verify.workspace.start")
+        try:
+            workspace_project, source_snapshot, source_materialization_method = _materialize_workspace(
+                project_dir,
+                workspace_root,
+                timeout_seconds=snapshot_copy_timeout(),
+                progress=phase_progress("source-materialization"),
+                progress_label="sealed source snapshot materialization",
+                progress_interval_seconds=config.progress_interval_seconds,
+            )
+            # Every fixed/workspace identity probe, including uncached attempts
+            # and internal retries, must consume this exact validated subject.
+            source_binding.enter_context(bind_source_snapshot(source_snapshot))
+            changed = _apply_assignment(
+                workspace_project,
+                assignment,
+                remove_packages=remove_packages,
+            )
+            workspace_topology = resolve_project_topology(
+                workspace_project,
+                allow_discovery=False,
+                require_supported=True,
+            )
+            package_manager_project = workspace_topology.package_manager_root
+            normalized_overrides = normalized_resolver_overrides(
+                config.resolver_overrides
+            )
+            override_path, override_changed = apply_resolver_overrides(
+                package_manager_project,
+                manager=workspace_topology.profile.manager,
+                overrides=normalized_overrides,
+            )
+            if normalized_overrides:
+                override_key = resolver_override_fingerprint(
+                    normalized_overrides,
+                    length=32,
+                )
+                override_label = resolver_override_log_label(
+                    workspace_topology.profile.manager,
+                    normalized_overrides,
+                )
+                event(
+                    "verify.resolver-override.materialized",
+                    resolverOverrideKey=override_key,
+                    resolverOverrides=normalized_overrides,
+                    manifestPath=override_path,
+                    changedPackages=list(override_changed),
+                    manager=workspace_topology.profile.manager,
+                    packageManagerRoot=str(package_manager_project),
+                )
+                _emit_progress(
+                    progress,
+                    f"{progress_label}: resolver override materialized; "
+                    f"{override_label}; overrideKey={override_key[:12]}",
+                )
+            package_manager_relative_to_workspace = package_manager_project.relative_to(workspace_root)
+            project_relative_to_workspace = workspace_project.relative_to(workspace_root)
+            from verification_source_closure import execution_scope
+            execution_context = execution_scope(source_snapshot, project=workspace_project,
+                package_manager_root=package_manager_project, commands=config.commands,
+                materialization=source_materialization_method)
+            execution_context["preparationCwd"] = execution_context.pop("executionCwd")
+            event("verify.source-closure.context", **execution_context)
+            _emit_progress(progress, "VERIFICATION_PREPARATION_SCOPE " + json.dumps(execution_context, ensure_ascii=False, sort_keys=True))
+            event(
+                "verify.workspace.finish",
+                durationMs=int((time.monotonic() - workspace_started) * 1000),
+                changedPackages=len(changed),
+                sourceSnapshotKey=source_snapshot.key,
+                sourceMaterializationMethod=source_materialization_method,
+                sourceFiles=source_snapshot.file_count,
+                sourceBytes=source_snapshot.byte_count,
+            )
+        except ProjectTopologyError as exc:
+            return BaselineVerifyResult(
+                False,
+                "infrastructure",
+                f"PROJECT_TOPOLOGY_UNSUPPORTED: {exc}",
+                workspace=str(workspace_root),
+            )
+        except SourceCaptureError as exc:
+            return BaselineVerifyResult(
+                False, "infrastructure", f"source snapshot preparation failed: {exc}"
+            )
+        except (AssignmentMaterializationError, ResolverOverrideMaterializationError) as exc:
+            # A solver/planner assignment or resolver-control candidate that
+            # cannot be represented by package.json is not package-manager
+            # evidence and must never become a learned dependency nogood.
+            return BaselineVerifyResult(False, "unknown", str(exc))
+        except Exception as exc:  # filesystem/git setup is infrastructure, never a nogood
+            return BaselineVerifyResult(False, "infrastructure", f"workspace preparation failed: {exc}")
+
+        manager = workspace_topology.profile.manager
+        event(
+            "project.topology",
+            topologyKey=workspace_topology.key,
+            manager=manager,
+            managerFamily=workspace_topology.profile.family,
+            nodeLinker=workspace_topology.profile.node_linker,
+            packageRelativeToSource=workspace_topology.package_relative_to_source.as_posix() or ".",
+            packageRelativeToManager=workspace_topology.package_relative_to_manager.as_posix() or ".",
+            workspacePackage=workspace_topology.is_workspace_package,
+            canonicalLockfile=workspace_topology.lockfile.name,
+        )
+        executable = resolve_executable(manager)
+        if not executable:
+            return BaselineVerifyResult(
+                False,
+                "infrastructure",
+                f"INFRA_PACKAGE_MANAGER_NOT_FOUND: {manager} is not available in PATH or known Windows shim locations",
+                command=manager,
+                workspace=str(workspace_project),
+            )
+
+        if workspace_topology.profile.family == "yarn-berry":
+            from yarn_berry import require_runtime_version
+            try:
+                require_runtime_version(workspace_topology.profile, executable, package_manager_project, base_env)
+            except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+                return BaselineVerifyResult(False, "infrastructure", str(exc), workspace=str(workspace_project))
+
+        if proof_identity is None:
+            proof_identity = build_verification_proof_identity(
+                source_snapshot.project_path,
+                assignment=assignment,
+                remove_packages=tuple(sorted(str(item) for item in remove_packages)),
+                resolver_overrides=config.resolver_overrides,
+                manager=manager,
+                manager_executable=executable,
+                registry=config.registry,
+                project_checks=config.project_checks if run_project_checks else "off",
+                commands=config.commands if run_project_checks else (),
+                environment=base_env,
+                source_snapshot_key=source_snapshot.key,
+                assignment_semantics=_assignment_observation_semantics(config, assignment),
+            )
+        elif proof_identity.source_snapshot_key != source_snapshot.key:
+            return BaselineVerifyResult(
+                False,
+                "unknown",
+                "SOURCE_IDENTITY_MISMATCH: supplied proof identity does not match "
+                f"sealed SourceSnapshot; proof={proof_identity.source_snapshot_key} "
+                f"snapshot={source_snapshot.key}",
+                workspace=str(workspace_project),
+            )
+        event("proof.identity", manager=manager, sourceSnapshotKey=source_snapshot.key)
+
+        from verification_proof import fixed_resolver_input_identity
+        from verification_identity_diagnostics import identity_component_diff, safe_identity_error
+        try:
+            expected_fixed_identity = fixed_resolver_input_identity(source_snapshot.project_path, manager=manager)
+            expected_remote_identity = fixed_resolver_input_identity(source_snapshot.project_path, manager=manager, remote_only=True)
+        except (SourceIdentityUnavailable, OSError, ValueError) as exc:
+            return BaselineVerifyResult(False, "unknown", "FIXED_SOURCE_IDENTITY_UNAVAILABLE_BEFORE_RESOLVER: " + safe_identity_error(exc))
+
+        def fixed_source_identity_gate(stage: str) -> Optional[BaselineVerifyResult]:
+            try:
+                # The complete identity is rebound to the original checkout.
+                # Local/workspace paths are intentionally not re-identified
+                # from the temporary assignment clone.
+                current_fixed_identity = fixed_resolver_input_identity(source_snapshot.project_path, manager=manager)
+                current_remote_identity = fixed_resolver_input_identity(workspace_project, manager=manager, remote_only=True)
+                current_source_fixed_key = current_fixed_identity["key"]
+                expected_remote_key = expected_remote_identity["key"]
+                observed_remote_key = current_remote_identity["key"]
+            except (SourceIdentityUnavailable, OSError, ValueError) as exc:
+                event(
+                    "verify.fixed-source.identity-unavailable",
+                    stage=stage,
+                    detail=safe_identity_error(exc),
+                )
+                return BaselineVerifyResult(
+                    False,
+                    "unknown",
+                    f"FIXED_SOURCE_IDENTITY_UNAVAILABLE_DURING_{stage.upper()}: {safe_identity_error(exc)}",
+                    workspace=str(workspace_project),
+                )
+            expected_fixed_key = proof_identity.fixed_resolver_inputs_key
+            if (
+                current_source_fixed_key == expected_fixed_key
+                and observed_remote_key == expected_remote_key
+            ):
+                return None
+            identity_changes = {
+                "fixedInputs": identity_component_diff(expected_fixed_identity, current_fixed_identity),
+                "remoteInputs": identity_component_diff(expected_remote_identity, current_remote_identity),
+                "expectedComponentEvidenceMatchesProof": expected_fixed_identity["key"] == expected_fixed_key,
+            }
+            event(
+                "verify.fixed-source.identity-drift",
+                identityChanges=identity_changes,
+                stage=stage,
+                expectedFixedResolverInputsKey=expected_fixed_key,
+                observedFixedResolverInputsKey=current_source_fixed_key,
+                expectedRemoteFixedResolverInputsKey=expected_remote_key,
+                observedRemoteFixedResolverInputsKey=observed_remote_key,
+            )
+            return BaselineVerifyResult(
+                False,
+                "unknown",
+                "FIXED_SOURCE_IDENTITY_DRIFT_DURING_" + stage.upper() + ": "
+                + f"expected={expected_fixed_key} observed={current_source_fixed_key} "
+                + f"remoteExpected={expected_remote_key} remoteObserved={observed_remote_key}; "
+                + "identityChanges=" + json.dumps(identity_changes, sort_keys=True),
+                workspace=str(workspace_project),
+            )
+
+        proof_store = VerificationProofStore(
+            Path(config.proof_cache_dir) if config.proof_cache_dir else None
+        )
+
+        stage_journal = None
+        if config.recovery_checkpoints and proof_store.root is not None:
+            from verification_stage_checkpoint import StageJournal, digest as checkpoint_digest
+            stage_journal = StageJournal(
+                config.recovery_journal_dir or (proof_store.root / "stage-checkpoints"),
+                {"toolBuildId": proof_identity.tool_build_id, "sourceSnapshotKey": source_snapshot.key,
+                 "resolverInputKey": proof_identity.resolver_input_key, "assignmentKey": proof_identity.assignment_key,
+                 "environmentHash": checkpoint_digest(base_env)})
+            stage_journal.write("source-sealed", "PASS", {"container": str(source_snapshot.container), "key": source_snapshot.key})
+
+        resolved_state: Optional[ResolvedDependencyState] = None
+
+        # BLOCK_PSI57_YARN1_RESOLVER_SEED_V1
+        # A resolver seed is same-run PERFORMANCE_ONLY state. It can influence
+        # filesystem preparation cost, never Resolver/Preparation/ProjectProof
+        # or Solver authority. The full scripts-enabled frozen Yarn install below
+        # remains the lifecycle authority even on a seed HIT.
+        resolver_seed_store = same_run_resolver_seed_store()
+        resolver_seed_capability = resolver_seed_continuation_capability(
+            workspace_topology.profile
+        )
+        if workspace_topology.profile.family == "yarn-berry":
+            resolver_seed_runtime_version = workspace_topology.profile.declared_version
+            resolver_seed_runtime_ok = os.name == "nt"  # Same-run watcher continuity is Windows-only.
+        elif resolver_seed_capability.supported:
+            (
+                resolver_seed_runtime_ok,
+                resolver_seed_runtime_version,
+            ) = yarn1_resolver_seed_runtime_supported(executable)
+        else:
+            resolver_seed_runtime_ok = False
+            resolver_seed_runtime_version = ""
+        resolver_seed_enabled = bool(
+            resolver_seed_capability.supported and resolver_seed_runtime_ok
+        )
+        resolver_seed_key = ""
+        resolver_seed_used = False
+        event(
+            "resolver-seed.runtime-capability",
+            managerFamily=workspace_topology.profile.family,
+            supported=resolver_seed_enabled,
+            profileSupported=resolver_seed_capability.supported,
+            strategy=resolver_seed_capability.strategy,
+            runtimeVersion=resolver_seed_runtime_version,
+            certifiedRuntime=(
+                resolver_seed_runtime_version if resolver_seed_runtime_ok else ""
+            ),
+            authority=RESOLVER_SEED_AUTHORITY,
+        )
+        # BLOCK_PSI57_YARN1_RESOLVER_SEED_END
+
+        def publish_pass(
+            proof_type: str,
+            key: str,
+            observed_versions: Mapping[str, str],
+            observed_hash: str,
+            *,
+            extra_metadata: Optional[Mapping[str, object]] = None,
+        ) -> None:
+            metadata: Dict[str, object] = {
+                "observedResolvedVersions": dict(sorted(observed_versions.items())),
+                "observedResolvedHash": observed_hash,
+            }
+            if extra_metadata:
+                metadata.update(dict(extra_metadata))
+            if proof_store.publish_pass(
+                proof_type, key, proof_identity, metadata=metadata
+            ):
+                event(
+                    "proof.cache.publish",
+                    proofType=proof_type,
+                    cacheKey=key,
+                    observedResolvedHash=observed_hash,
+                    resolvedStateKey=proof_identity.resolved_state_key,
+                )
+
+        install = install_args_for_profile(
+            workspace_topology.profile,
+            ignore_scripts=True,
+            frozen=False,
+        )
+        argv, _ = _command_prefix(executable, install)
+        install_env = {
+            "CI": "1",
+            "YARN_ENABLE_IMMUTABLE_INSTALLS": "false",
+            "YARN_ENABLE_SCRIPTS": "false",
+            "npm_config_ignore_scripts": "true",
+        }
+        install_env.update(_package_manager_cache_environment(config, manager))
+        if workspace_topology.profile.family == "yarn-berry":
+            install_env["YARN_ENABLE_SCRIPTS"] = "true"  # skip-build suppresses execution without changing install artifacts
+            if config.registry:
+                install_env["YARN_NPM_REGISTRY_SERVER"] = config.registry
+        # Recovery may reuse a durable ResolverProof only when the Desktop
+        # explicitly marks this command as a Continue/transient-retry replay.
+        # A normal fresh Baseline still performs fresh resolver work unless its
+        # caller supplies the legacy exact reuse key. The stored ResolvedState
+        # is content-addressed and validated again before the HIT is accepted.
+        recovery_reuse = str(
+            os.environ.get("DEPLOOM_BASELINE_RECOVERY_PROOF_REUSE") or ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        resolver_reuse_key = (
+            config.reuse_resolver_proof_key
+            or (proof_identity.resolver_input_key if recovery_reuse or config.recovery_checkpoints else "")
+        )
+        resolver_reuse_cache_operation_id = ""
+        if resolver_reuse_key:
+            resolver_reuse_cache_operation_id = new_observability_id("cache")
+            event(
+                "proof.cache.lookup",
+                proofType="resolver",
+                cacheKey=resolver_reuse_key,
+                cacheOperationId=resolver_reuse_cache_operation_id,
+                reuseLookup=True,
+                recoveryReuse=recovery_reuse,
+            )
+            resolver_record = proof_store.lookup_pass(
+                "resolver", resolver_reuse_key
+            )
+            if resolver_record is None:
+                event(
+                    "proof.cache.miss",
+                    proofType="resolver",
+                    cacheKey=resolver_reuse_key,
+                    cacheOperationId=resolver_reuse_cache_operation_id,
+                    reuseLookup=True,
+                    recoveryReuse=recovery_reuse,
+                )
+        else:
+            resolver_record = None
+        resolver_reused = bool(
+            resolver_record is not None
+            and resolver_reuse_key == proof_identity.resolver_input_key
+        )
+        observed_versions: Dict[str, str] = {}
+        observed_hash = ""
+        resolver_publication_allowed = False
+
+        if resolver_reused and resolver_record is not None:
+            resolved_state = load_resolved_dependency_state(
+                resolver_record.metadata,
+                proof_cache_dir=proof_store.root,
+            )
+            if resolved_state is None:
+                resolver_reused = False
+                resolver_record = None
+                event(
+                    "proof.cache.rejected",
+                    proofType="resolver",
+                    cacheKey=proof_identity.resolver_input_key,
+                    cacheOperationId=resolver_reuse_cache_operation_id,
+                    reason="resolved-state-artifact-invalid-or-missing",
+                )
+            else:
+                observed_versions = {
+                    str(name): str(version)
+                    for name, version in dict(
+                        resolver_record.metadata.get("observedResolvedVersions") or {}
+                    ).items()
+                }
+                observed_hash = str(
+                    resolver_record.metadata.get("observedResolvedHash") or ""
+                )
+                proof_identity = bind_resolved_state_identity(
+                    proof_identity,
+                    resolved_state.key,
+                    project_checks=config.project_checks if run_project_checks else "off",
+                    commands=config.commands if run_project_checks else (),
+                )
+                try:
+                    restore_resolved_dependency_state(workspace_project, resolved_state)
+                except ResolvedDependencyStateError as exc:
+                    return BaselineVerifyResult(
+                        False, "unknown", str(exc), workspace=str(workspace_project)
+                    )
+
+        if resolver_reused:
+            event(
+                "verify.resolver.skipped",
+                operationId=new_observability_id("resolver-skip"),
+                reason="resolver-proof-restored-for-project-verification",
+                resolverInputKey=proof_identity.resolver_input_key,
+            )
+            event(
+                "proof.cache.hit",
+                proofType="resolver",
+                cacheKey=proof_identity.resolver_input_key,
+                cacheOperationId=resolver_reuse_cache_operation_id,
+                reuseMode="restore-exact-resolved-state-then-frozen-lifecycle",
+            )
+            _emit_progress(
+                progress,
+                f"{progress_label}: ResolverProof HIT; exact proven lockfile restored. "
+                "Fresh lifecycle remains frozen and authoritative.",
+            )
+            if run_project_checks and config.commands:
+                seed_capability = resolver_seed_capability
+                seed_capability_reason = (
+                    seed_capability.reason
+                    if resolver_seed_runtime_ok or not seed_capability.supported
+                    else (
+                        "YARN1_RESOLVER_SEED_RUNTIME_UNCERTIFIED: "
+                        f"observed={resolver_seed_runtime_version or '<unknown>'}; "
+                        "ordinary frozen lifecycle remains authoritative"
+                    )
+                )
+                event(
+                    "resolver-seed.capability",
+                    managerFamily=seed_capability.manager_family,
+                    supported=resolver_seed_enabled,
+                    strategy=seed_capability.strategy,
+                    reason=seed_capability_reason,
+                    runtimeVersion=resolver_seed_runtime_version,
+                    logicalOnlyResolutionSupported=(
+                        logical_resolution_without_materialization_supported(
+                            workspace_topology.profile
+                        )
+                    ),
+                    authority=RESOLVER_SEED_AUTHORITY,
+                )
+                if not resolver_seed_enabled:
+                    event(
+                        "resolver-seed.continuation.unsupported",
+                        operationId=new_observability_id(
+                            "resolver-seed-unsupported"
+                        ),
+                        managerFamily=seed_capability.manager_family,
+                        reason=seed_capability_reason,
+                        runtimeVersion=resolver_seed_runtime_version,
+                        authority=RESOLVER_SEED_AUTHORITY,
+                    )
+                    _emit_progress(
+                        progress,
+                        f"{progress_label}: "
+                        "PSI57_RESOLVER_SEED_CONTINUATION_UNAVAILABLE; "
+                        f"{seed_capability_reason}",
+                    )
+        else:
+            if stage_journal:
+                stage_journal.write("resolver-install", "RUNNING")
+            resolver_started = time.monotonic()
+            resolver_operation_id = new_observability_id("resolver-process")
+            event(
+                "verify.resolver.start",
+                operationId=resolver_operation_id,
+                command=" ".join(argv),
+                verificationPurpose=_verification_purpose(config),
+            )
+            try:
+                result = _run_preparation_install(
+                    argv,
+                    package_manager_project,
+                    config=config, timeout_factory=phase_timeout,
+                    env=install_env,
+                    base_env=base_env,
+                    progress=phase_progress("resolver-install"),
+                    progress_label="package-manager resolver install",
+                    progress_interval_seconds=config.progress_interval_seconds,
+                )
+            except BaselineCandidateBudgetExceeded as exc:
+                return BaselineVerifyResult(
+                    False, "budget", str(exc), command=" ".join(argv)
+                )
+            except subprocess.TimeoutExpired as exc:
+                if _budget_deadline_hit(config):
+                    return BaselineVerifyResult(
+                        False, "budget",
+                        f"BASELINE_BUDGET_EXHAUSTED: resolver-install: the wall-clock budget was reached while the package manager was still running: {exc}",
+                        command=" ".join(argv),
+                    )
+                return BaselineVerifyResult(False, "infrastructure", f"package-manager verification timed out: {exc}", command=" ".join(argv), output=_process_failure_output(exc), workspace=str(workspace_project))
+            except OSError as exc:
+                return BaselineVerifyResult(False, "infrastructure", f"package-manager launch failed: {exc}", command=" ".join(argv))
+
+            resolver_publication_allowed = _durable_proof_publication_allowed(result)
+            output = result.stdout or ""
+            kind = (
+                "passed"
+                if result.returncode == 0
+                else (
+                    "infrastructure"
+                    if bool(getattr(result, "deploom_infra_detected", False))
+                    else _classify_install_failure(output)
+                )
+            )
+            if kind != "passed":
+                emit_observability_event(
+                    "verify.failure-classification",
+                    phase="resolver",
+                    authoritativeSource=(
+                        "substrate" if kind == "infrastructure" else "dep-parser"
+                    ),
+                    kind=kind,
+                )
+            event(
+                "verify.resolver.finish",
+                operationId=resolver_operation_id,
+                durationMs=int((time.monotonic() - resolver_started) * 1000),
+                exitCode=result.returncode,
+                outcome=kind,
+                verificationPurpose=_verification_purpose(config),
+            )
+            if result.returncode != 0:
+                tail = "\n".join(output.splitlines()[-80:])
+                return BaselineVerifyResult(
+                    False,
+                    kind,
+                    f"{manager} resolver preflight failed for {len(changed)} changed direct package(s)",
+                    command=" ".join(argv),
+                    output=tail,
+                    workspace=str(workspace_project),
+                )
+
+        fixed_identity_result = fixed_source_identity_gate("resolver")
+        if fixed_identity_result is not None:
+            return fixed_identity_result
+
+        try:
+            materialized_manifest = json.loads((workspace_project / "package.json").read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError, TypeError) as exc:
+            return BaselineVerifyResult(False, "unknown", f"ASSIGNMENT_MANIFEST_UNREADABLE: {exc}")
+        removal_names = set(remove_packages)
+        for expected_name, expected_version in sorted(assignment.items()):
+            declared_versions = []
+            for section in ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies"):
+                values = materialized_manifest.get(section)
+                if isinstance(values, dict) and expected_name in values:
+                    declared_versions.append(str(values[expected_name]))
+            if expected_name in removal_names:
+                if declared_versions:
+                    return BaselineVerifyResult(
+                        False,
+                        "unknown",
+                        f"ASSIGNMENT_MANIFEST_DRIFT: {expected_name} was proven for removal but remains declared as {declared_versions!r}",
+                        workspace=str(workspace_project),
+                    )
+                continue
+            if not declared_versions or any(value != expected_version for value in declared_versions):
+                return BaselineVerifyResult(
+                    False,
+                    "unknown",
+                    f"ASSIGNMENT_MANIFEST_DRIFT: {expected_name} expected {expected_version!r}, "
+                    f"observed {declared_versions!r}",
+                    workspace=str(workspace_project),
+                )
+
+        if not resolver_reused:
+            try:
+                observed_versions = observed_resolved_assignment(
+                    workspace_project,
+                    assignment,
+                    remove_packages=remove_packages,
+                    package_manager_root=package_manager_project,
+                    allow_declared_selectors=_verification_purpose(config) == "baseline-control",
+                )
+                observed_hash = observed_resolved_hash(observed_versions)
+            except ObservedResolutionError as exc:
+                event("verify.resolver.observed-drift", outcome="unknown", detail=str(exc))
+                return BaselineVerifyResult(
+                    False, "unknown", str(exc), workspace=str(workspace_project)
+                )
+            resolved_state_capture_started = time.monotonic()
+            resolved_state_capture_operation_id = new_observability_id(
+                "resolved-state-capture"
+            )
+            event(
+                "verify.resolved-state.capture.start",
+                operationId=resolved_state_capture_operation_id,
+                resolverInputKey=proof_identity.resolver_input_key,
+            )
+            try:
+                resolved_state = capture_resolved_dependency_state(
+                    workspace_project,
+                    manager=manager,
+                    resolver_input_key=proof_identity.resolver_input_key,
+                    observed_resolved_hash=observed_hash,
+                    proof_cache_dir=proof_store.root,
+                )
+            except ResolvedDependencyStateError as exc:
+                event(
+                    "verify.resolved-state.capture.finish",
+                    operationId=resolved_state_capture_operation_id,
+                    durationMs=int(
+                        (time.monotonic() - resolved_state_capture_started) * 1000
+                    ),
+                    outcome="failed",
+                    errorType=type(exc).__name__,
+                )
+                return BaselineVerifyResult(
+                    False,
+                    "unknown",
+                    str(exc),
+                    workspace=str(workspace_project),
+                )
+            event(
+                "verify.resolved-state.capture.finish",
+                operationId=resolved_state_capture_operation_id,
+                durationMs=int(
+                    (time.monotonic() - resolved_state_capture_started) * 1000
+                ),
+                outcome="passed",
+                resolvedStateKey=resolved_state.key,
+            )
+            proof_identity = bind_resolved_state_identity(
+                proof_identity,
+                resolved_state.key,
+                project_checks=config.project_checks if run_project_checks else "off",
+                commands=config.commands if run_project_checks else (),
+            )
+            if resolver_publication_allowed:
+                publish_pass(
+                    "resolver",
+                    proof_identity.resolver_input_key,
+                    observed_versions,
+                    observed_hash,
+                    extra_metadata=resolved_state_metadata(resolved_state),
+                )
+            else:
+                event(
+                    "proof.cache.publish-skipped",
+                    proofType="resolver",
+                    cacheKey=proof_identity.resolver_input_key,
+                    reason="process-tree-supervision-not-guaranteed",
+                )
+            if stage_journal and resolver_publication_allowed:
+                stage_journal.write("resolver-install", "PASS", resolved_state_metadata(resolved_state))
+            event(
+                "verify.resolved-state.captured",
+                resolvedStateKey=resolved_state.key,
+                lockfilePath=resolved_state.lockfile_path,
+                lockfileHash=resolved_state.lockfile_hash,
+            )
+
+            # BLOCK_PSI58_RESOLVER_SEED_ECONOMICS_V1
+            # Publish only at a real resolver -> later lifecycle boundary.
+            # A fresh resolver inside a project-check attempt continues directly
+            # into lifecycle in the same workspace and must not pay for a copy.
+            seed_publication = resolver_seed_publication_decision(
+                capability_enabled=resolver_seed_enabled,
+                fresh_resolver=True,
+                run_project_checks=run_project_checks,
+                publication_hint=config.resolver_seed_publication_hint,
+                verification_purpose=_verification_purpose(config),
+            )
+            if seed_publication.publish:
+                resolver_seed_key = resolver_seed_identity(
+                    resolver_input_key=proof_identity.resolver_input_key,
+                    resolved_state_key=resolved_state.key,
+                    observed_resolved_hash=observed_hash,
+                    manager_family=workspace_topology.profile.family,
+                )
+                seed_publish_started = time.monotonic()
+                try:
+                    seed_published = resolver_seed_store.publish(
+                        key=resolver_seed_key,
+                        source_workspace_root=workspace_root,
+                        project_relative=project_relative_to_workspace,
+                        package_manager_relative=package_manager_relative_to_workspace,
+                        source_project=project_dir,
+                        resolved_state_key=resolved_state.key,
+                        observed_resolved_hash=observed_hash,
+                        parent=trial_parent,
+                        timeout_seconds=snapshot_copy_timeout(),
+                        progress=phase_progress("resolver-seed-publish"),
+                        progress_label=f"{progress_label}: resolver seed publish",
+                        producer=progress_label,
+                        manager_family=workspace_topology.profile.family,
+                    )
+                except Exception as exc:
+                    failed_publish_ms = int(
+                        (time.monotonic() - seed_publish_started) * 1000
+                    )
+                    event(
+                        "resolver-seed.publish-failed",
+                        seedKey=resolver_seed_key,
+                        reason=f"publication-error:{type(exc).__name__}:{exc}",
+                        durationMs=failed_publish_ms,
+                        publicationHint=config.resolver_seed_publication_hint,
+                        authority=RESOLVER_SEED_AUTHORITY,
+                    )
+                    _emit_progress(
+                        progress,
+                        f"{progress_label}: Ψ.5.8 ResolverSeed bridge publication "
+                        f"skipped ({type(exc).__name__}: {exc}); proof flow unchanged",
+                    )
+                else:
+                    publish_ms = int((time.monotonic() - seed_publish_started) * 1000)
+                    event(
+                        "resolver-seed.published",
+                        seedKey=resolver_seed_key,
+                        resolvedStateKey=resolved_state.key,
+                        observedResolvedHash=observed_hash,
+                        published=bool(seed_published),
+                        durationMs=publish_ms,
+                        reason=seed_publication.reason,
+                        publicationHint=config.resolver_seed_publication_hint,
+                        strategy=resolver_seed_capability.strategy,
+                        authority=RESOLVER_SEED_AUTHORITY,
+                    )
+                    _emit_progress(
+                        progress,
+                        f"{progress_label}: Ψ.5.8 ResolverSeed bridge published; "
+                        f"seed={resolver_seed_key[:12]}; publishMs={publish_ms}; "
+                        "authority=PERFORMANCE_ONLY",
+                    )
+            elif config.resolver_seed_publication_hint:
+                event(
+                    "resolver-seed.publish-skipped",
+                    reason=seed_publication.reason,
+                    publicationHint=config.resolver_seed_publication_hint,
+                    runProjectChecks=run_project_checks,
+                    authority=RESOLVER_SEED_AUTHORITY,
+                )
+        elif not observed_hash or resolved_state is None:
+            return BaselineVerifyResult(
+                False,
+                "unknown",
+                "RESOLVED_STATE_PROOF_MISSING: reused ResolverProof has no exact resolved state",
+                workspace=str(workspace_project),
+            )
+
+        if run_project_checks and config.project_checks != "off" and config.commands:
+            # Ω guarded lower needs only dependency-root topology, not an O(files)
+            # integrity seal. Durable PreparedArtifacts are eligible because the
+            # cross-process snapshot lease serializes every shared consumer.
+            preparation_fastpath_enabled = (
+                _allow_prepared_fastpath
+                and _prepared_snapshot_fastpath_worth_sealing(
+                    config.commands,
+                    project_dir,
+                )
+            )
+            # Durable filesystem bytes never become authority by themselves.
+            # Cross-process reuse is enabled only when the existing exact proof
+            # store independently confirms the same PreparationProofKey.
+            preparation_cache_operation_id = new_observability_id("cache")
+            event(
+                "proof.cache.lookup",
+                proofType="preparation",
+                cacheKey=proof_identity.preparation_proof_key,
+                cacheOperationId=preparation_cache_operation_id,
+            )
+            preparation_record = proof_store.lookup_pass(
+                "preparation", proof_identity.preparation_proof_key
+            )
+            event(
+                "proof.cache.hit" if preparation_record is not None else "proof.cache.miss",
+                proofType="preparation",
+                cacheKey=proof_identity.preparation_proof_key,
+                cacheOperationId=preparation_cache_operation_id,
+            )
+            private_snapshot: Optional[PreparedWorkspaceSnapshot] = None
+            private_producer: Optional[str] = None
+            private_claim_reason = "proof-missing"
+            if preparation_record is not None:
+                private_snapshot, private_producer, private_claim_reason = _claim_same_run_private_prepared_snapshot(
+                    proof_identity.preparation_proof_key, project_dir
+                )
+                if private_snapshot is None and private_claim_reason not in {"missing", "busy"}:
+                    event("same-run.private-prepared.invalidated", identity=proof_identity.preparation_proof_key, consumer=progress_label, originalProducer=str(private_producer or ""), reason=private_claim_reason)
+            snapshot_is_private = private_snapshot is not None
+            snapshot = private_snapshot
+            if snapshot is None and preparation_record is not None:
+                durable_lookup_allowed = True
+                if (
+                    _verification_purpose(config) == "baseline-control"
+                    and not config.recovery_checkpoints
+                    and not _persistent_control_cross_run_enabled()
+                ):
+                    durable_lookup_allowed = False
+                    event(
+                        "persistent-control.prepared.cold-skip",
+                        operationId=new_observability_id(
+                            "persistent-control-cold-skip"
+                        ),
+                        reason="same-run-only-default",
+                        preparationProofKey=proof_identity.preparation_proof_key,
+                    )
+                    _emit_progress(
+                        progress,
+                        f"{progress_label}: "
+                        "PSI41_PERSISTENT_CONTROL_COLD_REUSE_SKIPPED; "
+                        "cross-run full-hash is disabled until benchmarked cheaper "
+                        "than fresh preparation; same-run private reuse remains enabled",
+                    )
+                if durable_lookup_allowed:
+                    snapshot = _lookup_prepared_workspace_snapshot(
+                        proof_identity.preparation_proof_key,
+                        project_dir,
+                        progress=progress,
+                    )
+            if snapshot is not None and snapshot.observed_resolved_hash != observed_hash:
+                event(
+                    "verify.preparation.snapshot-rejected",
+                    reason="observed-resolved-hash-mismatch",
+                    snapshotObservedHash=snapshot.observed_resolved_hash,
+                    resolverObservedHash=observed_hash,
+                )
+                _evict_prepared_workspace_snapshot(
+                    proof_identity.preparation_proof_key, project_dir
+                )
+                snapshot = None
+
+            if snapshot is not None:
+                producer = private_producer if snapshot_is_private else _PREPARED_SNAPSHOT_PRODUCERS.get(
+                    _prepared_snapshot_slot(proof_identity.preparation_proof_key, project_dir)
+                )
+                event("verify.preparation.snapshot-hit", preparationProofKey=proof_identity.preparation_proof_key, observedResolvedHash=observed_hash, storageTier="same-run-private" if snapshot_is_private else "durable")
+                if snapshot_is_private:
+                    event(
+                        "same-run.prepared-artifact.hit",
+                        operationId=new_observability_id("private-prepared-hit"),
+                        marker="PSI3_SAME_RUN_PRIVATE_PREPARED_HIT",
+                        identity=proof_identity.preparation_proof_key,
+                        consumer=progress_label,
+                        originalProducer=str(producer or ""),
+                        lifecycleInstallAvoided=True,
+                        integritySealAvoided=True,
+                        storageTier="same-run-private",
+                    )
+                    _emit_progress(progress, f"{progress_label}: Ψ.3 same-run private PreparedArtifact HIT; lifecycle replay and durable seal skipped; fresh project-check clone still required")
+                elif producer is not None:
+                    pin_prepared_artifact_record(proof_identity.preparation_proof_key)
+                    event("same-run.prepared-artifact.hit", marker="SAME_RUN_PREPARED_ARTIFACT_HIT", identity=proof_identity.preparation_proof_key, consumer=progress_label, originalProducer=producer, lifecycleInstallAvoided=True, integritySealAvoided=True, storageTier="durable")
+                if not snapshot_is_private:
+                    if _verification_purpose(config) == "baseline-control":
+                        event(
+                            "persistent-control.prepared.hit",
+                            operationId=new_observability_id(
+                                "persistent-control-hit"
+                            ),
+                            marker="PSI4_PERSISTENT_CONTROL_PREPARED_HIT",
+                            preparationProofKey=proof_identity.preparation_proof_key,
+                            lifecycleInstallAvoided=True,
+                            integritySealAvoided=True,
+                        )
+                        _emit_progress(
+                            progress,
+                            f"{progress_label}: "
+                            "PSI4_PERSISTENT_CONTROL_PREPARED_HIT; "
+                            "fresh isolated control command still required",
+                        )
+                    _emit_progress(progress, f"{progress_label}: lifecycle preparation snapshot HIT; fresh project-check clones will be materialized from the sealed tree")
+                observed_versions = dict(snapshot.observed_resolved_versions)
+            else:
+                invalidated_producer = _PREPARED_SNAPSHOT_PRODUCERS.pop(
+                    _prepared_snapshot_slot(
+                        proof_identity.preparation_proof_key, project_dir
+                    ),
+                    None,
+                )
+                if invalidated_producer is not None:
+                    event(
+                        "same-run.prepared-artifact.invalidated",
+                        identity=proof_identity.preparation_proof_key,
+                        reason="continuity-validation-miss",
+                        originalProducer=invalidated_producer,
+                    )
+                if preparation_record is not None:
+                    _emit_progress(
+                        progress,
+                        f"{progress_label}: PreparationProof HIT but its durable PreparedArtifact is unavailable or failed continuity validation; replaying frozen lifecycle instead of trusting recovery metadata",
+                    )
+
+                # Ψ.5.7 captures a post-resolver/pre-lifecycle tree only when the
+                # normal PreparationArtifact path missed. Fresh resolver work can
+                # seed a later exact ResolverProof HIT; a HIT clones that seed and
+                # still executes the ordinary scripts-enabled frozen Yarn install.
+                if (
+                    resolver_seed_enabled
+                    and resolved_state is not None
+                    and _verification_purpose(config)
+                    not in {"baseline-control", "incumbent-promotion"}
+                ):
+                    try:
+                        resolver_seed_key = resolver_seed_identity(
+                            resolver_input_key=proof_identity.resolver_input_key,
+                            resolved_state_key=resolved_state.key,
+                            observed_resolved_hash=observed_hash,
+                            manager_family=workspace_topology.profile.family,
+                        )
+                        if not resolver_reused:
+                            event(
+                                "resolver-seed.publish-skipped",
+                                reason="inline-lifecycle-no-copy",
+                                seedKey=resolver_seed_key,
+                                authority=RESOLVER_SEED_AUTHORITY,
+                            )
+                        else:
+                            seed_target = temp_root / "resolver-seed-lifecycle"
+                            seed_materialization = resolver_seed_store.materialize(
+                                key=resolver_seed_key,
+                                target_workspace_root=seed_target,
+                                source_project=project_dir,
+                                resolved_state_key=resolved_state.key,
+                                observed_resolved_hash=observed_hash,
+                                timeout_seconds=snapshot_copy_timeout(),
+                                progress=phase_progress(
+                                    "resolver-seed-materialization"
+                                ),
+                                progress_label=(
+                                    f"{progress_label}: resolver seed materialization"
+                                ),
+                            )
+                            if seed_materialization is None:
+                                event(
+                                    "resolver-seed.miss",
+                                    seedKey=resolver_seed_key,
+                                    resolvedStateKey=resolved_state.key,
+                                    reason=resolver_seed_store.miss_reason(
+                                        resolver_seed_key
+                                    ),
+                                    authority=RESOLVER_SEED_AUTHORITY,
+                                )
+                            else:
+                                seed_project = seed_materialization.project_path
+                                seed_package_manager = (
+                                    seed_materialization.package_manager_path
+                                )
+                                assert_resolved_dependency_state(
+                                    seed_project, resolved_state
+                                )
+                                seed_observed = observed_resolved_assignment(
+                                    seed_project,
+                                    assignment,
+                                    remove_packages=remove_packages,
+                                    package_manager_root=seed_package_manager,
+                                    allow_declared_selectors=_verification_purpose(config) == "baseline-control",
+                                )
+                                seed_observed_hash = observed_resolved_hash(
+                                    seed_observed
+                                )
+                                if seed_observed_hash != observed_hash:
+                                    raise ResolverSeedError(
+                                        "RESOLVER_SEED_OBSERVED_ASSIGNMENT_DRIFT: "
+                                        f"expected={observed_hash} "
+                                        f"observed={seed_observed_hash}"
+                                    )
+                                if workspace_topology.profile.family == "yarn-berry":
+                                    from yarn_berry import prepare_resolver_seed_for_lifecycle
+                                    prepare_resolver_seed_for_lifecycle(seed_package_manager)
+                                else:
+                                    prepare_yarn1_resolver_seed_for_lifecycle(seed_package_manager)
+                                workspace_root = (
+                                    seed_materialization.workspace_root
+                                )
+                                workspace_project = seed_project
+                                package_manager_project = seed_package_manager
+                                resolver_seed_used = True
+                                event(
+                                    "resolver-seed.hit",
+                                    seedKey=resolver_seed_key,
+                                    resolvedStateKey=resolved_state.key,
+                                    observedResolvedHash=observed_hash,
+                                    materializationMethod=(
+                                        seed_materialization.method
+                                    ),
+                                    integrityReset=True,
+                                    lifecycleInstallStillRequired=True,
+                                    authority=RESOLVER_SEED_AUTHORITY,
+                                )
+                                _emit_progress(
+                                    progress,
+                                    f"{progress_label}: Ψ.5.7 ResolverSeed HIT; "
+                                    "validated exact pre-lifecycle tree cloned, "
+                                    ".yarn-integrity reset in private clone; "
+                                    "ordinary frozen lifecycle remains authoritative",
+                                )
+                    except (
+                        ResolverSeedError,
+                        ResolvedDependencyStateError,
+                        ObservedResolutionError,
+                        OSError,
+                        ValueError,
+                    ) as exc:
+                        resolver_seed_used = False
+                        event(
+                            "resolver-seed.fallback",
+                            seedKey=resolver_seed_key,
+                            reason=f"{type(exc).__name__}: {exc}",
+                            fallback="ordinary-frozen-lifecycle",
+                            authority=RESOLVER_SEED_AUTHORITY,
+                        )
+                        _emit_progress(
+                            progress,
+                            f"{progress_label}: Ψ.5.7 resolver seed unavailable "
+                            f"({type(exc).__name__}: {exc}); "
+                            "ordinary frozen lifecycle remains authoritative",
+                        )
+
+                full_install = install_args_for_profile(
+                    workspace_topology.profile,
+                    ignore_scripts=False,
+                    frozen=True,
+                )
+                full_argv, _ = _command_prefix(executable, full_install)
+                lifecycle_env = {
+                    "CI": "1",
+                    "YARN_ENABLE_IMMUTABLE_INSTALLS": "true",
+                    "YARN_ENABLE_SCRIPTS": "true",
+                    "npm_config_ignore_scripts": "false",
+                }
+                lifecycle_env.update(_package_manager_cache_environment(config, manager))
+                if workspace_topology.profile.family == "yarn-berry" and config.registry:
+                    lifecycle_env["YARN_NPM_REGISTRY_SERVER"] = config.registry
+                if stage_journal:
+                    stage_journal.write("lifecycle-install", "RUNNING")
+                preparation_started = time.monotonic()
+                lifecycle_operation_id = new_observability_id("lifecycle-install")
+                event(
+                    "verify.preparation.start",
+                    operationId=lifecycle_operation_id,
+                    command=" ".join(full_argv),
+                    verificationPurpose=_verification_purpose(config),
+                )
+                event(
+                    "same-run.prepared-artifact.build",
+                    identity=proof_identity.preparation_proof_key,
+                    consumer=progress_label,
+                )
+                try:
+                    full_result = _run_preparation_install(
+                        full_argv, package_manager_project,
+                        config=config, timeout_factory=phase_timeout, env=lifecycle_env,
+                        base_env=base_env, progress=phase_progress("lifecycle-install"),
+                        progress_label="package-manager lifecycle install",
+                        progress_interval_seconds=config.progress_interval_seconds,
+                    )
+                except BaselineCandidateBudgetExceeded as exc:
+                    return BaselineVerifyResult(
+                        False, "budget", str(exc), command=" ".join(full_argv)
+                    )
+                except (OSError, subprocess.TimeoutExpired) as exc:
+                    if isinstance(exc, subprocess.TimeoutExpired) and _budget_deadline_hit(config):
+                        return BaselineVerifyResult(
+                            False, "budget",
+                            f"BASELINE_BUDGET_EXHAUSTED: lifecycle-install: the wall-clock budget was reached while installing: {exc}",
+                            command=" ".join(full_argv),
+                        )
+                    return BaselineVerifyResult(False, "infrastructure", f"project-preflight install failed: {exc}", command=" ".join(full_argv), output=_process_failure_output(exc), workspace=str(workspace_project))
+                preparation_publication_allowed = _durable_proof_publication_allowed(full_result)
+                preparation_classified = (
+                    "passed"
+                    if full_result.returncode == 0
+                    else (
+                        "infrastructure"
+                        if bool(getattr(full_result, "deploom_infra_detected", False))
+                        else _classify_install_failure(full_result.stdout or "")
+                    )
+                )
+                event(
+                    "verify.preparation.finish",
+                    operationId=lifecycle_operation_id,
+                    durationMs=int((time.monotonic() - preparation_started) * 1000),
+                    exitCode=full_result.returncode,
+                    outcome=preparation_classified,
+                    verificationPurpose=_verification_purpose(config),
+                )
+                if full_result.returncode != 0:
+                    tail = "\n".join(((full_result.stdout or "") + "\n" + (getattr(full_result, "stderr", "") or "")).splitlines()[-80:])
+                    lifecycle_detail = f"lifecycle install exited {full_result.returncode}: " + "\n".join(tail.splitlines()[-14:])
+                    common = dict(
+                        command=" ".join(full_argv),
+                        output=tail,
+                        workspace=str(workspace_project),
+                        observed_resolved_versions=observed_versions,
+                        observed_resolved_hash=observed_hash,
+                        resolved_state_key=resolved_state.key if resolved_state is not None else "",
+                        resolved_lockfile_path=resolved_state.lockfile_path if resolved_state is not None else "",
+                        resolved_lockfile_hash=resolved_state.lockfile_hash if resolved_state is not None else "",
+                        resolved_state_artifact=resolved_state.artifact_relative_path if resolved_state is not None else "",
+                    )
+                    if preparation_classified in {"infrastructure", "dependency"}:
+                        return BaselineVerifyResult(
+                            False, preparation_classified,
+                            "assignment resolves without lifecycle scripts, but lifecycle install failed",
+                            **common,
+                        )
+                    return BaselineVerifyResult(
+                        False, "unknown",
+                        "assignment resolves, but lifecycle/preparation failed; cause is unclassified; " + lifecycle_detail,
+                        **common,
+                    )
+
+                if resolver_seed_used:
+                    from yarn_berry import validate_resolver_seed as validate_berry_resolver_seed
+                    try:
+                        lifecycle_integrity_flags = (
+                            validate_yarn1_lifecycle_completion(package_manager_project)
+                            if workspace_topology.profile.family == "yarn-classic"
+                            else validate_berry_resolver_seed(package_manager_project)
+                        )
+                    except ResolverSeedError as exc:
+                        event(
+                            "resolver-seed.lifecycle-unproven",
+                            seedKey=resolver_seed_key,
+                            reason=str(exc),
+                            authority=RESOLVER_SEED_AUTHORITY,
+                        )
+                        return BaselineVerifyResult(
+                            False,
+                            "unknown",
+                            "YARN1_LIFECYCLE_COMPLETION_UNPROVEN: "
+                            f"{exc}; no PreparationProof was produced",
+                            command=" ".join(full_argv),
+                            workspace=str(workspace_project),
+                            observed_resolved_versions=observed_versions,
+                            observed_resolved_hash=observed_hash,
+                            resolved_state_key=(
+                                resolved_state.key
+                                if resolved_state is not None
+                                else ""
+                            ),
+                        )
+                    event(
+                        "resolver-seed.lifecycle-certified",
+                        seedKey=resolver_seed_key,
+                        integrityFlags=list(lifecycle_integrity_flags),
+                        ignoreScripts=False,
+                        fullFrozenLifecycleExecuted=True,
+                        authority="PACKAGE_MANAGER_LIFECYCLE",
+                    )
+
+                fixed_identity_result = fixed_source_identity_gate("lifecycle")
+                if fixed_identity_result is not None:
+                    return fixed_identity_result
+
+                try:
+                    lifecycle_observed = observed_resolved_assignment(
+                        workspace_project, assignment, remove_packages=remove_packages,
+                        package_manager_root=package_manager_project,
+                        allow_declared_selectors=_verification_purpose(config) == "baseline-control",
+                    )
+                    lifecycle_observed_hash = observed_resolved_hash(lifecycle_observed)
+                except ObservedResolutionError as exc:
+                    event("verify.preparation.observed-drift", outcome="unknown", detail=str(exc))
+                    return BaselineVerifyResult(False, "unknown", str(exc), workspace=str(workspace_project))
+                if lifecycle_observed_hash != observed_hash:
+                    return BaselineVerifyResult(
+                        False, "unknown",
+                        "OBSERVED_RESOLVED_ASSIGNMENT_DRIFT: lifecycle install changed "
+                        f"the proven direct tree resolver={observed_hash} lifecycle={lifecycle_observed_hash}",
+                        workspace=str(workspace_project),
+                    )
+                observed_versions = lifecycle_observed
+                observed_hash = lifecycle_observed_hash
+                try:
+                    assert resolved_state is not None
+                    assert_resolved_dependency_state(workspace_project, resolved_state)
+                except (AssertionError, ResolvedDependencyStateError) as exc:
+                    return BaselineVerifyResult(
+                        False, "unknown",
+                        f"RESOLVED_STATE_PREPARATION_DRIFT: {exc}",
+                        workspace=str(workspace_project),
+                    )
+                if preparation_publication_allowed:
+                    publish_pass(
+                        "preparation",
+                        proof_identity.preparation_proof_key,
+                        observed_versions,
+                        observed_hash,
+                        extra_metadata=resolved_state_metadata(resolved_state),
+                    )
+                    if stage_journal:
+                        stage_journal.write("lifecycle-install", "PASS", {"preparationProofKey": proof_identity.preparation_proof_key, "resolvedStateKey": resolved_state.key})
+                else:
+                    event(
+                        "proof.cache.publish-skipped",
+                        proofType="preparation",
+                        cacheKey=proof_identity.preparation_proof_key,
+                        reason="process-tree-supervision-not-guaranteed",
+                    )
+
+                normalized = clean_ephemeral_verification_caches(package_manager_project)
+                if normalized:
+                    event("verify.preparation.snapshot-normalized", removedCaches=list(normalized))
+                snapshot_started = time.monotonic()
+                snapshot_timeout = snapshot_copy_timeout()
+                event(
+                    "verify.preparation.snapshot-publish.start",
+                    preparationProofKey=proof_identity.preparation_proof_key,
+                    hardTimeoutSeconds=snapshot_timeout,
+                )
+                _emit_progress(
+                    progress,
+                    f"{progress_label}: snapshot publish started; hardTimeout={snapshot_timeout}s",
+                )
+                if stage_journal:
+                    stage_journal.write("prepared-publication", "RUNNING", {"preparationProofKey": proof_identity.preparation_proof_key})
+                publication_operation_id = new_observability_id(
+                    "prepared-publication"
+                )
+                role_allows_durable, publication_reason = (
+                    _durable_prepared_publication_policy(config)
+                )
+                durable_snapshot_requested = bool(
+                    preparation_publication_allowed and role_allows_durable
+                )
+                purpose = _verification_purpose(config)
+                control_cost_reason = ""
+                if (
+                    durable_snapshot_requested
+                    and purpose == "baseline-control"
+                    and not config.recovery_checkpoints
+                    and not _persistent_control_cross_run_enabled()
+                ):
+                    durable_snapshot_requested = False
+                    control_cost_reason = "same-run-only-default"
+                    event(
+                        "persistent-control.prepared.publication-cost-skip",
+                        operationId=publication_operation_id,
+                        reason=control_cost_reason,
+                        preparationProofKey=proof_identity.preparation_proof_key,
+                    )
+                event(
+                    "prepared.publication.decision",
+                    operationId=publication_operation_id,
+                    role=purpose,
+                    durableRequested=durable_snapshot_requested,
+                    decisionReason=(
+                        control_cost_reason
+                        if purpose == "baseline-control" and control_cost_reason
+                        else (
+                            publication_reason
+                            if preparation_publication_allowed
+                            else "process-tree-supervision-not-guaranteed"
+                        )
+                    ),
+                    preparationProofKey=proof_identity.preparation_proof_key,
+                )
+                if not durable_snapshot_requested:
+                    event(
+                        "prepared.publication.skipped",
+                        operationId=publication_operation_id,
+                        role=purpose,
+                        preparationProofKey=proof_identity.preparation_proof_key,
+                        decisionReason=(
+                            control_cost_reason
+                            if purpose == "baseline-control" and control_cost_reason
+                            else (
+                                publication_reason
+                                if preparation_publication_allowed
+                                else "process-tree-supervision-not-guaranteed"
+                            )
+                        ),
+                    )
+                    if purpose in _PSI4_INTERMEDIATE_PURPOSES:
+                        _emit_progress(
+                            progress,
+                            f"{progress_label}: "
+                            "PSI4_INTERMEDIATE_DURABLE_SEAL_SKIPPED; "
+                            f"role={purpose}; same-run private continuity remains required",
+                        )
+                try:
+                    snapshot = _publish_prepared_workspace_snapshot(
+                        workspace_root, workspace_project,
+                        key=proof_identity.preparation_proof_key,
+                        observed_versions=observed_versions,
+                        observed_hash=observed_hash,
+                        source_project=project_dir,
+                        seal_dependency_integrity=preparation_fastpath_enabled,
+                        shared_reuse_allowed=durable_snapshot_requested,
+                        publication_root=(
+                            None
+                            if durable_snapshot_requested
+                            else _same_run_private_prepared_root(trial_parent)
+                        ),
+                        progress=progress,
+                        progress_label=f"{progress_label}: snapshot-publish",
+                        timeout_seconds=snapshot_timeout,
+                        progress_interval_seconds=config.progress_interval_seconds,
+                    )
+                except Exception as exc:
+                    return BaselineVerifyResult(False, "infrastructure", f"PREPARED_SNAPSHOT_PUBLISH_FAILED: {exc}", workspace=str(workspace_project))
+                snapshot_duration_ms = int((time.monotonic() - snapshot_started) * 1000)
+                event(
+                    "verify.preparation.snapshot-publish",
+                    durationMs=snapshot_duration_ms,
+                    preparationProofKey=proof_identity.preparation_proof_key,
+                )
+                event(
+                    "verify.preparation.snapshot-publish.finish",
+                    durationMs=snapshot_duration_ms,
+                    preparationProofKey=proof_identity.preparation_proof_key,
+                    legacyEvent="verify.preparation.snapshot-publish",
+                )
+                _emit_progress(
+                    progress,
+                    f"{progress_label}: snapshot publish PASS; elapsed={snapshot_duration_ms // 1000}s; mode={snapshot.storage_mode}",
+                )
+                durable_snapshot_confirmed = bool(
+                    durable_snapshot_requested
+                    and snapshot.durable_publication_confirmed
+                )
+                if durable_snapshot_requested:
+                    event(
+                        "prepared.publication.promote.finish",
+                        operationId=publication_operation_id,
+                        role=purpose,
+                        durationMs=(
+                            snapshot.durable_seal_duration_ms
+                            if durable_snapshot_confirmed
+                            else 0
+                        ),
+                        totalPublicationMs=snapshot_duration_ms,
+                        outcome=(
+                            "passed"
+                            if durable_snapshot_confirmed
+                            else "failed"
+                        ),
+                        durablePublicationConfirmed=durable_snapshot_confirmed,
+                        preparationProofKey=proof_identity.preparation_proof_key,
+                    )
+                    if (
+                        purpose == "baseline-control"
+                        and durable_snapshot_confirmed
+                    ):
+                        event(
+                            "persistent-control.prepared.published",
+                            operationId=publication_operation_id,
+                            preparationProofKey=proof_identity.preparation_proof_key,
+                            durableSealMs=snapshot.durable_seal_duration_ms,
+                        )
+                workspace_project = snapshot.workspace_root / snapshot.project_relative
+                if durable_snapshot_confirmed:
+                    _PREPARED_SNAPSHOT_PRODUCERS[
+                        _prepared_snapshot_slot(
+                            proof_identity.preparation_proof_key, project_dir
+                        )
+                    ] = progress_label
+                    pin_prepared_artifact_record(
+                        proof_identity.preparation_proof_key
+                    )
+                    if stage_journal:
+                        stage_journal.write("prepared-publication", "PASS", {"preparationProofKey": proof_identity.preparation_proof_key, "workspaceRoot": str(snapshot.workspace_root)})
+                elif not durable_snapshot_requested:
+                    _register_same_run_private_prepared_snapshot(
+                        snapshot, producer=progress_label
+                    )
+
+            if snapshot is None:
+                return BaselineVerifyResult(False, "infrastructure", "PREPARED_SNAPSHOT_UNAVAILABLE: project checks require a sealed preparation tree")
+
+            project_failures: List[BaselineProjectFailure] = []
+            project_publication_allowed = True
+            reusable_private_root: Optional[Path] = None
+            reusable_private_project: Optional[Path] = None
+            source_entries_by_path = {os.path.normcase(str(item["path"])).replace("\\", "/"): item
+                                      for item in snapshot.source_closure_entries}
+            if len(source_entries_by_path) != len(snapshot.source_closure_entries):
+                source_entries_by_path = {}  # Ambiguous Windows names: no delta authority.
+
+            command_checkpoints = None
+            command_checkpoint_refs = []
+            if config.recovery_checkpoints and proof_store.root is not None:
+                # Reopened snapshots have no same-call publication flag. The
+                # durable loader (or None) owns cross-process receipt authority.
+                from verification_stage_checkpoint import CommandCheckpoint
+                checkpoint_artifact = load_prepared_artifact_record(
+                    proof_identity.preparation_proof_key, project_dir, progress=progress)
+                command_checkpoints = CommandCheckpoint(
+                    config.recovery_journal_dir or (proof_store.root / "stage-checkpoints"),
+                    proof_identity, checkpoint_artifact, config.commands, base_env)
+
+            for command_index, command in enumerate(config.commands, start=1):
+                receipt = command_checkpoints.lookup(command_index, command) if command_checkpoints else None
+                if receipt:
+                    command_checkpoint_refs.append(receipt)
+                    event("verify.project-check.checkpoint-hit", command=command, check=command_index, receipt=receipt)
+                    _emit_progress(progress, f"{progress_label}: project check {command_index}/{len(config.commands)} checkpoint PASS: {command}")
+                    continue
+                if command_checkpoints:
+                    command_checkpoints.begin(command_index, command)
+                reusing_private_trial = bool(
+                    reusable_private_root is not None
+                    and reusable_private_project is not None
+                    and reusable_private_root.is_dir()
+                    and reusable_private_project.is_dir()
+                )
+                command_root = (
+                    reusable_private_root
+                    if reusing_private_trial and reusable_private_root is not None
+                    else _fresh_project_check_root(
+                        temp_root, command_index, event=event, command=command
+                    )
+                )
+                clone_started = time.monotonic()
+                clone_timeout = snapshot_copy_timeout()
+                event(
+                    "verify.project-check.clone.start",
+                    command=command,
+                    check=command_index,
+                    checks=len(config.commands),
+                    preparationProofKey=proof_identity.preparation_proof_key,
+                    hardTimeoutSeconds=clone_timeout,
+                    reusedPrivateTrial=reusing_private_trial,
+                )
+
+                if reusing_private_trial:
+                    assert reusable_private_project is not None
+                    command_project = reusable_private_project
+                    clone_isolation = ("ntfs-junction-guarded" if guarded_clone_is_active(command_root)
+                                       else "reused-private-trial")
+                    _emit_progress(
+                        progress,
+                        f"{progress_label}: project check {command_index}/{len(config.commands)} "
+                        "reusing unchanged private verification trial; clone skipped",
+                    )
+                else:
+                    if command_root.exists():
+                        command_root = _fresh_project_check_root(
+                            temp_root, command_index, event=event, command=command
+                        )
+                    _emit_progress(
+                        progress,
+                        f"{progress_label}: project clone {command_index}/{len(config.commands)} started; "
+                        f"hardTimeout={clone_timeout}s",
+                    )
+                    try:
+                        command_fastpath_allowed = (
+                            _allow_prepared_fastpath
+                            and bool(snapshot.dependency_roots)
+                            and _prepared_command_fastpath_allowed(
+                                project_dir, command
+                            )
+                        )
+                        if (
+                            _allow_prepared_fastpath
+                            and bool(snapshot.dependency_roots)
+                            and not command_fastpath_allowed
+                        ):
+                            _emit_progress(
+                                progress,
+                                f"{progress_label}: NTFS fast clone command quarantine "
+                                f"for {command}; using proof-safe private copy",
+                            )
+                        command_project = _materialize_prepared_workspace_snapshot(
+                            snapshot,
+                            command_root,
+                            allow_fastpath=command_fastpath_allowed,
+                            progress=progress,
+                            progress_label=f"{progress_label}: project-clone:{command_index}/{len(config.commands)}",
+                            timeout_seconds=clone_timeout,
+                            progress_interval_seconds=config.progress_interval_seconds,
+                        )
+                        if guarded_clone_is_active(command_root):
+                            guarded_trial_roots.add(command_root)
+                        from verification_source_closure import validate_materialized_source_closure
+                        validate_materialized_source_closure(snapshot, command_root, progress=progress,
+                            progress_interval_seconds=config.progress_interval_seconds)
+                    except Exception as exc:
+                        clone_failure = f"PREPARED_SNAPSHOT_CLONE_FAILED: {command}: {exc}"
+                        emit_observability_event(
+                            "verify.project-check.clone-failed",
+                            command=command,
+                            check=command_index,
+                            checks=len(config.commands),
+                            preparationProofKey=proof_identity.preparation_proof_key,
+                            authoritativeSource="substrate",
+                            kind="infrastructure",
+                            rebuildAttempted=bool(_allow_prepared_fastpath),
+                            detail=str(exc),
+                        )
+                        # A clone failure is substrate uncertainty, not
+                        # incompatibility. Drop only the suspect locator and
+                        # retry this *same exact assignment* once through the
+                        # existing authoritative no-fastpath rebuild path.
+                        _evict_prepared_workspace_snapshot(
+                            proof_identity.preparation_proof_key,
+                            project_dir,
+                        )
+                        if _allow_prepared_fastpath:
+                            _emit_progress(
+                                progress,
+                                f"{progress_label}: {clone_failure}; invalidating the stale "
+                                "prepared artifact and rebuilding this exact assignment once "
+                                "through the authoritative full-copy path",
+                            )
+                            return _retry_assignment_without_prepared_fastpath(
+                                project_dir,
+                                assignment,
+                                config=config,
+                                run_project_checks=run_project_checks,
+                                remove_packages=remove_packages,
+                                progress=progress,
+                                progress_label=progress_label,
+                                proof_identity=proof_identity,
+                                runtime_env=runtime_env,
+                            )
+                        return BaselineVerifyResult(
+                            False,
+                            "infrastructure",
+                            clone_failure,
+                            command=command,
+                        )
+                    clone_isolation = (
+                        "ntfs-junction-guarded"
+                        if guarded_clone_is_active(command_root)
+                        else "fresh-prepared-snapshot-clone"
+                    )
+
+                clone_duration_ms = int((time.monotonic() - clone_started) * 1000)
+                event(
+                    "verify.project-check.clone.finish",
+                    command=command,
+                    check=command_index,
+                    checks=len(config.commands),
+                    durationMs=clone_duration_ms,
+                    preparationProofKey=proof_identity.preparation_proof_key,
+                    isolation=clone_isolation,
+                    reusedPrivateTrial=reusing_private_trial,
+                )
+                _emit_progress(
+                    progress,
+                    f"{progress_label}: project clone {command_index}/{len(config.commands)} PASS; "
+                    f"elapsed={clone_duration_ms // 1000}s; isolation={clone_isolation}",
+                )
+
+                workspace_guard: Optional[WorkspaceChangeGuard] = None
+                workspace_guard_started = False
+                check_result: Optional[subprocess.CompletedProcess[str]] = None
+                lower_check_clean = False
+                command_pass_verified = False
+                try:
+                    removed_caches = clean_ephemeral_verification_caches(command_root, snapshot.dependency_roots)
+                    if removed_caches:
+                        _emit_progress(progress, f"{progress_label}: normalized transient caches before {command}: {', '.join(removed_caches)}")
+
+                    if clone_isolation in {"fresh-prepared-snapshot-clone", "reused-private-trial", "ntfs-junction-guarded"}:
+                        workspace_guard = WorkspaceChangeGuard(command_root)
+                        workspace_guard_started = workspace_guard.start()
+                        if not workspace_guard_started:
+                            _emit_progress(
+                                progress,
+                                f"{progress_label}: private-trial mutation guard unavailable; "
+                                "current check remains proof-safe, but this trial will not be reused",
+                            )
+
+                    # MANDATORY PRE-CHECK (Ω guarded lower).
+                    # The sealed lower is reached through junctions and is
+                    # reused across checks, so a stale package map, a poisoned
+                    # junction target, or a PreparedArtifact built for another
+                    # assignment is only observable here -- before the project
+                    # process ever sees a tree that never matched the proof.
+                    # Substrate drift is never dependency evidence: it must not
+                    # reach the Solver and must not launch the command.
+                    precheck_failure = ""
+                    try:
+                        precheck_observed = observed_resolved_assignment(
+                            command_project,
+                            assignment,
+                            remove_packages=remove_packages,
+                            package_manager_root=(command_root / package_manager_relative_to_workspace),
+                            authorized_roots=guarded_clone_authorized_roots(command_root),
+                            allow_declared_selectors=_verification_purpose(config) == "baseline-control",
+                        )
+                        if observed_resolved_hash(precheck_observed) != observed_hash:
+                            drifted = sorted(
+                                name
+                                for name, version in precheck_observed.items()
+                                if str(assignment.get(name, version)) != version
+                            )
+                            precheck_failure = (
+                                "observed direct dependency tree differs from the proven "
+                                f"lifecycle assignment; packages={drifted or '<hash-only>'}"
+                            )
+                    except ObservedResolutionError as exc:
+                        precheck_failure = str(exc)
+
+                    if precheck_failure:
+                        emit_observability_event(
+                            "verify.project-check.precheck-failed",
+                            phase="guarded-lower-precheck",
+                            command=command,
+                            isolation=clone_isolation,
+                            authoritativeSource="substrate",
+                            kind="infrastructure",
+                            rebuildAttempted=bool(_allow_prepared_fastpath),
+                            detail=precheck_failure,
+                        )
+                        event(
+                            "verify.project-check.precheck-failed",
+                            command=command,
+                            check=command_index,
+                            checks=len(config.commands),
+                            isolation=clone_isolation,
+                            detail=precheck_failure,
+                        )
+                        if clone_isolation == "ntfs-junction-guarded":
+                            cleanup_guarded_clone(command_root)
+                        _disable_prepared_command_fastpath(project_dir, command)
+                        _disable_prepared_snapshot_fastpath(
+                            proof_identity.preparation_proof_key, project_dir
+                        )
+                        _evict_prepared_workspace_snapshot(
+                            proof_identity.preparation_proof_key, project_dir
+                        )
+                        if _allow_prepared_fastpath:
+                            # One controlled rebuild through the fully
+                            # authoritative full-copy path, same proof identity.
+                            _emit_progress(
+                                progress,
+                                f"{progress_label}: guarded-lower precheck rejected {command} "
+                                f"({precheck_failure}); discarding the suspect materialization "
+                                "and rebuilding through the authoritative path",
+                            )
+                            return _retry_assignment_without_prepared_fastpath(
+                                project_dir,
+                                assignment,
+                                config=config,
+                                run_project_checks=run_project_checks,
+                                remove_packages=remove_packages,
+                                progress=progress,
+                                progress_label=progress_label,
+                                proof_identity=proof_identity,
+                                runtime_env=runtime_env,
+                            )
+                        # Clean rebuild already happened and still mismatches:
+                        # deterministic substrate invariant failure. Fail closed,
+                        # never as project incompatibility, never as UNKNOWN.
+                        return BaselineVerifyResult(
+                            False,
+                            "infrastructure",
+                            f"SUBSTRATE_ASSIGNMENT_DRIFT: {command}: {precheck_failure}",
+                            command=command,
+                            workspace=str(command_project),
+                        )
+
+                    from migration_validation import display_validation_command
+                    command_label = display_validation_command(command)
+                    check_context = execution_scope(source_snapshot, project=command_project,
+                        package_manager_root=command_root / package_manager_relative_to_workspace,
+                        commands=(command_label,), materialization=clone_isolation)
+                    check_context["preparedSourceContentKey"] = snapshot.source_closure_content_key
+                    event("verify.source-closure.execution", **check_context)
+                    _emit_progress(progress, "VERIFICATION_EXECUTION_SCOPE " + json.dumps(check_context, ensure_ascii=False, sort_keys=True))
+                    _emit_progress(progress, f"{progress_label}: project check {command_index}/{len(config.commands)} started: {command_label}")
+                    check_started = time.monotonic()
+                    event(
+                        "verify.project-check.start",
+                        command=command,
+                        check=command_index,
+                        checks=len(config.commands),
+                        isolation=clone_isolation,
+                    )
+                    shell_argv = project_check_command_argv(command)
+                    try:
+                        check_result = _run(
+                            shell_argv,
+                            command_project,
+                            timeout_seconds=project_check_timeout(
+                                config, attempt_remaining_seconds=attempt_deadline - time.monotonic(),
+                                budget_remaining_seconds=(config.budget_phase_deadline - time.monotonic()
+                                                          if config.budget_phase_deadline else None),
+                                progress_label=progress_label,
+                            ),
+                            base_env=base_env,
+                            progress=phase_progress(f"project-check:{command_label}"),
+                            progress_label=command_label,
+                            progress_interval_seconds=config.progress_interval_seconds,
+                        )
+                        project_publication_allowed = bool(
+                            project_publication_allowed
+                            and _durable_proof_publication_allowed(check_result)
+                        )
+                    except BaselineCandidateBudgetExceeded as exc:
+                        return BaselineVerifyResult(
+                            False, "budget", str(exc), command=command
+                        )
+                    except (OSError, subprocess.TimeoutExpired) as exc:
+                        emit_observability_event(
+                            "verify.failure-classification",
+                            phase="project-check",
+                            authoritativeSource=(
+                                "supervisor"
+                                if isinstance(exc, subprocess.TimeoutExpired)
+                                else "substrate"
+                            ),
+                            kind="infrastructure",
+                        )
+                        budget_cutoff = isinstance(exc, subprocess.TimeoutExpired) and _budget_deadline_hit(config)
+                        if clone_isolation == "ntfs-junction-guarded":
+                            cleanup_guarded_clone(command_root)
+                            _evict_prepared_workspace_snapshot(
+                                proof_identity.preparation_proof_key, project_dir
+                            )
+                        if budget_cutoff:
+                            return BaselineVerifyResult(
+                                False, "budget",
+                                f"BASELINE_BUDGET_EXHAUSTED: project-check: the wall-clock budget was reached while the command was still running: {exc}",
+                                command=command,
+                            )
+                        if isinstance(exc, subprocess.TimeoutExpired):
+                            output = exc.output or ""
+                            if isinstance(output, bytes):
+                                output = output.decode("utf-8", errors="replace")
+                            return BaselineVerifyResult(
+                                False, "infrastructure",
+                                f"PROJECT_CHECK_COMMAND_TIMEOUT: {command}: exceeded {exc.timeout} seconds; no verdict obtained",
+                                command=command, output=str(output)[-8192:],
+                            )
+                        return BaselineVerifyResult(False, "infrastructure", f"project check launch failed: {exc}", command=command)
+
+                    if clone_isolation == "ntfs-junction-guarded" and command_index < len(config.commands):
+                        from prepared_workspace_fastpath import peek_guarded_clone
+                        guard_result = peek_guarded_clone(command_root)
+                    else:
+                        guard_result = stop_guarded_clone(command_root)
+                    lower_check_clean = not (guard_result.errors or guard_result.mutations or guard_result.notification_only)
+                    if (
+                        guard_result.errors
+                        or guard_result.mutations
+                        or guard_result.notification_only
+                    ):
+                        # Any notification means this optimization is no longer
+                        # authoritative for the preparation identity. Even an
+                        # integrity-matched final state may have been transiently
+                        # mutated while another consumer was reading it.
+                        cleanup_guarded_clone(command_root)
+                        # This is performance state only. The command is still
+                        # freshly executed in an isolated private clone.
+                        _disable_prepared_command_fastpath(project_dir, command)
+                        _disable_prepared_snapshot_fastpath(
+                            proof_identity.preparation_proof_key, project_dir
+                        )
+                        _evict_prepared_workspace_snapshot(
+                            proof_identity.preparation_proof_key, project_dir
+                        )
+                        rejection_reason = (
+                            "watcher-error"
+                            if guard_result.errors
+                            else (
+                                "confirmed-content-mutation"
+                                if guard_result.mutations
+                                else "dependency-write-notification"
+                            )
+                        )
+                        event(
+                            "verify.project-check.fastpath-rejected",
+                            command=command,
+                            check=command_index,
+                            checks=len(config.commands),
+                            reason=rejection_reason,
+                            watcherErrors=list(guard_result.errors),
+                            confirmedMutations=list(guard_result.mutations),
+                            integrityMatchedNotifications=list(
+                                guard_result.notification_only
+                            ),
+                        )
+                        _emit_progress(
+                            progress,
+                            f"{progress_label}: NTFS fast clone rejected during {command} "
+                            f"({rejection_reason}); rebuilding trusted preparation and "
+                            "retrying with proof-safe full-copy project clones; changed paths="
+                            + repr(list(guard_result.mutations or guard_result.notification_only)[:10]),
+                        )
+                        # The failed fast-path check is infrastructure evidence,
+                        # never dependency evidence. Re-enter with the same proof
+                        # identity; ResolverProof may be reused, while lifecycle
+                        # preparation is rebuilt because the shared snapshot was
+                        # quarantined.
+                        fallback_started = time.monotonic()
+                        fallback_result = _retry_assignment_without_prepared_fastpath(
+                            project_dir,
+                            assignment,
+                            config=config,
+                            run_project_checks=run_project_checks,
+                            remove_packages=remove_packages,
+                            progress=progress,
+                            progress_label=progress_label,
+                            proof_identity=proof_identity,
+                            runtime_env=runtime_env,
+                        )
+                        fallback_ms = max(0, int((time.monotonic() - fallback_started) * 1000))
+                        event("verify.project-check.fastpath-fallback-complete",
+                              command=command, durationMs=fallback_ms,
+                              resolverProofReuseRequested=True, outcome=fallback_result.kind)
+                        _emit_progress(progress, f"{progress_label}: private-copy fallback completed; "
+                                       f"elapsed={fallback_ms / 1000:.3f}s; outcome={fallback_result.kind}")
+                        return fallback_result
+
+                    # Allowed root cache writes are cache-only. Remove them
+                    # from the sealed dependency base before any later check.
+                    normalized_shared = clean_ephemeral_verification_caches(snapshot.workspace_root, snapshot.dependency_roots)
+                    if normalized_shared:
+                        event(
+                            "verify.project-check.shared-cache-normalized",
+                            command=command,
+                            removedCaches=list(normalized_shared),
+                        )
+
+                    try:
+                        assert resolved_state is not None
+                        assert_resolved_dependency_state(command_project, resolved_state)
+                    except (AssertionError, ResolvedDependencyStateError) as exc:
+                        _evict_prepared_workspace_snapshot(
+                            proof_identity.preparation_proof_key, project_dir
+                        )
+                        return BaselineVerifyResult(
+                            False,
+                            "unknown",
+                            f"RESOLVED_STATE_PROJECT_DRIFT: {command}: {exc}",
+                            command=command,
+                            workspace=str(command_project),
+                        )
+
+                    try:
+                        check_observed = observed_resolved_assignment(
+                            command_project, assignment, remove_packages=remove_packages,
+                            package_manager_root=(command_root / package_manager_relative_to_workspace),
+                            authorized_roots=guarded_clone_authorized_roots(command_root),
+                            allow_declared_selectors=_verification_purpose(config) == "baseline-control",
+                        )
+                        check_observed_hash = observed_resolved_hash(check_observed)
+                    except ObservedResolutionError as exc:
+                        return BaselineVerifyResult(False, "unknown", str(exc), command=command, workspace=str(command_project))
+                    if check_observed_hash != observed_hash:
+                        return BaselineVerifyResult(
+                            False, "unknown",
+                            "OBSERVED_RESOLVED_ASSIGNMENT_DRIFT: project check "
+                            f"{command} mutated the proven direct dependency tree",
+                            command=command, workspace=str(command_project),
+                        )
+
+                    event(
+                        "verify.project-check.finish",
+                        command=command,
+                        check=command_index,
+                        checks=len(config.commands),
+                        durationMs=int((time.monotonic() - check_started) * 1000),
+                        exitCode=check_result.returncode,
+                        outcome="passed" if check_result.returncode == 0 else "failed",
+                        isolation=clone_isolation,
+                        capturedBytes=int(getattr(check_result, "captured_bytes", 0) or 0),
+                        droppedBytes=int(getattr(check_result, "dropped_bytes", 0) or 0),
+                        outputTruncated=bool(getattr(check_result, "output_truncated", False)),
+                        supervisionQuality=str(getattr(getattr(check_result, "supervision", None), "quality", "")),
+                        descendantsKilled=int(getattr(getattr(check_result, "supervision", None), "descendants_terminated", 0) or 0),
+                        descendantsRemaining=int(getattr(getattr(check_result, "supervision", None), "descendants_remaining", 0) or 0),
+                        quiescenceMs=int(getattr(getattr(check_result, "supervision", None), "quiescence_ms", 0) or 0),
+                    )
+                    if check_result.returncode == 0:
+                        command_pass_verified = True
+                        _emit_progress(progress, f"{progress_label}: project check {command_index}/{len(config.commands)} PASS: {command_label}")
+                        continue
+                    tail = "\n".join((check_result.stdout or "").splitlines()[-80:])
+                    from verification_source_closure import excluded_source_failure_evidence
+                    excluded_inputs = excluded_source_failure_evidence(source_snapshot, check_result.stdout,
+                        execution_root=command_root, execution_cwd=command_project)
+                    if excluded_inputs:
+                        return BaselineVerifyResult(False, "infrastructure",
+                            "VERIFICATION_SOURCE_SCOPE_REQUIRED_INPUT_EXCLUDED: "
+                            + json.dumps({"paths": excluded_inputs, "sourceScope": "frontend" if source_snapshot.input_policy.frontend_profile else "repository",
+                                          "action": "move required source inputs out of excluded tool/build state directories"}, sort_keys=True),
+                            command=command, output=tail, workspace=str(command_project))
+                    # Only our direct, trusted adapter reserves exit 2 for
+                    # unavailable evidence. Arbitrary project output cannot
+                    # grant infrastructure authority or teach incompatibility.
+                    from migration_validation import internal_command_argv
+                    if internal_command_argv(command) is not None and check_result.returncode == 2:
+                        return BaselineVerifyResult(False, "infrastructure", "TEST_EVIDENCE_UNAVAILABLE: " + (tail.splitlines()[-1] if tail else "adapter returned exit 2"), command=command, output=tail)
+                    # Arbitrary project output is not infrastructure authority.
+                    # Launch, timeout, watcher and supervision failures are already
+                    # represented by typed exceptions above.
+                    emit_observability_event(
+                        "verify.failure-classification",
+                        phase="project-check",
+                        authoritativeSource="project-rc",
+                        kind="project",
+                    )
+                    project_failures.append(BaselineProjectFailure(command, check_result.returncode, tail))
+                    _emit_progress(progress, f"{progress_label}: project check {command_index}/{len(config.commands)} RED exit={check_result.returncode}: {command_label}")
+                finally:
+                    workspace_changes = workspace_guard.stop() if workspace_guard is not None else None
+                    source_reset_for_reuse = False
+                    if (workspace_guard_started and workspace_changes is not None
+                            and not workspace_changes.errors and workspace_changes.changes
+                            and clone_isolation in {"fresh-prepared-snapshot-clone", "reused-private-trial", "ntfs-junction-guarded"}
+                            and check_result is not None
+                            and getattr(getattr(check_result, "supervision", None), "quality", "") == "guaranteed-tree"):
+                        from verification_source_closure import reset_observed_trial_outputs
+                        source_reset_for_reuse = reset_observed_trial_outputs(
+                            command_root, source_entries_by_path, workspace_changes.changes, progress=progress,
+                            prepared_root=snapshot.workspace_root,
+                            dependency_roots=(snapshot.dependency_roots
+                                if lower_check_clean and guarded_clone_is_active(command_root) else ()))
+
+                    if command_checkpoints and check_result is not None:
+                        # Command guards above retain their authority. A receipt
+                        # also requires guaranteed process-tree quiescence.
+                        receipt = command_checkpoints.complete(
+                            command_index, command, check_result,
+                            safe=command_pass_verified and lower_check_clean
+                                and _durable_proof_publication_allowed(check_result))
+                        if receipt:
+                            command_checkpoint_refs.append(receipt)
+                            event("verify.project-check.checkpoint-published", command=command, check=command_index, receipt=receipt)
+
+                    if (
+                        workspace_guard_started
+                        and workspace_changes is not None
+                        and not workspace_changes.errors
+                        and (not workspace_changes.changes or source_reset_for_reuse)
+                        and command_root.is_dir()
+                        and command_project.is_dir()
+                        and (clone_isolation != "ntfs-junction-guarded"
+                             or (lower_check_clean and guarded_clone_is_active(command_root)
+                                 and command_index < len(config.commands)))
+                        and check_result is not None
+                        and (
+                            getattr(check_result, "supervision", None) is None
+                            or str(getattr(check_result.supervision, "quality", "")) == "guaranteed-tree"
+                        )
+                    ):
+                        reusable_private_root = command_root
+                        reusable_private_project = command_project
+                        event(
+                            "verify.project-check.trial-reuse-ready",
+                            command=command,
+                            check=command_index,
+                            checks=len(config.commands),
+                            preparationProofKey=proof_identity.preparation_proof_key,
+                        )
+                        _emit_progress(
+                            progress,
+                            f"{progress_label}: private verification trial remained unchanged; "
+                            "next project check may reuse it without cloning or full source hashing",
+                        )
+                    else:
+                        if workspace_changes is not None:
+                            event(
+                                "verify.project-check.trial-reuse-rejected",
+                                command=command,
+                                check=command_index,
+                                checks=len(config.commands),
+                                preparationProofKey=proof_identity.preparation_proof_key,
+                                reason=(
+                                    "watcher-error"
+                                    if workspace_changes.errors
+                                    else "workspace-mutated"
+                                    if workspace_changes.changes
+                                    else "watcher-unavailable"
+                                ),
+                                changes=list(workspace_changes.changes[:64]),
+                                watcherErrors=list(workspace_changes.errors),
+                            )
+                        reusable_private_root = None
+                        reusable_private_project = None
+                        if clone_isolation == "ntfs-junction-guarded":
+                            cleanup_guarded_clone(command_root)
+                        _cleanup_trial_root(command_root, event=event, command=command)
+
+            if project_failures:
+                summary_commands = ", ".join(item.command for item in project_failures)
+                output = "\n\n".join(
+                    f"=== {item.command} (exit {item.exit_code}) ===\n{item.output}"
+                    for item in project_failures
+                )
+                first = project_failures[0]
+                return BaselineVerifyResult(
+                    False, "project", f"project preflight failed: {summary_commands}",
+                    command=first.command, output=output[-16000:], workspace=str(workspace_project),
+                    project_failures=tuple(project_failures),
+                    observed_resolved_versions=observed_versions,
+                    observed_resolved_hash=observed_hash,
+                    resolved_state_key=resolved_state.key if resolved_state is not None else "",
+                    resolved_lockfile_path=resolved_state.lockfile_path if resolved_state is not None else "",
+                    resolved_lockfile_hash=resolved_state.lockfile_hash if resolved_state is not None else "",
+                    resolved_state_artifact=resolved_state.artifact_relative_path if resolved_state is not None else "",
+                )
+
+            assert resolved_state is not None
+            if project_publication_allowed:
+                publish_pass(
+                    "project", proof_identity.project_proof_key, observed_versions, observed_hash,
+                    extra_metadata=resolved_state_metadata(resolved_state),
+                )
+            else:
+                event(
+                    "proof.cache.publish-skipped",
+                    proofType="project",
+                    cacheKey=proof_identity.project_proof_key,
+                    reason="process-tree-supervision-not-guaranteed",
+                )
+
+        _emit_progress(progress, f"{progress_label}: completed; elapsed={int(time.monotonic() - attempt_started)}s")
+        return BaselineVerifyResult(
+            True, "passed", f"resolver preflight passed for {len(changed)} changed direct package(s)",
+            command=" ".join(argv), workspace=str(workspace_project),
+            observed_resolved_versions=observed_versions,
+            observed_resolved_hash=observed_hash,
+            resolved_state_key=resolved_state.key if resolved_state is not None else "",
+            resolved_lockfile_path=resolved_state.lockfile_path if resolved_state is not None else "",
+            resolved_lockfile_hash=resolved_state.lockfile_hash if resolved_state is not None else "",
+            resolved_state_artifact=resolved_state.artifact_relative_path if resolved_state is not None else "",
+            preparation_proof_key=proof_identity.preparation_proof_key if run_project_checks and config.commands else "",
+            command_checkpoint_refs=tuple(command_checkpoint_refs) if run_project_checks and config.commands else (),
+            verified_source_snapshot_key=source_snapshot.key,
+            verified_assignment_fingerprint=assignment_hash,
+        )
+    finally:
+        # Early return may retain a trial provisionally. Release every owned
+        # lower lease/guard even when a later check or evidence adapter aborts.
+        for guarded_root in guarded_trial_roots:
+            try:
+                cleanup_guarded_clone(guarded_root)
+            except Exception as exc:
+                event("verify.project-check.guard-cleanup-failed", detail=str(exc), workspace=str(guarded_root))
+        source_binding.close()
+        shutil.rmtree(temp_root, ignore_errors=True)
+        if temp_root.exists():
+            retire_trial(temp_root)
+
+
+
+def promote_same_run_prepared_artifact(
+    project_dir: Path,
+    preparation_proof_key: str,
+    *,
+    proof_cache_dir: str = "",
+    progress: Optional[ProgressCallback] = None,
+    progress_label: str = "verified incumbent prepared-artifact promotion",
+) -> bool:
+    """Promote an exact clean same-run tree through the existing strong seal."""
+    project_dir = project_dir.resolve()
+    key = str(preparation_proof_key or "").strip()
+    if not key:
+        return False
+
+    configure_prepared_artifact_store(proof_cache_dir or None)
+    proof_store = VerificationProofStore(
+        Path(proof_cache_dir) if proof_cache_dir else None
+    )
+    if proof_store.root is None or proof_store.lookup_pass("preparation", key) is None:
+        emit_observability_event(
+            "same-run.private-prepared.promote.finish",
+            identity=key,
+            promoted=False,
+            reason="preparation-proof-missing",
+        )
+        return False
+
+    durable = _lookup_prepared_workspace_snapshot(
+        key, project_dir, progress=progress
+    )
+    if durable is not None:
+        emit_observability_event(
+            "same-run.private-prepared.promote.finish",
+            identity=key,
+            promoted=True,
+            reason="already-durable",
+        )
+        return True
+
+    snapshot, producer, reason = _claim_same_run_private_prepared_snapshot(
+        key, project_dir
+    )
+    if snapshot is None:
+        emit_observability_event(
+            "same-run.private-prepared.promote.finish",
+            identity=key,
+            promoted=False,
+            reason=f"private-{reason}",
+            originalProducer=str(producer or ""),
+        )
+        return False
+
+    slot = _prepared_snapshot_slot(key, project_dir)
+    with _PREPARED_SNAPSHOT_LOCK:
+        _SAME_RUN_PRIVATE_PREPARED_SNAPSHOTS.pop(slot, None)
+        _SAME_RUN_PRIVATE_PREPARED_PRODUCERS.pop(slot, None)
+        _SAME_RUN_PRIVATE_PREPARED_GUARDS.pop(slot, None)
+        _SAME_RUN_PRIVATE_PREPARED_ACTIVE_ATTEMPTS.pop(slot, None)
+
+    promotion_operation_id = new_observability_id(
+        "incumbent-durable-promotion"
+    )
+    promotion_started = time.monotonic()
+    emit_observability_event(
+        "same-run.private-prepared.promote.start",
+        operationId=promotion_operation_id,
+        identity=key,
+        originalProducer=str(producer or ""),
+        sourceProject=str(project_dir),
+    )
+    emit_observability_event(
+        "prepared.publication.promote.start",
+        operationId=promotion_operation_id,
+        role="verified-incumbent",
+        preparationProofKey=key,
+        sourceProject=str(project_dir),
+    )
+    _emit_progress(
+        progress,
+        f"{progress_label}: Ψ.3 promoting verified incumbent to strong durable PreparedArtifact",
+    )
+    try:
+        promoted = _publish_prepared_workspace_snapshot(
+            snapshot.workspace_root,
+            snapshot.workspace_root / snapshot.project_relative,
+            key=key,
+            observed_versions=snapshot.observed_resolved_versions,
+            observed_hash=snapshot.observed_resolved_hash,
+            source_project=project_dir,
+            seal_dependency_integrity=True,
+            shared_reuse_allowed=True,
+            publication_root=None,
+            progress=progress,
+            progress_label=f"{progress_label}: durable-promotion",
+        )
+    except Exception as exc:
+        _retire_prepared_workspace_snapshot(snapshot)
+        emit_observability_event(
+            "same-run.private-prepared.promote.finish",
+            operationId=promotion_operation_id,
+            identity=key,
+            promoted=False,
+            reason=f"promotion-error:{type(exc).__name__}",
+            originalProducer=str(producer or ""),
+        )
+        emit_observability_event(
+            "prepared.publication.promote.finish",
+            operationId=promotion_operation_id,
+            role="verified-incumbent",
+            preparationProofKey=key,
+            durationMs=int((time.monotonic() - promotion_started) * 1000),
+            outcome="failed",
+            reason=f"promotion-error:{type(exc).__name__}",
+        )
+        _emit_progress(
+            progress,
+            f"{progress_label}: Ψ.3 durable promotion unavailable; "
+            "verified result remains valid and no durable reuse is claimed",
+        )
+        return False
+
+    durable_ok = bool(
+        promoted.durable_publication_confirmed
+        and is_durable_prepared_path(promoted.workspace_root)
+        and promoted.workspace_root.is_dir()
+    )
+    if durable_ok:
+        with _PREPARED_SNAPSHOT_LOCK:
+            _PREPARED_SNAPSHOT_PRODUCERS[slot] = str(
+                producer or progress_label
+            )
+        pin_prepared_artifact_record(key)
+    promotion_duration_ms = int(
+        (time.monotonic() - promotion_started) * 1000
+    )
+    emit_observability_event(
+        "same-run.private-prepared.promote.finish",
+        operationId=promotion_operation_id,
+        identity=key,
+        promoted=durable_ok,
+        reason="strong-durable-seal" if durable_ok else "durable-record-missing",
+        originalProducer=str(producer or ""),
+    )
+    emit_observability_event(
+        "prepared.publication.promote.finish",
+        operationId=promotion_operation_id,
+        role="verified-incumbent",
+        preparationProofKey=key,
+        durationMs=(
+            promoted.durable_seal_duration_ms
+            if durable_ok
+            else 0
+        ),
+        totalPublicationMs=promotion_duration_ms,
+        outcome="passed" if durable_ok else "failed",
+        reason="strong-durable-seal" if durable_ok else "durable-record-missing",
+    )
+    return durable_ok
+
+
+def assignment_fingerprint(assignment: Mapping[str, str]) -> str:
+    payload = json.dumps(dict(sorted(assignment.items())), separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+_verify_assignment_uncached_impl = verify_assignment
+
+
+def _effective_result_proof_identity(
+    proof_identity: VerificationProofIdentity,
+    result: BaselineVerifyResult,
+    *,
+    config: BaselineVerifyConfig,
+    run_project_checks: bool,
+) -> VerificationProofIdentity:
+    """Return the exact identity actually reached by the inner verifier."""
+    resolved_state_key = str(result.resolved_state_key or "").strip()
+    if (
+        resolved_state_key
+        and resolved_state_key != str(proof_identity.resolved_state_key or "")
+    ):
+        return bind_resolved_state_identity(
+            proof_identity,
+            resolved_state_key,
+            project_checks=(
+                config.project_checks if run_project_checks else "off"
+            ),
+            commands=(config.commands if run_project_checks else ()),
+        )
+    return proof_identity
+
+
+def _verify_assignment_uncached(
+    project_dir: Path,
+    assignment: Mapping[str, str],
+    *,
+    config: BaselineVerifyConfig,
+    run_project_checks: bool = False,
+    remove_packages: Iterable[str] = (),
+    progress: Optional[ProgressCallback] = None,
+    progress_label: str = "assignment verification",
+    proof_identity: Optional[VerificationProofIdentity] = None,
+    runtime_env: Optional[Mapping[str, str]] = None,
+    _allow_prepared_fastpath: bool = True,
+) -> BaselineVerifyResult:
+    # BLOCK_Y_OBSERVABILITY_CONTRACT_V1
+    project_dir = project_dir.resolve()
+    telemetry_path = Path(config.telemetry_path).resolve() if config.telemetry_path else None
+    attempt_id = new_observability_id("attempt")
+    parent_attempt_id = current_attempt_id()
+    started = time.monotonic()
+    resources_before = process_resource_snapshot()
+    assignment_hash = assignment_fingerprint(assignment)
+
+    with attempt_scope(attempt_id, parent_attempt_id=parent_attempt_id):
+        identity_fields = proof_identity.event_fields() if proof_identity is not None else {}
+        emit_verification_event(
+            telemetry_path,
+            "verify.attempt.start",
+            projectPath=str(project_dir),
+            label=progress_label,
+            assignment=assignment_hash,
+            runProjectChecks=run_project_checks,
+            projectChecks=config.project_checks,
+            commands=list(config.commands),
+            parentAttemptId=parent_attempt_id,
+            **identity_fields,
+        )
+        try:
+            result = _verify_assignment_uncached_impl(
+                project_dir,
+                assignment,
+                config=config,
+                run_project_checks=run_project_checks,
+                remove_packages=remove_packages,
+                progress=progress,
+                progress_label=progress_label,
+                proof_identity=proof_identity,
+                runtime_env=runtime_env,
+                _allow_prepared_fastpath=_allow_prepared_fastpath,
+            )
+        except BaseException as exc:
+            if run_project_checks and config.commands:
+                _evict_same_run_private_prepared_for_attempt(
+                    attempt_id,
+                    reason="verify-attempt-exception",
+                )
+            for terminal_event, terminal_fields in pending_stage_finishes(
+                terminal_reason="exception"
+            ):
+                emit_verification_event(
+                    telemetry_path,
+                    terminal_event,
+                    projectPath=str(project_dir),
+                    label=progress_label,
+                    assignment=assignment_hash,
+                    **terminal_fields,
+                )
+            resources_after = process_resource_snapshot()
+            emit_verification_event(
+                telemetry_path,
+                "verify.attempt.finish",
+                projectPath=str(project_dir),
+                label=progress_label,
+                assignment=assignment_hash,
+                outcome="exception",
+                ok=False,
+                durationMs=int((time.monotonic() - started) * 1000),
+                cpuMs=max(0, resources_after.cpu_ms - resources_before.cpu_ms),
+                rssBytes=resources_after.rss_bytes,
+                peakRssBytes=resources_after.peak_rss_bytes,
+                errorType=type(exc).__name__,
+                **identity_fields,
+            )
+            raise
+
+        if proof_identity is not None:
+            effective_identity = _effective_result_proof_identity(
+                proof_identity,
+                result,
+                config=config,
+                run_project_checks=run_project_checks,
+            )
+            result = dataclasses.replace(
+                result,
+                preparation_proof_key=effective_identity.preparation_proof_key,
+            )
+            if run_project_checks and config.commands:
+                if result.kind in {"project", "passed"}:
+                    _park_same_run_private_prepared_snapshot(
+                        effective_identity.preparation_proof_key,
+                        project_dir,
+                    )
+                else:
+                    _evict_same_run_private_prepared_for_attempt(
+                        attempt_id,
+                        reason=f"verify-result-{result.kind}",
+                    )
+
+        for terminal_event, terminal_fields in pending_stage_finishes(
+            terminal_reason=result.kind
+        ):
+            emit_verification_event(
+                telemetry_path,
+                terminal_event,
+                projectPath=str(project_dir),
+                label=progress_label,
+                assignment=assignment_hash,
+                **terminal_fields,
+            )
+        resources_after = process_resource_snapshot()
+        emit_verification_event(
+            telemetry_path,
+            "verify.attempt.finish",
+            projectPath=str(project_dir),
+            label=progress_label,
+            assignment=assignment_hash,
+            outcome=result.kind,
+            ok=result.ok,
+            summary=result.summary,
+            durationMs=int((time.monotonic() - started) * 1000),
+            cpuMs=max(0, resources_after.cpu_ms - resources_before.cpu_ms),
+            rssBytes=resources_after.rss_bytes,
+            peakRssBytes=resources_after.peak_rss_bytes,
+            **identity_fields,
+        )
+        return result
+
+
+
+def _retry_assignment_without_prepared_fastpath(
+    project_dir: Path,
+    assignment: Mapping[str, str],
+    *,
+    config: BaselineVerifyConfig,
+    run_project_checks: bool,
+    remove_packages: Iterable[str],
+    progress: Optional[ProgressCallback],
+    progress_label: str,
+    proof_identity: VerificationProofIdentity,
+    runtime_env: Optional[Mapping[str, str]] = None,
+) -> BaselineVerifyResult:
+    # Project checks run only after ResolverProof + ResolvedState have been
+    # captured. Preserve that exact proof identity and restore the exact
+    # ResolvedState on retry instead of needlessly resolving from the network
+    # again. The quarantined prepared snapshot is still rebuilt, and every
+    # project clone is forced onto the private full-copy path.
+    retry_config = dataclasses.replace(
+        config,
+        reuse_resolver_proof_key=proof_identity.resolver_input_key,
+    )
+    return _verify_assignment_uncached(
+        project_dir,
+        assignment,
+        config=retry_config,
+        run_project_checks=run_project_checks,
+        remove_packages=remove_packages,
+        progress=progress,
+        progress_label=progress_label,
+        proof_identity=proof_identity,
+        runtime_env=runtime_env,
+        _allow_prepared_fastpath=False,
+    )
+
+
+def verify_assignment(
+    project_dir: Path,
+    assignment: Mapping[str, str],
+    *,
+    config: BaselineVerifyConfig,
+    run_project_checks: bool = False,
+    remove_packages: Iterable[str] = (),
+    progress: Optional[ProgressCallback] = None,
+    progress_label: str = "assignment verification",
+    runtime_env: Optional[Mapping[str, str]] = None,
+) -> BaselineVerifyResult:
+    """Cache-aware proof entry point with ResolvedState-bound project proofs."""
+    project_dir = project_dir.resolve()
+    # These are readiness reads; identity construction and materialization
+    # validate the sealed bytes before admitting any verification evidence.
+    snapshot = active_source_snapshot(project_dir)
+    preflight_project = snapshot.project_path if snapshot is not None else project_dir
+    try:
+        _validate_assignment_materialization(
+            preflight_project,
+            assignment,
+            remove_packages=remove_packages,
+        )
+    except AssignmentMaterializationError as exc:
+        return BaselineVerifyResult(False, "unknown", str(exc))
+
+    try:
+        live_topology = resolve_project_topology(
+            preflight_project,
+            allow_discovery=False,
+            require_supported=True,
+        )
+    except ProjectTopologyError as exc:
+        return BaselineVerifyResult(
+            False,
+            "infrastructure",
+            f"PROJECT_TOPOLOGY_UNSUPPORTED: {exc}",
+            workspace=str(project_dir),
+        )
+    proof_store = VerificationProofStore(
+        Path(config.proof_cache_dir) if config.proof_cache_dir else None
+    )
+    if proof_store.root is None:
+        return _verify_assignment_uncached(
+            project_dir,
+            assignment,
+            config=config,
+            run_project_checks=run_project_checks,
+            remove_packages=remove_packages,
+            progress=progress,
+            progress_label=progress_label,
+            runtime_env=runtime_env,
+        )
+
+    manager = live_topology.profile.manager
+    executable = resolve_executable(manager)
+    if not executable:
+        return _verify_assignment_uncached(
+            project_dir,
+            assignment,
+            config=config,
+            run_project_checks=run_project_checks,
+            remove_packages=remove_packages,
+            progress=progress,
+            progress_label=progress_label,
+        )
+
+    environment = project_verification_environment()
+    if runtime_env:
+        # The EXPLICIT project/CI Node runtime participates in proof identity:
+        # a proof cached under the ambient host Node must never be reused for a
+        # different requested runtime, and tool identity in the proof must name
+        # the runtime CI actually uses.
+        environment = project_verification_environment(runtime_env)
+    try:
+        identity = build_verification_proof_identity(
+            project_dir,
+            assignment=assignment,
+            remove_packages=tuple(sorted(str(item) for item in remove_packages)),
+            resolver_overrides=config.resolver_overrides,
+            manager=manager,
+            manager_executable=executable,
+            registry=config.registry,
+            project_checks=config.project_checks if run_project_checks else "off",
+            commands=config.commands if run_project_checks else (),
+            environment=environment,
+            assignment_semantics=_assignment_observation_semantics(config, assignment),
+        )
+    except SourceIdentityUnavailable as exc:
+        return BaselineVerifyResult(False, "infrastructure", str(exc))
+    telemetry_path = Path(config.telemetry_path).resolve() if config.telemetry_path else None
+
+    cache_operations: Dict[Tuple[str, str], str] = {}
+
+    def cache_event(name: str, proof_type: str, key: str, **extra: object) -> None:
+        operation_key = (proof_type, key)
+        if name == "proof.cache.lookup":
+            operation_id = new_observability_id("cache")
+            cache_operations[operation_key] = operation_id
+        else:
+            operation_id = cache_operations.get(operation_key) or new_observability_id("cache")
+            if name in {"proof.cache.hit", "proof.cache.miss", "proof.cache.rejected"}:
+                cache_operations.pop(operation_key, None)
+        emit_verification_event(
+            telemetry_path,
+            name,
+            projectPath=str(project_dir),
+            label=progress_label,
+            proofType=proof_type,
+            cacheKey=key,
+            cacheOperationId=operation_id,
+            **identity.event_fields(),
+            **extra,
+        )
+
+    wants_project_proof = bool(
+        run_project_checks and config.project_checks != "off" and config.commands
+    )
+
+    cache_event("proof.cache.lookup", "resolver", identity.resolver_input_key)
+    resolver_record = proof_store.lookup_pass("resolver", identity.resolver_input_key)
+    resolved_state = (
+        load_resolved_dependency_state(
+            resolver_record.metadata,
+            proof_cache_dir=proof_store.root,
+        )
+        if resolver_record is not None
+        else None
+    )
+    resolver_hit = resolver_record is not None and resolved_state is not None
+    if resolver_record is not None and resolved_state is None:
+        cache_event(
+            "proof.cache.rejected",
+            "resolver",
+            identity.resolver_input_key,
+            reason="resolved-state-artifact-invalid-or-missing",
+        )
+    elif resolver_hit and resolved_state is not None:
+        identity = bind_resolved_state_identity(
+            identity,
+            resolved_state.key,
+            project_checks=config.project_checks if run_project_checks else "off",
+            commands=config.commands if run_project_checks else (),
+        )
+        cache_event(
+            "proof.cache.hit",
+            "resolver",
+            identity.resolver_input_key,
+        )
+    else:
+        cache_event("proof.cache.miss", "resolver", identity.resolver_input_key)
+
+    # Arbitrary shell commands may invoke undeclared external runtimes. Their
+    # PASS is not durable-reusable until a declared tool closure exists.
+    project_cache_reusable = wants_project_proof and project_proof_cache_reusable(config.commands)
+    if project_cache_reusable and resolver_hit:
+        cache_event("proof.cache.lookup", "project", identity.project_proof_key)
+        project_record = proof_store.lookup_pass("project", identity.project_proof_key)
+        if project_record is not None:
+            cache_event("proof.cache.hit", "project", identity.project_proof_key)
+            emit_verification_event(
+                telemetry_path,
+                "verify.resolver.skipped",
+                projectPath=str(project_dir),
+                label=progress_label,
+                operationId=new_observability_id("resolver-skip"),
+                reason="exact-project-proof-hit",
+                **identity.event_fields(),
+            )
+            _emit_progress(
+                progress,
+                f"{progress_label}: exact ProjectProof cache HIT for ResolvedState "
+                f"{identity.resolved_state_key[:12]}; install/lifecycle/checks skipped",
+            )
+            assert resolved_state is not None
+            return BaselineVerifyResult(
+                True,
+                "passed",
+                "exact ProjectProof cache hit",
+                command=f"proof-cache:{identity.project_proof_key[:12]}",
+                observed_resolved_versions={
+                    str(name): str(version)
+                    for name, version in dict(
+                        project_record.metadata.get("observedResolvedVersions") or {}
+                    ).items()
+                },
+                observed_resolved_hash=str(
+                    project_record.metadata.get("observedResolvedHash") or ""
+                ),
+                resolved_state_key=resolved_state.key,
+                resolved_lockfile_path=resolved_state.lockfile_path,
+                resolved_lockfile_hash=resolved_state.lockfile_hash,
+                resolved_state_artifact=resolved_state.artifact_relative_path,
+            )
+        cache_event("proof.cache.miss", "project", identity.project_proof_key)
+
+    if resolver_hit and not wants_project_proof:
+        emit_verification_event(
+            telemetry_path,
+            "verify.resolver.skipped",
+            projectPath=str(project_dir),
+            label=progress_label,
+            operationId=new_observability_id("resolver-skip"),
+            reason="exact-resolver-proof-hit",
+            **identity.event_fields(),
+        )
+        _emit_progress(
+            progress,
+            f"{progress_label}: exact ResolverProof + ResolvedState cache HIT; resolver verification skipped",
+        )
+        assert resolver_record is not None and resolved_state is not None
+        return BaselineVerifyResult(
+            True,
+            "passed",
+            "exact ResolverProof cache hit",
+            command=f"proof-cache:{identity.resolver_input_key[:12]}",
+            observed_resolved_versions={
+                str(name): str(version)
+                for name, version in dict(
+                    resolver_record.metadata.get("observedResolvedVersions") or {}
+                ).items()
+            },
+            observed_resolved_hash=str(
+                resolver_record.metadata.get("observedResolvedHash") or ""
+            ),
+            resolved_state_key=resolved_state.key,
+            resolved_lockfile_path=resolved_state.lockfile_path,
+            resolved_lockfile_hash=resolved_state.lockfile_hash,
+            resolved_state_artifact=resolved_state.artifact_relative_path,
+        )
+
+    effective_config = (
+        dataclasses.replace(
+            config,
+            reuse_resolver_proof_key=identity.resolver_input_key,
+        )
+        if resolver_hit and wants_project_proof
+        else config
+    )
+    return _verify_assignment_uncached(
+        project_dir,
+        assignment,
+        config=effective_config,
+        run_project_checks=run_project_checks,
+        remove_packages=remove_packages,
+        progress=progress,
+        progress_label=progress_label,
+        proof_identity=identity,
+        runtime_env=runtime_env,
+    )
+
+# BLOCK_Y_OBSERVABILITY_CONTRACT_V1
+_verify_assignment_cache_aware_impl = verify_assignment
+
+
+def _verify_assignment_with_pinned_source(
+    project_dir: Path, assignment: Mapping[str, str], *, config: BaselineVerifyConfig,
+    **kwargs,
+) -> BaselineVerifyResult:
+    # Cache identity and execution must consume the same sealed bytes. Without
+    # a caller epoch, hashing live source before a separate capture races edits
+    # and performs an unnecessary full-tree content pass.
+    try:
+        if not config.proof_cache_dir:
+            # The uncached verifier issues its receipt from the materialized
+            # source. Avoid an additional top-level capture for ad-hoc checks.
+            return _verify_assignment_cache_aware_impl(project_dir, assignment, config=config, **kwargs)
+        pin_started = time.monotonic()
+        pin_finished = False
+        pin_operation = new_observability_id("source-pin")
+        emit_observability_event("verify.source-pin.start", operationId=pin_operation)
+        with verification_source_snapshot_scope(
+            project_dir,
+            timeout_seconds=0 if config.unbounded_preparation else config.snapshot_copy_timeout_seconds,
+            progress=kwargs.get("progress"),
+            progress_interval_seconds=config.progress_interval_seconds,
+            reuse_completed=True,
+            recovery_directory=(Path(config.recovery_journal_dir or config.proof_cache_dir) / "sc"
+                                if config.recovery_checkpoints and (config.recovery_journal_dir or config.proof_cache_dir) else None),
+        ) as subject:
+            pin_finished = True
+            emit_observability_event("verify.source-pin.finish", operationId=pin_operation,
+                durationMs=int((time.monotonic() - pin_started) * 1000), outcome="passed")
+            result = _verify_assignment_cache_aware_impl(project_dir, assignment, config=config, **kwargs)
+            if result.ok:
+                result = dataclasses.replace(result, verified_source_snapshot_key=subject.key,
+                    verified_assignment_fingerprint=assignment_fingerprint(assignment))
+            return result
+    except SourceCaptureError as exc:
+        if "pin_operation" in locals() and not pin_finished:
+            emit_observability_event("verify.source-pin.finish", operationId=pin_operation,
+                durationMs=int((time.monotonic() - pin_started) * 1000), outcome="failed")
+        return BaselineVerifyResult(False, "infrastructure", f"source snapshot preparation failed: {exc}")
+
+
+def verify_assignment(
+    project_dir: Path,
+    assignment: Mapping[str, str],
+    *,
+    config: BaselineVerifyConfig,
+    run_project_checks: bool = False,
+    remove_packages: Iterable[str] = (),
+    progress: Optional[ProgressCallback] = None,
+    progress_label: str = "assignment verification",
+    runtime_env: Optional[Mapping[str, str]] = None,
+) -> BaselineVerifyResult:
+    project_dir = project_dir.resolve()
+    remove_packages = tuple(str(item) for item in remove_packages)
+    telemetry_path = Path(config.telemetry_path).resolve() if config.telemetry_path else None
+    request_id = new_observability_id("request")
+    started = time.monotonic()
+    resources_before = process_resource_snapshot()
+    assignment_hash = assignment_fingerprint(assignment)
+    request_overrides = normalized_resolver_overrides(config.resolver_overrides)
+    request_override_key = resolver_override_fingerprint(
+        request_overrides, length=32
+    )
+
+    with request_scope(request_id):
+        emit_verification_event(
+            telemetry_path,
+            "verify.request.start",
+            projectPath=str(project_dir),
+            label=progress_label,
+            assignment=assignment_hash,
+            runProjectChecks=run_project_checks,
+            projectChecks=config.project_checks,
+            commands=list(config.commands),
+            resolverOverrides=request_overrides,
+            resolverOverrideKey=request_override_key,
+        )
+        try:
+            if run_project_checks and config.project_checks != "off" and config.commands:
+                coordination_key = _preparation_coordination_key(
+                    project_dir, assignment, remove_packages, config
+                )
+                with _coalesce_same_run_preparation(coordination_key) as waited:
+                    if waited:
+                        emit_verification_event(
+                            telemetry_path,
+                            "same-run.prepared-artifact.coalesced",
+                            identity=assignment_hash,
+                            consumer=progress_label,
+                        )
+                    result = _verify_assignment_with_pinned_source(
+                        project_dir,
+                        assignment,
+                        config=config,
+                        run_project_checks=run_project_checks,
+                        remove_packages=remove_packages,
+                        progress=progress,
+                        progress_label=progress_label,
+                        runtime_env=runtime_env,
+                    )
+            else:
+                result = _verify_assignment_with_pinned_source(
+                    project_dir,
+                    assignment,
+                    config=config,
+                    run_project_checks=run_project_checks,
+                    remove_packages=remove_packages,
+                    progress=progress,
+                    progress_label=progress_label,
+                    runtime_env=runtime_env,
+                )
+        except BaseException as exc:
+            resources_after = process_resource_snapshot()
+            emit_verification_event(
+                telemetry_path,
+                "verify.request.finish",
+                projectPath=str(project_dir),
+                label=progress_label,
+                assignment=assignment_hash,
+                outcome="exception",
+                ok=False,
+                durationMs=int((time.monotonic() - started) * 1000),
+                cpuMs=max(0, resources_after.cpu_ms - resources_before.cpu_ms),
+                rssBytes=resources_after.rss_bytes,
+                peakRssBytes=resources_after.peak_rss_bytes,
+                errorType=type(exc).__name__,
+            )
+            emit_verification_event(
+                telemetry_path,
+                "verification.run.summary",
+                **run_summary_payload(),
+            )
+            raise
+
+        resources_after = process_resource_snapshot()
+        emit_verification_event(
+            telemetry_path,
+            "verify.request.finish",
+            projectPath=str(project_dir),
+            label=progress_label,
+            assignment=assignment_hash,
+            outcome=result.kind,
+            ok=result.ok,
+            summary=result.summary,
+            durationMs=int((time.monotonic() - started) * 1000),
+            cpuMs=max(0, resources_after.cpu_ms - resources_before.cpu_ms),
+            rssBytes=resources_after.rss_bytes,
+            peakRssBytes=resources_after.peak_rss_bytes,
+        )
+        emit_verification_event(
+            telemetry_path,
+            "verification.run.summary",
+            **run_summary_payload(),
+        )
+        return result
+
