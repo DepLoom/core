@@ -7,7 +7,6 @@ These tests exercise the real Core data types, plan builder and artifact writer.
 """
 import json
 import tempfile
-import time
 import unittest
 from pathlib import Path
 
@@ -152,7 +151,9 @@ class DraftPublicationContractTests(unittest.TestCase):
 
     def test_deadline_budget_has_explicit_phase_and_disabled_state(self) -> None:
         clock = roadmap.DeadlineClock(0.001)
-        time.sleep(0.01)
+        # Do not sleep 10 ms: coarse monotonic timer granularity on Windows
+        # can leave the clock unexpired. Move only the synthetic start point.
+        clock.started -= 1.0
         with self.assertRaises(roadmap.DraftBudgetExceeded) as caught:
             clock.check("synthetic-phase")
         self.assertEqual("synthetic-phase", caught.exception.phase)
