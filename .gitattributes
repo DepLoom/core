@@ -1,0 +1,6 @@
+# Preserve hash-bound Core bytes on Windows and Linux.
+*.py text eol=lf
+*.schema.json text eol=lf
+/document_locales/*.json text eol=lf
+/VERSION text eol=lf
+/.gitattributes text eol=lf
