@@ -40,8 +40,9 @@ python dependency_live_roadmap_generator.py --help
 python -m unittest discover -s tests -p "test_required_planner.py" -v
 ```
 
-The independent [lightweight CI](.github/workflows/ci.yml) covers focused
-contract, target/transition and input-identity tests on Linux and Windows.
+The independent [lightweight CI](.github/workflows/ci.yml) runs a curated,
+headless planner regression suite on Linux and Windows. See the
+[testing boundary](docs/TESTING.md) for coverage and exclusions.
 It does not run Electron, Desktop, npm migration benchmarks or the historical
 monorepo test suite.
 
