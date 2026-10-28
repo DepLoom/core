@@ -23,7 +23,7 @@ The first extraction had six focused test modules. The added tests cover:
 | Finite-domain solver | Oracle, Z3, exact assignment, monotonicity and fallback |
 | Compatibility and transition | Current/target peer relationships, cross-group cohorts, learner nogoods, mandatory updates |
 | Planning intent | Explicit mutable scope, `required`, deferrals, decision/health target selection |
-| Draft publication | Candidate search cap/truncation, Yellow/Green, target security UNKNOWN and goal summaries |
+| Draft publication | Run-scoped `plan.json`/`result.json`, immutable input hashes, honest partial status, candidate cap/truncation, Yellow/Green, target security UNKNOWN and goal summaries |
 | Registry metadata | Cache identity, credential boundaries, local test registry, concurrent access |
 | Workspace | Topology, package-manager control files, glob expansion, input coverage |
 | Provenance | Source/lock identity, plans/entrypoints, evidence references and replayable inputs |
