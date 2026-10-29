@@ -24286,6 +24286,12 @@ def _draft_row_status(row: DependencyRow, chosen_target: str) -> str:
     current = str(row.current_version or "").strip()
     target = str(chosen_target or "").strip()
     if target == NO_ACTION or target == "":
+        exact_contract = _baseline_intent_payload()["decisionContract"]
+        if (exact_contract["objective"] == EXPLICIT_VERSIONS
+                and row.name in (exact_contract.get("exactTargets") or {})):
+            # User explicitly requested a concrete target. Keeping the healthy
+            # baseline is NOT success: missing target evidence is a blocker.
+            return "blocked"
         if not _row_security_known(row) or _row_has_unrated_vulns(row):
             return "unknown-security"
         if _draft_policy_satisfied(row):
