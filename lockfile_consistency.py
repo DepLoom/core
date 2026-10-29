@@ -287,6 +287,11 @@ def registry_artifact_url_allowed(registry: str, url: str) -> bool:
         return True
     # VCS resolutions are not npm tarballs; preserve their separate lockfile
     # policy while rejecting unknown URL schemes and embedded passwords.
+    if parsed.scheme == "file":
+        # An absolute local file:/// resolution is not a registry artifact.
+        # Do not interpret remote file://host paths as local resources.
+        return (value == value.strip() and parsed.netloc in {"", "localhost"}
+                and bool(parsed.path) and not parsed.query and not parsed.fragment)
     if parsed.scheme in {"git", "git+ssh", "git+https", "ssh"}:
         try:
             return (value == value.strip() and bool(parsed.hostname)
