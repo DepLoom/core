@@ -76,3 +76,15 @@ candidate will now be rejected, and its target/status may legitimately change
 from `PROPOSED` to `NO_TARGET`. The **benign** matching/foreign registry
 comparison, semantic solver, security UNKNOWN status and policy are unchanged.
 The diagnostics still make no claim of installed-tree or runtime proof.
+ 
+## P2.6 malformed packument shape
+
+A top-level JSON object alone is not evidence of a valid npm packument.
+Before caching or analyzing real registry responses, Core now checks that
+`versions` is a map, each version has an object record, `dist` (when
+present) is an object and `dist.tarball` (when present) is a string;
+optional `dist-tags` and `time` must be objects. A malformed registry
+response becomes a typed registry infrastructure failure and a Draft
+`UNKNOWN_METADATA` row, not a false clean plan or uncaught `AttributeError`.
+Legitimate HTTP 404 package absence remains independently representable.
+Tests send malformed JSON packuments via a real localhost HTTP server.

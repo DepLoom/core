@@ -168,3 +168,39 @@ class RegistryPromptSanitizationTests(unittest.TestCase):
         self.assertEqual('https://nexus.invalid/repository/[redacted]/npm',sanitized)
     def test_public_registry_prompt_retains_origin(self):
         self.assertEqual('https://registry.npmjs.org',core._sanitize_registry_url('https://registry.npmjs.org'))
+
+class MalformedPackumentIsUnknownNotClean(unittest.TestCase):
+    def test_invalid_nested_metadata_is_rejected_before_plan_or_cache(self):
+        from registry_candidate_diagnostics import valid_registry_packument_shape
+        valid={"versions":{"1.0.0":{"dist":{}}},"dist-tags":{"latest":"1.0.0"}}
+        self.assertTrue(valid_registry_packument_shape(valid))
+        broken=[{"versions":[]}, {"versions":{"1.0.0":None}},
+                {"versions":{"1.0.0":{"dist":[]}}},
+                {"versions":{"1.0.0":{"dist":{"tarball":42}}}},
+                {"versions":{},"dist-tags":[]}, {"versions":{},"time":"bad"}]
+        for bad in broken:
+            with self.subTest(bad=bad):
+                self.assertFalse(valid_registry_packument_shape(bad))
+
+    def test_real_local_http_invalid_packument_cannot_be_known_clean(self):
+        # Real HTTP, deliberately invalid registry response, no live npm/OSV.
+        payload={"versions":{"1.0.0":{"dist":{"tarball":999}}},"dist-tags":{"latest":"1.0.0"}}
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self,*args): pass
+            def do_GET(self):
+                body=json.dumps(payload).encode()
+                self.send_response(200)
+                self.send_header('Content-Type','application/json')
+                self.send_header('Content-Length',str(len(body)))
+                self.end_headers();self.wfile.write(body)
+        server=http.server.ThreadingHTTPServer(('127.0.0.1',0),Handler)
+        worker=threading.Thread(target=server.serve_forever,daemon=True);worker.start()
+        try:
+            client=core.LiveDataClient(f'http://127.0.0.1:{server.server_port}',timeout=2,
+                                       batch_size=2,sleep_sec=0,use_system_proxy=False)
+            with self.assertRaises(core.RegistryInfrastructureError) as failed:
+                client.fetch_npm_metadata('demo')
+            self.assertIn('invalid registry response',str(failed.exception))
+            self.assertNotIn('demo',client.npm_cache)
+        finally:
+            server.shutdown();server.server_close();worker.join(timeout=3)

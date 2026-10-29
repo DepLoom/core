@@ -96,7 +96,8 @@ from draft_input_identity import capture_draft_semantic_inputs, aggregate_semant
 from storybook_release_policy import is_storybook_release_package
 from registry_candidate_diagnostics import (
     summarize_structural_candidates, with_observed_physical_probes,
-    no_target_diagnostic_code, safe_registry_artifact_url, _identity as safe_registry_identity,
+    no_target_diagnostic_code, safe_registry_artifact_url, valid_registry_packument_shape,
+    _identity as safe_registry_identity,
 )
 
 from deploom_failure import build_failure, write_diagnostic_artifact
@@ -2966,9 +2967,16 @@ class LiveDataClient:
             self.npm_cache.clear()
             self._metadata_request_context = context
         if pkg in self.npm_cache:
-            return self.npm_cache[pkg]
+            if self.npm_cache[pkg] is None or valid_registry_packument_shape(self.npm_cache[pkg]):
+                return self.npm_cache[pkg]
+            self.npm_cache.pop(pkg, None)
         data, executed, *_ = cached_query(["public-packument-v1", self.registry, context, pkg], fetch,
                                          ttl=self.metadata_cache_ttl, check=check)
+        if data is None:  # legitimate registry HTTP 404 package absence
+            self.npm_cache[pkg] = None
+            return None
+        if not valid_registry_packument_shape(data):
+            raise RegistryInfrastructureError("REGISTRY_METADATA_INVALID_SHAPE: cached metadata lacks valid versions/dist")
         if not executed and isinstance(data, dict):
             self._metadata_cache_disk_hits += 1
         self.npm_cache[pkg] = data
@@ -2980,7 +2988,9 @@ class LiveDataClient:
             self.npm_cache.clear()
             self._metadata_request_context = context
         if pkg in self.npm_cache:
-            return self.npm_cache[pkg]
+            if self.npm_cache[pkg] is None or valid_registry_packument_shape(self.npm_cache[pkg]):
+                return self.npm_cache[pkg]
+            self.npm_cache.pop(pkg, None)
         if durable and self.metadata_cache_dir is not None and self.metadata_cache_ttl > 0:
             # C2: planning packument cache -- merge latest/version/engines/
             # history metadata queries across CLI invocations. Only a fresh
@@ -2988,7 +2998,7 @@ class LiveDataClient:
             cached = load_packument(
                 self.metadata_cache_dir, self.registry, pkg, self.metadata_cache_ttl, context=context or ""
             )
-            if cached is not None:
+            if cached is not None and valid_registry_packument_shape(cached):
                 self.npm_cache[pkg] = cached
                 self._metadata_cache_disk_hits += 1
                 return cached
@@ -3014,6 +3024,8 @@ class LiveDataClient:
                 if status == 304 and stale is not None:
                     response.close()
                     data = stale["data"]
+                    if not valid_registry_packument_shape(data):
+                        raise ValueError("304 response has invalid cached registry packument")
                     store_packument(self.metadata_cache_dir, self.registry, pkg, data,
                                     self.metadata_cache_tool_version, context=context or "", validators=stale["validators"])
                     self.npm_cache[pkg] = data
@@ -3031,8 +3043,8 @@ class LiveDataClient:
                     return None
                 response.raise_for_status()
                 data = self._bounded_json(response)
-                if not isinstance(data, dict):
-                    raise ValueError("registry metadata response is not a JSON object")
+                if not valid_registry_packument_shape(data):
+                    raise ValueError("registry packument has invalid versions/dist-tags/time/dist shape")
                 self.npm_cache[pkg] = data
                 if durable and self.metadata_cache_dir is not None and self.metadata_cache_ttl > 0:
                     # Best-effort; a cache write failure never aborts the run.

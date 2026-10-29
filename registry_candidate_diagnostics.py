@@ -66,6 +66,30 @@ def _decoded_segments(path: str) -> list[str] | None:
     return result
 
 
+def valid_registry_packument_shape(raw: Any) -> bool:
+    """Fail closed on malformed packument nesting, not just top-level JSON.
+
+    An accepted packument may contain versions with missing dist.tarball:
+    that is ordinary candidate-rejection evidence, not a malformed JSON
+    structure. A typed but invalid dist.tarball, by contrast, cannot be used
+    as evidence that the package has no installable version.
+    """
+    if not isinstance(raw, dict) or not isinstance(raw.get("versions"), dict):
+        return False
+    for field in ("dist-tags", "time"):
+        if field in raw and raw[field] is not None and not isinstance(raw[field], dict):
+            return False
+    for version, details in raw["versions"].items():
+        if not isinstance(version, str) or not isinstance(details, dict):
+            return False
+        dist = details.get("dist")
+        if dist is not None and not isinstance(dist, dict):
+            return False
+        if isinstance(dist, dict) and "tarball" in dist and dist["tarball"] is not None and not isinstance(dist["tarball"], str):
+            return False
+    return True
+
+
 def safe_registry_artifact_url(registry: str, artifact: str) -> bool:
     """Strict same-origin, same-path policy; no redirect or network I/O.
 
