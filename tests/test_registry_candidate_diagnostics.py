@@ -293,9 +293,10 @@ class SecurityReviewIdentityTests(unittest.TestCase):
 
     def test_no_installable_artifact_requires_all_newer_candidates_rejected(self):
         from registry_candidate_diagnostics import no_target_diagnostic_code
-        self.assertEqual("UNRESOLVED_TARGET_CONSTRAINT_OR_POLICY", no_target_diagnostic_code(
+        self.assertIsNone(no_target_diagnostic_code(
             "no-target", {"upgradeCandidates": 2, "acceptedUpgradeCandidates": 1,
-                          "allUpgradeCandidatesRejected": False}))
+                          "allUpgradeCandidatesRejected": False}),
+            "incomplete counts must not publish a confident diagnostic")
         self.assertEqual("CANDIDATE_CAP", no_target_diagnostic_code(
             "candidate-search-truncated", {"allUpgradeCandidatesRejected": True}))
 
