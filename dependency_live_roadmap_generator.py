@@ -66,7 +66,7 @@ import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from enum import Enum
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
@@ -94,6 +94,11 @@ from draft_decision_contract import (
 )
 from draft_input_identity import capture_draft_semantic_inputs, aggregate_semantic_inputs
 from storybook_release_policy import is_storybook_release_package
+from registry_candidate_diagnostics import (
+    summarize_structural_candidates, with_observed_physical_probes,
+    no_target_diagnostic_code, safe_registry_artifact_url, valid_registry_packument_shape,
+    _identity as safe_registry_identity,
+)
 
 from deploom_failure import build_failure, write_diagnostic_artifact
 from cli_io import configure_utf8_stdio
@@ -1059,6 +1064,7 @@ class DependencyRow:
     planning_min_lag_3m: str = ""
     lag_planning_source: str = "live"
     registry_artifacts: Dict[str, Dict[str, Any]] = dataclasses.field(default_factory=dict)
+    registry_candidate_diagnostics: Dict[str, Any] = dataclasses.field(default_factory=dict)
     compatibility_cohort: str = ""
     compatibility_note: str = ""
     constraint_preflight: Dict[str, Any] = dataclasses.field(default_factory=dict)
@@ -2689,27 +2695,14 @@ class LiveDataClient:
         return scheme, host, port
 
     def registry_artifact_url_allowed(self, url: str) -> bool:
-        """Allow package artifacts only from the configured registry path.
+        """Fail-closed same-origin/path admission for registry artifacts.
 
-        Release notes may still come from GitHub, but package-manager metadata,
-        tarballs and lockfile `resolved` URLs must stay inside the configured
-        registry.  This prevents a Nexus-backed roadmap from silently selecting
-        a public npm/yarn artifact.
+        Match the lockfile validator and never permit credentials, redirects,
+        ambiguous dot-segments, signed queries or malformed authority to
+        create a candidate. This only tightens unsafe URL admission; it does
+        not alter solver constraints or the diagnostic reason taxonomy.
         """
-        value = str(url or "").strip()
-        if not value:
-            return False
-        registry_parsed = urlparse(self.registry)
-        artifact_parsed = urlparse(value)
-        if self._origin_tuple(self.registry) != self._origin_tuple(value):
-            return False
-        registry_path = registry_parsed.path.rstrip("/")
-        artifact_path = artifact_parsed.path or ""
-        if registry_path and not (
-            artifact_path == registry_path or artifact_path.startswith(registry_path + "/")
-        ):
-            return False
-        return artifact_parsed.scheme in {"http", "https"} and bool(artifact_parsed.hostname)
+        return safe_registry_artifact_url(self.registry, url)
 
     def registry_tarball_url(self, meta: Dict[str, Any], version: str) -> str:
         version_meta = (meta.get("versions") or {}).get(version)
@@ -2776,28 +2769,54 @@ class LiveDataClient:
 
         response = None
         try:
-            response = self._supervised(
-                lambda tarball_url=tarball_url: self.session.get(
-                    tarball_url,
-                    timeout=self._budgeted_timeout(),
-                    stream=True,
-                    headers={"Range": "bytes=0-0", "Accept": "application/octet-stream"},
-                    allow_redirects=True,
+            # requests follows redirects *before* its caller can validate the
+            # final URL. Never send a request to an unapproved destination.
+            # Also bound the number of allowed same-registry redirects.
+            next_url = tarball_url
+            for redirect_count in range(6):
+                response = self._supervised(
+                    lambda target=next_url: self.session.get(
+                        target,
+                        timeout=self._budgeted_timeout(),
+                        stream=True,
+                        headers={"Range": "bytes=0-0", "Accept": "application/octet-stream"},
+                        allow_redirects=False,
+                    )
                 )
-            )
-            evidence["httpStatus"] = int(response.status_code)
-            evidence["finalUrl"] = str(response.url or tarball_url)
-            if not self.registry_artifact_url_allowed(evidence["finalUrl"]):
-                evidence["status"] = "foreign-registry-redirect"
-                evidence["error"] = "tarball redirected outside the configured registry"
+                evidence["httpStatus"] = int(response.status_code)
+                if response.status_code not in {301, 302, 303, 307, 308}:
+                    break
+                location = response.headers.get("Location")
+                destination = urljoin(next_url, location) if location else ""
+                response.close()
+                response = None
+                if not destination or not self.registry_artifact_url_allowed(destination):
+                    evidence["status"] = "foreign-registry-redirect"
+                    evidence["error"] = "tarball redirected outside configured registry or to an invalid URL"
+                    # Never record a secret-bearing untrusted Location header.
+                    evidence["finalUrl"] = ""
+                    break
+                next_url = destination
             else:
-                response.raise_for_status()
-                first = next(response.iter_content(chunk_size=REGISTRY_ARTIFACT_PROBE_BYTES), b"")
-                if first:
-                    evidence["status"] = "available"
+                evidence["status"] = "redirect-limit-exceeded"
+                evidence["error"] = "tarball exceeded bounded same-registry redirect limit"
+
+            if evidence["status"] == "unknown":
+                if response is None:
+                    raise ValueError("artifact probe returned no final response")
+                # Avoid leaking URL query/credentials in downstream evidence.
+                evidence["finalUrl"] = response.url if self.registry_artifact_url_allowed(response.url) else ""
+                if not self.registry_artifact_url_allowed(response.url):
+                    evidence["status"] = "foreign-registry-redirect"
+                    evidence["error"] = "tarball response outside configured registry"
                 else:
-                    evidence["status"] = "empty-artifact"
-                    evidence["error"] = "registry returned an empty artifact response"
+                    response.raise_for_status()
+                    first = next(response.iter_content(chunk_size=REGISTRY_ARTIFACT_PROBE_BYTES), b"")
+                    if first:
+                        evidence["status"] = "available"
+                    else:
+                        evidence["status"] = "empty-artifact"
+                        evidence["error"] = "registry returned an empty artifact response"
         except DraftBudgetExceeded:
             raise
         except requests.HTTPError as exc:
@@ -2948,9 +2967,16 @@ class LiveDataClient:
             self.npm_cache.clear()
             self._metadata_request_context = context
         if pkg in self.npm_cache:
-            return self.npm_cache[pkg]
+            if self.npm_cache[pkg] is None or valid_registry_packument_shape(self.npm_cache[pkg]):
+                return self.npm_cache[pkg]
+            self.npm_cache.pop(pkg, None)
         data, executed, *_ = cached_query(["public-packument-v1", self.registry, context, pkg], fetch,
                                          ttl=self.metadata_cache_ttl, check=check)
+        if data is None:  # legitimate registry HTTP 404 package absence
+            self.npm_cache[pkg] = None
+            return None
+        if not valid_registry_packument_shape(data):
+            raise RegistryInfrastructureError("REGISTRY_METADATA_INVALID_SHAPE: cached metadata lacks valid versions/dist")
         if not executed and isinstance(data, dict):
             self._metadata_cache_disk_hits += 1
         self.npm_cache[pkg] = data
@@ -2962,7 +2988,9 @@ class LiveDataClient:
             self.npm_cache.clear()
             self._metadata_request_context = context
         if pkg in self.npm_cache:
-            return self.npm_cache[pkg]
+            if self.npm_cache[pkg] is None or valid_registry_packument_shape(self.npm_cache[pkg]):
+                return self.npm_cache[pkg]
+            self.npm_cache.pop(pkg, None)
         if durable and self.metadata_cache_dir is not None and self.metadata_cache_ttl > 0:
             # C2: planning packument cache -- merge latest/version/engines/
             # history metadata queries across CLI invocations. Only a fresh
@@ -2970,7 +2998,7 @@ class LiveDataClient:
             cached = load_packument(
                 self.metadata_cache_dir, self.registry, pkg, self.metadata_cache_ttl, context=context or ""
             )
-            if cached is not None:
+            if cached is not None and valid_registry_packument_shape(cached):
                 self.npm_cache[pkg] = cached
                 self._metadata_cache_disk_hits += 1
                 return cached
@@ -2996,6 +3024,8 @@ class LiveDataClient:
                 if status == 304 and stale is not None:
                     response.close()
                     data = stale["data"]
+                    if not valid_registry_packument_shape(data):
+                        raise ValueError("304 response has invalid cached registry packument")
                     store_packument(self.metadata_cache_dir, self.registry, pkg, data,
                                     self.metadata_cache_tool_version, context=context or "", validators=stale["validators"])
                     self.npm_cache[pkg] = data
@@ -3013,8 +3043,8 @@ class LiveDataClient:
                     return None
                 response.raise_for_status()
                 data = self._bounded_json(response)
-                if not isinstance(data, dict):
-                    raise ValueError("registry metadata response is not a JSON object")
+                if not valid_registry_packument_shape(data):
+                    raise ValueError("registry packument has invalid versions/dist-tags/time/dist shape")
                 self.npm_cache[pkg] = data
                 if durable and self.metadata_cache_dir is not None and self.metadata_cache_ttl > 0:
                     # Best-effort; a cache write failure never aborts the run.
@@ -4999,6 +5029,12 @@ def analyze_project(
         # "no installable target" for dependencies whose first N versions are
         # equally old (53/63 lag blockers on the production 77-package run).
         search_versions, _ = versions_from_current(meta, current, include_prerelease, 0)
+        # Explain structural rejection without changing the existing Core allowlist.
+        # This is not proof of physical tarball availability or solver feasibility.
+        registry_candidate_diagnostics = summarize_structural_candidates(
+            client.registry, meta, search_versions,
+            client.registry_artifact_url_allowed, current=current,
+        )
         structural_candidates, registry_candidate_notes = client.registry_structural_candidates(meta, search_versions)
         if registry_candidate_notes:
             notes.append(
@@ -5148,6 +5184,15 @@ def analyze_project(
                 registry_artifacts[candidate_target] = client.registry_version_artifact(
                     name, meta, candidate_target
                 )
+        # Physical evidence is read only from probes that Core already ran.
+        # A Draft planning-only row cannot claim an HTTP success or failure.
+        seen_versions = set(search_versions)
+        registry_candidate_diagnostics = with_observed_physical_probes(
+            registry_candidate_diagnostics,
+            {version: evidence for (pkg, version), evidence in client.registry_artifact_cache.items()
+             if pkg == name and version in seen_versions},
+            current=current,
+        )
         analysis = AnalysisInfo(
             metadata_available=True,
             non_registry=False,
@@ -5180,6 +5225,7 @@ def analyze_project(
             reason=reason,
             notes="; ".join(notes),
             registry_artifacts=registry_artifacts,
+            registry_candidate_diagnostics=registry_candidate_diagnostics,
             vuln_evidence_by_version={v: vuln_summary(entries) for v, entries in (vulns or {}).items()},
             draft_scan_state="done",
             draft_unknown="osv-unavailable" if vulns is None else "",
@@ -24210,6 +24256,7 @@ def build_draft_plan(
     manifests: Dict[str, Any] = {}
     projects: List[str] = sorted(rows_by_project)
     totals = {"proposed": 0, "no-change": 0, "ok": 0, "blocked": 0, "deferred": 0, "excluded": 0, "unknown-metadata": 0, "unknown-security": 0, "no-target": 0, "candidate-search-truncated": 0, "peer-compat-unresolved": 0,
+              "no-installable-artifact": 0,
               "not-attempted": 0, "interrupted": 0, "registry-failed": 0, "osv-unavailable": 0, "unrated": 0, "total": 0}
     scan: Dict[str, Dict[str, int]] = {}
     for project in projects:
@@ -24243,6 +24290,11 @@ def build_draft_plan(
             target = _draft_target_for_major(row)
             status = _draft_row_status(row, target)
             totals[status] = totals.get(status, 0) + 1
+            registry_no_target_code = no_target_diagnostic_code(
+                status, row.registry_candidate_diagnostics,
+            )
+            if registry_no_target_code == "NO_INSTALLABLE_ARTIFACT":
+                totals["no-installable-artifact"] += 1
             totals["total"] += 1
             target_reason = row.reason if row.reason else (
                 row.target_default_reason if row.target_default_reason != NO_ACTION else None
@@ -24285,6 +24337,10 @@ def build_draft_plan(
                 "breakingChanges": list(row.breaking_changes or []),
                 "migrationNotes": list(row.migration_notes or []),
             }
+            if row.registry_candidate_diagnostics:
+                entry["registryCandidateDiagnostics"] = row.registry_candidate_diagnostics
+            if registry_no_target_code:
+                entry["noTargetDiagnosticCode"] = registry_no_target_code
             if row.compatibility_cohort or row.compatibility_note:
                 entry["conflict"] = row.compatibility_note or row.compatibility_cohort
                 conflicts.append({"package": row.name, "project": project, "note": row.compatibility_note or row.compatibility_cohort, "cohort": row.compatibility_cohort})
@@ -24524,8 +24580,29 @@ def build_draft_plan(
             "rows": plan_rows,
             "health": post_health,
         })
+    # Aggregate only codes and counts (never raw package URL or credentials).
+    registry_rejections: Dict[str, int] = defaultdict(int)
+    registry_examined = 0
+    registry_rejected = 0
+    for project_rows in rows_by_project.values():
+        for row in project_rows:
+            evidence = row.registry_candidate_diagnostics
+            if not evidence:
+                continue
+            registry_examined += int(evidence.get("examined", 0))
+            registry_rejected += int(evidence.get("rejected", 0))
+            for code, count in evidence.get("rejectionCounts", {}).items():
+                registry_rejections[code] += int(count)
     return {
         "schemaVersion": 1,
+        "registryDiagnostics": {
+            "schemaVersion": 1,
+            "examinedVersions": registry_examined,
+            "rejectedVersions": registry_rejected,
+            "rejectionCounts": dict(sorted(registry_rejections.items())),
+            "noInstallableArtifactRows": totals["no-installable-artifact"],
+            "authority": "STRUCTURAL_REGISTRY_EVIDENCE_ONLY",
+        },
         "projects": projects,
         "proposals": proposals,
         "unknowns": unknowns,
@@ -24538,17 +24615,18 @@ def build_draft_plan(
 
 
 def _sanitize_registry_url(url: str) -> str:
-    """Strip userinfo (credentials) from a registry URL for prompt output."""
-    text = str(url or "").strip()
-    if not text:
+    """Never print registry userinfo, query, token path or URL fragments.
+
+    Registry secrets may live in *any* path segment, not just a parameter
+    named token. Render the safe identity, not a truncated raw URL.
+    """
+    if not url:
         return ""
-    if "://" in text:
-        scheme, rest = text.split("://", 1)
-        if "@" in rest.split("/", 1)[0]:
-            authority = rest.split("/", 1)[0]
-            rest = rest.replace(authority, authority.rsplit("@", 1)[-1], 1)
-        return f"{scheme}://{rest}"
-    return text
+    identity = safe_registry_identity(url)
+    origin, prefix = identity.get("origin"), identity.get("pathPrefix")
+    if not origin:
+        return "[invalid-registry-url]"
+    return origin + (prefix if prefix and prefix != "/" else "")
 
 
 def _power_shell_quote(value: str) -> str:
