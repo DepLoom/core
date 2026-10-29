@@ -66,7 +66,7 @@ import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from enum import Enum
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
@@ -96,7 +96,7 @@ from draft_input_identity import capture_draft_semantic_inputs, aggregate_semant
 from storybook_release_policy import is_storybook_release_package
 from registry_candidate_diagnostics import (
     summarize_structural_candidates, with_observed_physical_probes,
-    no_target_diagnostic_code,
+    no_target_diagnostic_code, safe_registry_artifact_url, _identity as safe_registry_identity,
 )
 
 from deploom_failure import build_failure, write_diagnostic_artifact
@@ -2694,27 +2694,14 @@ class LiveDataClient:
         return scheme, host, port
 
     def registry_artifact_url_allowed(self, url: str) -> bool:
-        """Allow package artifacts only from the configured registry path.
+        """Fail-closed same-origin/path admission for registry artifacts.
 
-        Release notes may still come from GitHub, but package-manager metadata,
-        tarballs and lockfile `resolved` URLs must stay inside the configured
-        registry.  This prevents a Nexus-backed roadmap from silently selecting
-        a public npm/yarn artifact.
+        Match the lockfile validator and never permit credentials, redirects,
+        ambiguous dot-segments, signed queries or malformed authority to
+        create a candidate. This only tightens unsafe URL admission; it does
+        not alter solver constraints or the diagnostic reason taxonomy.
         """
-        value = str(url or "").strip()
-        if not value:
-            return False
-        registry_parsed = urlparse(self.registry)
-        artifact_parsed = urlparse(value)
-        if self._origin_tuple(self.registry) != self._origin_tuple(value):
-            return False
-        registry_path = registry_parsed.path.rstrip("/")
-        artifact_path = artifact_parsed.path or ""
-        if registry_path and not (
-            artifact_path == registry_path or artifact_path.startswith(registry_path + "/")
-        ):
-            return False
-        return artifact_parsed.scheme in {"http", "https"} and bool(artifact_parsed.hostname)
+        return safe_registry_artifact_url(self.registry, url)
 
     def registry_tarball_url(self, meta: Dict[str, Any], version: str) -> str:
         version_meta = (meta.get("versions") or {}).get(version)
@@ -2781,28 +2768,54 @@ class LiveDataClient:
 
         response = None
         try:
-            response = self._supervised(
-                lambda tarball_url=tarball_url: self.session.get(
-                    tarball_url,
-                    timeout=self._budgeted_timeout(),
-                    stream=True,
-                    headers={"Range": "bytes=0-0", "Accept": "application/octet-stream"},
-                    allow_redirects=True,
+            # requests follows redirects *before* its caller can validate the
+            # final URL. Never send a request to an unapproved destination.
+            # Also bound the number of allowed same-registry redirects.
+            next_url = tarball_url
+            for redirect_count in range(6):
+                response = self._supervised(
+                    lambda target=next_url: self.session.get(
+                        target,
+                        timeout=self._budgeted_timeout(),
+                        stream=True,
+                        headers={"Range": "bytes=0-0", "Accept": "application/octet-stream"},
+                        allow_redirects=False,
+                    )
                 )
-            )
-            evidence["httpStatus"] = int(response.status_code)
-            evidence["finalUrl"] = str(response.url or tarball_url)
-            if not self.registry_artifact_url_allowed(evidence["finalUrl"]):
-                evidence["status"] = "foreign-registry-redirect"
-                evidence["error"] = "tarball redirected outside the configured registry"
+                evidence["httpStatus"] = int(response.status_code)
+                if response.status_code not in {301, 302, 303, 307, 308}:
+                    break
+                location = response.headers.get("Location")
+                destination = urljoin(next_url, location) if location else ""
+                response.close()
+                response = None
+                if not destination or not self.registry_artifact_url_allowed(destination):
+                    evidence["status"] = "foreign-registry-redirect"
+                    evidence["error"] = "tarball redirected outside configured registry or to an invalid URL"
+                    # Never record a secret-bearing untrusted Location header.
+                    evidence["finalUrl"] = ""
+                    break
+                next_url = destination
             else:
-                response.raise_for_status()
-                first = next(response.iter_content(chunk_size=REGISTRY_ARTIFACT_PROBE_BYTES), b"")
-                if first:
-                    evidence["status"] = "available"
+                evidence["status"] = "redirect-limit-exceeded"
+                evidence["error"] = "tarball exceeded bounded same-registry redirect limit"
+
+            if evidence["status"] == "unknown":
+                if response is None:
+                    raise ValueError("artifact probe returned no final response")
+                # Avoid leaking URL query/credentials in downstream evidence.
+                evidence["finalUrl"] = response.url if self.registry_artifact_url_allowed(response.url) else ""
+                if not self.registry_artifact_url_allowed(response.url):
+                    evidence["status"] = "foreign-registry-redirect"
+                    evidence["error"] = "tarball response outside configured registry"
                 else:
-                    evidence["status"] = "empty-artifact"
-                    evidence["error"] = "registry returned an empty artifact response"
+                    response.raise_for_status()
+                    first = next(response.iter_content(chunk_size=REGISTRY_ARTIFACT_PROBE_BYTES), b"")
+                    if first:
+                        evidence["status"] = "available"
+                    else:
+                        evidence["status"] = "empty-artifact"
+                        evidence["error"] = "registry returned an empty artifact response"
         except DraftBudgetExceeded:
             raise
         except requests.HTTPError as exc:
@@ -24590,17 +24603,18 @@ def build_draft_plan(
 
 
 def _sanitize_registry_url(url: str) -> str:
-    """Strip userinfo (credentials) from a registry URL for prompt output."""
-    text = str(url or "").strip()
-    if not text:
+    """Never print registry userinfo, query, token path or URL fragments.
+
+    Registry secrets may live in *any* path segment, not just a parameter
+    named token. Render the safe identity, not a truncated raw URL.
+    """
+    if not url:
         return ""
-    if "://" in text:
-        scheme, rest = text.split("://", 1)
-        if "@" in rest.split("/", 1)[0]:
-            authority = rest.split("/", 1)[0]
-            rest = rest.replace(authority, authority.rsplit("@", 1)[-1], 1)
-        return f"{scheme}://{rest}"
-    return text
+    identity = safe_registry_identity(url)
+    origin, prefix = identity.get("origin"), identity.get("pathPrefix")
+    if not origin:
+        return "[invalid-registry-url]"
+    return origin + (prefix if prefix and prefix != "/" else "")
 
 
 def _power_shell_quote(value: str) -> str:

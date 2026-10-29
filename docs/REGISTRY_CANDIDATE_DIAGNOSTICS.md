@@ -44,3 +44,35 @@ python -m unittest discover -s tests -p "test_*.py" -v
 ```
 
 Local regression fixtures use publicly synthetic metadata and localhost HTTP, including ranged probes, 404, redirect outside registry prefix, and an independently checked SHA-512 SRI; **no npm install** and no network call to OSV or a private Nexus is needed.
+
+## P2.6 security review: URL transport hardening
+
+Before P2.6, the existing admission predicate accepted deceptive same-origin
+tarballs containing `/../`, percent-encoded dot traversal, userinfo,
+query/fragment credentials and malformed ports could raise `ValueError`.
+Moreover, the physical ranged-GET probe used `allow_redirects=True`; it
+observed a redirect **after** requests had already contacted its destination.
+
+The Core admission predicate now delegates to a shared fail-closed
+`safe_registry_artifact_url`. Both planning and lockfile validation reject
+malformed authorities, userinfo, query/fragment, control characters, dot
+segments at repeated percent-decoding depth, encoded slashes/backslashes and
+out-of-prefix paths. The normal public npm and valid Nexus artifact paths,
+including valid percent-encoded `@scope`, remain supported. HTTP artifact
+probes follow only bounded, individually checked same-origin/path redirects
+with `allow_redirects=False`; an out-of-prefix/foreign redirect is rejected
+**before** making any request to the destination.
+
+Newly published registry identities keep scheme+origin and only a narrow
+allowlist of conventional registry path labels. Opaque path segments, including
+short tokens and percent-encoded credential fragments, are redacted in both
+Core diagnostics and prompts. Raw signed/query-bearing artifact URLs are not
+accepted; supporting them would require a separately reviewed credential
+policy.
+
+Because this is a security hardening of the authoritative admission guard,
+an intentionally malformed artifact previously considered a theoretical
+candidate will now be rejected, and its target/status may legitimately change
+from `PROPOSED` to `NO_TARGET`. The **benign** matching/foreign registry
+comparison, semantic solver, security UNKNOWN status and policy are unchanged.
+The diagnostics still make no claim of installed-tree or runtime proof.

@@ -97,7 +97,7 @@ class RegistryCandidateDiagnosticsTests(unittest.TestCase):
         self.assertEqual("NO_INSTALLABLE_ARTIFACT", no_target_diagnostic_code("no-target", evidence))
         self.assertEqual("https://registry.npmjs.org", evidence["rejectedArtifactOrigins"][0])
         self.assertEqual("http://127.0.0.1:42358", evidence["configuredRegistry"]["origin"])
-        self.assertEqual("/frozen", evidence["configuredRegistry"]["pathPrefix"])
+        self.assertEqual("/[redacted]", evidence["configuredRegistry"]["pathPrefix"])
 
     def test_registry_path_prefix_missing_tarball_and_malformed(self):
         registry = "https://nexus.example.invalid/repository/npm/"

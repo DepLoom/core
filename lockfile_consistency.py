@@ -32,6 +32,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 from urllib.parse import urlparse
 
 from semantic_version import NpmSpec, Version
+from registry_candidate_diagnostics import safe_registry_artifact_url
 
 DIRECT_SECTIONS = ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies")
 INSTALL_SECTIONS = ("dependencies", "devDependencies", "optionalDependencies")
@@ -270,19 +271,21 @@ def _origin_tuple(url: str) -> Tuple[str, str, int]:
 
 
 def registry_artifact_url_allowed(registry: str, url: str) -> bool:
-    """Require lockfile package artifacts to stay inside configured registry."""
-    value = str(url or "").strip()
+    """Reuse the Core planner's strict same-origin/path tarball policy.
+
+    Keep the legacy behavior for non-http lockfile resolutions (workspace,
+    file, git), which are classified separately by the lockfile verifier.
+    """
+    value = str(url or "")
     if not registry or not value:
         return True
-    parsed = urlparse(value)
-    if parsed.scheme not in {"http", "https"}:
-        return True
-    registry_parsed = urlparse(registry)
-    if _origin_tuple(registry) != _origin_tuple(value):
+    try:
+        parsed = urlparse(value)
+    except ValueError:
         return False
-    prefix = registry_parsed.path.rstrip("/")
-    path = parsed.path or ""
-    return not prefix or path == prefix or path.startswith(prefix + "/")
+    if parsed.scheme not in {"http", "https"} and "://" not in value:
+        return True
+    return safe_registry_artifact_url(registry, value)
 
 
 def _yarn_lock_resolved_urls(lockfile: Path) -> List[str]:
