@@ -285,6 +285,15 @@ def registry_artifact_url_allowed(registry: str, url: str) -> bool:
         return False
     if parsed.scheme not in {"http", "https"} and "://" not in value:
         return True
+    # VCS resolutions are not npm tarballs; preserve their separate lockfile
+    # policy while rejecting unknown URL schemes and embedded passwords.
+    if parsed.scheme in {"git", "git+ssh", "git+https", "ssh"}:
+        try:
+            return (value == value.strip() and bool(parsed.hostname)
+                    and parsed.password is None and not parsed.query
+                    and (parsed.port is None or 1 <= parsed.port <= 65535))
+        except ValueError:
+            return False
     return safe_registry_artifact_url(registry, value)
 
 
