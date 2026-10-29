@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections import Counter
 from typing import Any, Callable, Iterable, Mapping
-from urllib.parse import urlsplit, unquote
+from urllib.parse import unquote, urlsplit
 import re
 
 
@@ -20,8 +20,95 @@ REJECTION_CODES = frozenset({
 })
 
 
+# Display only conventional registry path labels, never arbitrary tenant IDs,
+# token-like values or decoded URL parameters. The exact registry is already
+# present in the caller's local configuration; diagnostics are not a URL log.
+_PUBLIC_PATH_LABELS = frozenset({
+    "repository", "repositories", "registry", "npm", "npm-group", "npm-hosted",
+    "public", "private", "api", "v1", "v2", "artifactory", "packages",
+})
+
+
+def _decoded_segments(path: str) -> list[str] | None:
+    """Reject URL paths whose HTTP normalization can escape a registry prefix.
+
+    Reject dot-segments at *any* finite percent-decoding depth, encoded path
+    separators, invalid percent escapes, backslashes, controls and double
+    slashes. The exact raw URL remains the URL used by the unchanged requests
+    client; this only rules out unsafe aliases before the allowlist comparison.
+    """
+    if not isinstance(path, str) or not path.startswith("/") or "\\" in path:
+        return None
+    if path == "/":
+        return []
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in path):
+        return None
+    if "//" in path:
+        return None
+    result: list[str] = []
+    for segment in path[1:].split("/"):
+        if not segment:
+            return None
+        decoded = segment
+        for _ in range(8):
+            # A percent sequence that is not a full escape is ambiguous.
+            if re.search(r"%(?![0-9A-Fa-f]{2})", decoded):
+                return None
+            updated = unquote(decoded, encoding="utf-8", errors="strict")
+            if updated == decoded:
+                break
+            decoded = updated
+        if any(ch in decoded for ch in ("/", "\\", "%")):
+            return None
+        if decoded in (".", "..") or any(ord(ch) < 32 or ord(ch) == 127 for ch in decoded):
+            return None
+        result.append(decoded)
+    return result
+
+
+def safe_registry_artifact_url(registry: str, artifact: str) -> bool:
+    """Strict same-origin, same-path policy; no redirect or network I/O.
+
+    Signed/query-bearing tarballs require an explicit future policy rather than
+    leaking bearer credentials or silently following redirects. Invalid URLs
+    and malformed ports fail closed instead of throwing during a Draft run.
+    """
+    if not isinstance(artifact, str) or not isinstance(registry, str):
+        return False
+    if (not artifact or not registry or artifact != artifact.strip()
+        or registry != registry.strip() or any(ord(c) < 32 or ord(c) == 127 for c in artifact + registry)):
+        return False
+    try:
+        base, url = urlsplit(registry), urlsplit(artifact)
+        if base.scheme.lower() not in ("http", "https") or url.scheme.lower() not in ("http", "https"):
+            return False
+        # urlsplit removes userinfo when reporting hostname; reject it outright
+        # on artifact URLs. Configured registry may carry auth separately.
+        if "@" in url.netloc or not base.hostname or not url.hostname:
+            return False
+        if not (1 <= (base.port if base.port is not None else (443 if base.scheme == "https" else 80)) <= 65535):
+            return False
+        if not (1 <= (url.port if url.port is not None else (443 if url.scheme == "https" else 80)) <= 65535):
+            return False
+        if "?" in artifact or "#" in artifact or "?" in registry or "#" in registry:
+            return False
+        origin = lambda p: (p.scheme.lower(), p.hostname.lower(),
+                            p.port if p.port is not None else (443 if p.scheme.lower() == "https" else 80))
+        if origin(base) != origin(url):
+            return False
+        # A trailing slash is common for the configured Nexus endpoint.
+        base_path = base.path.rstrip("/") or "/"
+        artifact_path = url.path or "/"
+        if _decoded_segments(base_path) is None or _decoded_segments(artifact_path) is None:
+            return False
+        return (artifact_path == base_path or base_path == "/" or
+                artifact_path.startswith(base_path + "/"))
+    except (ValueError, UnicodeError):
+        return False
+
+
 def _identity(url: str) -> dict[str, Any]:
-    """Return a bounded URL identity, never userinfo, query or fragment."""
+    """Provide only a bounded, non-secret *display* of the registry identity."""
     try:
         parts = urlsplit(str(url or ""))
         scheme = parts.scheme.lower()
@@ -31,36 +118,22 @@ def _identity(url: str) -> dict[str, Any]:
         )
     except ValueError:
         return {"origin": None, "pathPrefix": None}
-    if scheme not in {"http", "https"} or not host:
+    if (scheme not in {"http", "https"} or not host or port is None
+        or not 1 <= port <= 65535 or
+        not re.fullmatch(r"[a-zA-Z0-9.:_-]{1,253}", host)):
         return {"origin": None, "pathPrefix": None}
-    # Hostnames from urlsplit omit userinfo. IPv6 must be bracketed in origins.
     printable_host = f"[{host}]" if ":" in host else host
     origin = f"{scheme}://{printable_host}"
-    if port not in (443 if scheme == "https" else 80, None):
+    if port != (443 if scheme == "https" else 80):
         origin += f":{port}"
-    # Avoid accidental credentials/tokens in URI path segments. Keep path
-    # segment structure useful for diagnosing a mismatched Nexus prefix.
-    segments = parts.path.rstrip("/").split("/")
-    safe = []
-    for segment in segments:
-        if not segment:
-            continue
-        # A registry path is untrusted metadata; never forward encoded userinfo,
-        # query-like credentials, controls, or arbitrary secrets to artifacts.
-        # Keep only predictable structural prefix components.
-        decoded = unquote(segment)
-        suspicious = (
-            not re.fullmatch(r"[A-Za-z0-9._~@+-]{1,48}", decoded)
-            or bool(re.search(r"(?i)(token|apikey|api-key|secret|password|bearer|authorization|credential|access[-_]?key)", decoded))
-            or bool(re.fullmatch(r"[0-9a-fA-F]{24,}", decoded))
-        )
-        safe.append("[redacted]" if suspicious else decoded)
-        if len(safe) >= 12:
-            break
-    prefix = "/" + "/".join(safe) if safe else "/"
-    if len(prefix) > 160:
-        prefix = prefix[:155] + "[...]"
-    return {"origin": origin, "pathPrefix": prefix}
+    # Never copy unknown path segments: even short, innocent-looking parts
+    # may be passwords, bearer tokens or tenant IDs. Percent escapes are opaque.
+    segments = parts.path.strip("/").split("/") if parts.path.strip("/") else []
+    prefix = "/" + "/".join(
+        x.lower() if x.lower() in _PUBLIC_PATH_LABELS else "[redacted]"
+        for x in segments[:12] if x
+    )
+    return {"origin": origin, "pathPrefix": prefix if len(prefix) <= 160 else prefix[:148] + "[redacted]"}
 
 
 def _reason_for_rejected_url(registry: str, tarball: str) -> str:
