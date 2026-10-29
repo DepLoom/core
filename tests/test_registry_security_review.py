@@ -54,6 +54,31 @@ class ArtifactUrlFailClosedTests(unittest.TestCase):
         # Non-HTTP lock resolutions are handled by their own lockfile policies.
         self.assertTrue(lockfile_allowed(reg,'workspace:../local'))
 
+    def test_vcs_and_local_file_lock_resolutions_use_separate_safe_policy(self):
+        reg = 'https://nexus.invalid/repository/npm'
+        for uri in (
+            'git+ssh://git@github.com/example/repository.git#deadbeef',
+            'git+https://github.com/example/repository.git#v1',
+            'git://github.com/example/repository.git#main',
+            'ssh://git@github.com/example/repository.git',
+            'file:///var/tmp/local-package',
+            'file://localhost/var/tmp/local-package',
+        ):
+            with self.subTest(uri=uri):
+                self.assertTrue(lockfile_allowed(reg, uri), uri)
+                self.assertFalse(safe_registry_artifact_url(reg, uri),
+                                 'Core tarball guard must remain HTTP(S)-only')
+        for uri in (
+            'git+https://user:secret@github.com/example/repository.git',
+            'git+ssh://git@github.com:bogus/example/repository.git',
+            'file://evil.invalid/share/private',
+            'file://user:secret@localhost/path',
+            'javascript://evil.invalid/do-anything',
+            'random+scheme://host.invalid/a.tgz',
+        ):
+            with self.subTest(uri=uri):
+                self.assertFalse(lockfile_allowed(reg, uri), uri)
+
     def test_sensitive_and_encoded_path_segments_not_exported(self):
         for url in (
             'https://user:pw@nexus.invalid/repository/abc123/npm?token=secret',
