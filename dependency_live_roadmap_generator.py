@@ -66,7 +66,7 @@ import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from enum import Enum
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse, urljoin, quote
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
@@ -2871,6 +2871,59 @@ class LiveDataClient:
                 continue
             accepted.append(version)
         return accepted, notes
+
+    def registry_exact_version_manifest(
+        self, pkg: str, version: str,
+    ) -> Tuple[Optional[Dict[str, Any]], str]:
+        """Fetch ONE explicitly authorized version from this registry.
+
+        A known packument snapshot may lack a still-published historical
+        version. Do not infer absence from an incomplete in-memory/cache
+        index; query the registry's exact-version manifest instead. This is
+        a metadata-only admission probe, NOT a tarball install/OSV proof.
+        No arbitrary URL or redirect is accepted from a response.
+        """
+        if (
+            not isinstance(pkg, str) or not pkg
+            or not isinstance(version, str)
+            or not re.fullmatch(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", version)
+        ):
+            return None, "INVALID_EXACT_VERSION_INPUT"
+        url = f"{self.registry}/{quote(pkg, safe='@')}/{quote(version, safe='')}"
+        response = None
+        try:
+            response = self._supervised(
+                lambda: self.session.get(
+                    url, timeout=self._budgeted_timeout(),
+                    stream=True, allow_redirects=False,
+                )
+            )
+            status = int(getattr(response, "status_code", 0) or 0)
+            if status in (404, 410):
+                return None, "EXACT_VERSION_NOT_PUBLISHED"
+            if status != 200:
+                # 3xx is not an invitation to follow an unknown Location.
+                return None, "EXACT_VERSION_METADATA_UNVERIFIED"
+            record = self._bounded_json(response)
+            if (
+                not isinstance(record, dict)
+                or record.get("name") != pkg
+                or record.get("version") != version
+                or not valid_registry_packument_shape({"versions": {version: record}})
+            ):
+                return None, "EXACT_VERSION_IDENTITY_OR_METADATA_INVALID"
+            dist = record.get("dist")
+            tarball = dist.get("tarball") if isinstance(dist, dict) else None
+            if not isinstance(tarball, str) or not self.registry_artifact_url_allowed(tarball):
+                return None, "EXACT_VERSION_TARBALL_ORIGIN_REJECTED"
+            return record, "EXACT_VERSION_METADATA_ADMITTED"
+        except DraftBudgetExceeded:
+            raise
+        except (requests.RequestException, ValueError, UnicodeError, OSError):
+            return None, "EXACT_VERSION_METADATA_UNVERIFIED"
+        finally:
+            if response is not None:
+                response.close()
 
     def first_installable_version(
         self,
@@ -6728,8 +6781,28 @@ def apply_decision_contract_targets(rows_by_project: Dict[str, List[DependencyRo
                     reason = "EXACT_TARGET_NOT_AN_UPGRADE: requested version must exceed installed baseline"
                 else:
                     meta = client.npm_cache.get(row.name)
+                    versions = (meta.get("versions") or {}) if isinstance(meta, dict) else {}
+                    refresh_status = ""
+                    if not isinstance(versions.get(target), dict):
+                        # A prefetch/cache snapshot is not proof that the exact
+                        # published version does not exist. The second read is
+                        # version-specific, uses this registry only, validates
+                        # name/version and tarball origin, and never runs npm.
+                        record, refresh_status = client.registry_exact_version_manifest(
+                            row.name, target
+                        )
+                        if record is not None:
+                            enriched = dict(meta) if isinstance(meta, dict) else {}
+                            indexed = dict(enriched.get("versions") or {})
+                            indexed[target] = record
+                            enriched["versions"] = indexed
+                            client.npm_cache[row.name] = enriched
+                            meta = enriched
                     if not isinstance(meta, dict) or target not in (meta.get("versions") or {}):
-                        reason = "EXACT_TARGET_UNAVAILABLE: target absent from registry metadata"
+                        reason = (
+                            "EXACT_TARGET_UNAVAILABLE: target absent from registry metadata; "
+                            + (refresh_status or "EXACT_VERSION_METADATA_UNVERIFIED")
+                        )
                     else:
                         eligible, rejection_notes = client.registry_structural_candidates(meta, [target])
                         if target not in eligible:
