@@ -27,6 +27,18 @@ _PUBLIC_PATH_LABELS = frozenset({
     "repository", "repositories", "registry", "npm", "npm-group", "npm-hosted",
     "public", "private", "api", "v1", "v2", "artifactory", "packages",
 })
+# Diagnostic examples are untrusted packument keys, not a URL or token log.
+_SAFE_SAMPLE_VERSION = re.compile(
+    r"^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
+    r"(?:-[0-9A-Za-z.-]{1,32})?(?:\+[0-9A-Za-z.-]{1,24})?$"
+)
+_SECRET_SAMPLE = re.compile(r"(?i)token|api[-_]?key|secret|password|bearer|credential")
+# Never expose an unexpected status string from an untrusted/mutated probe cache.
+_KNOWN_PROBE_STATUSES = frozenset({
+    "available", "missing-artifact", "empty-artifact", "foreign-registry-redirect",
+    "planning-only", "current-installed", "missing-tarball-url", "foreign-registry-url",
+    "redirect-limit-exceeded", "unknown",
+})
 
 
 def _decoded_segments(path: str) -> list[str] | None:
@@ -191,8 +203,10 @@ def summarize_structural_candidates(
         totals["rejected"] += 1
         if version != str(current):
             totals["rejectedUpgradeCandidates"] += 1
-        if len(samples) < MAX_SAMPLES:
-            samples.append({"version": version[:64], "code": code})
+        if (len(samples) < MAX_SAMPLES and len(version) <= 64
+                and _SAFE_SAMPLE_VERSION.fullmatch(version)
+                and not _SECRET_SAMPLE.search(version)):
+            samples.append({"version": version, "code": code})
         if code == "FOREIGN_TARBALL_ORIGIN":
             origin = _identity(tarball).get("origin")
             if origin and origin not in seen:
@@ -232,7 +246,8 @@ def with_observed_physical_probes(
     for version, evidence in observed.items():
         if str(version) == str(current) or not isinstance(evidence, Mapping):
             continue
-        state = str(evidence.get("status") or "unknown")
+        raw_state = evidence.get("status")
+        state = raw_state if type(raw_state) is str and raw_state in _KNOWN_PROBE_STATUSES else "unknown"
         counts[state] += 1
         if state in {"missing-artifact", "empty-artifact"}:
             failures["HTTP_ARTIFACT_UNAVAILABLE"] += 1
@@ -249,14 +264,40 @@ def with_observed_physical_probes(
 
 
 def no_target_diagnostic_code(status: str, evidence: Mapping[str, Any]) -> str | None:
-    """Never reclassify solver or status; explain a *confirmed* failure mode."""
+    """Explain a NO_TARGET only with complete, self-consistent structural evidence.
+
+    A caller-provided allUpgradeCandidatesRejected flag is NOT a proof by
+    itself. Never change the solver status, and never confuse a truncated
+    candidate search with global artifact unavailability.
+    """
     if status == "candidate-search-truncated":
         return "CANDIDATE_CAP"
-    if status != "no-target":
+    if status != "no-target" or not isinstance(evidence, Mapping):
         return None
-    if evidence.get("allUpgradeCandidatesRejected") is True:
+    fields = ("examined", "accepted", "rejected", "upgradeCandidates",
+              "acceptedUpgradeCandidates", "rejectedUpgradeCandidates")
+    if any(type(evidence.get(key)) is not int or not 0 <= evidence[key] <= 2_147_483_647
+           for key in fields):
+        return None
+    examined, accepted, rejected = (evidence[key] for key in fields[:3])
+    upgrades, accepted_upgrades, rejected_upgrades = (evidence[key] for key in fields[3:])
+    if (accepted + rejected != examined or accepted_upgrades + rejected_upgrades != upgrades
+        or upgrades > examined or accepted_upgrades > accepted or rejected_upgrades > rejected):
+        return None
+    reasons = evidence.get("rejectionCounts")
+    if (not isinstance(reasons, Mapping)
+        or any(type(k) is not str or k not in REJECTION_CODES
+               or type(v) is not int or not 0 <= v <= 2_147_483_647
+               for k, v in reasons.items())
+        or sum(reasons.values()) != rejected):
+        return None
+    expected_all_rejected = upgrades > 0 and accepted_upgrades == 0 and rejected_upgrades == upgrades
+    if (type(evidence.get("allUpgradeCandidatesRejected")) is not bool
+        or evidence["allUpgradeCandidatesRejected"] != expected_all_rejected):
+        return None
+    if expected_all_rejected:
         return "NO_INSTALLABLE_ARTIFACT"
-    if evidence.get("upgradeCandidates") == 0:
+    if upgrades == 0:
         return "NO_PUBLISHED_UPGRADE_CANDIDATE"
     return "UNRESOLVED_TARGET_CONSTRAINT_OR_POLICY"
 
