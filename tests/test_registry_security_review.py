@@ -204,3 +204,75 @@ class MalformedPackumentIsUnknownNotClean(unittest.TestCase):
             self.assertNotIn('demo',client.npm_cache)
         finally:
             server.shutdown();server.server_close();worker.join(timeout=3)
+
+
+class FailClosedDiagnosticPublicationTests(unittest.TestCase):
+    """The evidence publisher must not trust a forged aggregate boolean."""
+
+    def test_no_installable_requires_complete_consistent_structural_counts(self):
+        from registry_candidate_diagnostics import no_target_diagnostic_code
+        valid = {
+            "examined": 2, "accepted": 0, "rejected": 2,
+            "upgradeCandidates": 1, "acceptedUpgradeCandidates": 0,
+            "rejectedUpgradeCandidates": 1, "allUpgradeCandidatesRejected": True,
+            "rejectionCounts": {"BAD_REGISTRY_PATH": 2},
+        }
+        self.assertEqual("NO_INSTALLABLE_ARTIFACT",
+                         no_target_diagnostic_code("no-target", valid))
+        for invalid in (
+            {"allUpgradeCandidatesRejected": True},  # the previous false positive
+            dict(valid, upgradeCandidates=0),
+            dict(valid, acceptedUpgradeCandidates=1),
+            dict(valid, rejectedUpgradeCandidates=0),
+            dict(valid, rejected=1),
+            dict(valid, rejected=True),
+            dict(valid, rejectionCounts={}),
+            dict(valid, rejectionCounts={"unknown-or-secret": 2}),
+            dict(valid, rejectionCounts={"BAD_REGISTRY_PATH": -2}),
+            dict(valid, allUpgradeCandidatesRejected=1),
+            dict(valid, examined=-1),
+        ):
+            with self.subTest(invalid=invalid):
+                self.assertIsNone(no_target_diagnostic_code("no-target", invalid))
+        self.assertIsNone(no_target_diagnostic_code("proposed", valid))
+        self.assertEqual("CANDIDATE_CAP",
+                         no_target_diagnostic_code("candidate-search-truncated", valid))
+
+    def test_no_upgrade_and_accepted_upgrade_remain_distinct(self):
+        from registry_candidate_diagnostics import no_target_diagnostic_code
+        no_upgrades = {
+            "examined": 1, "accepted": 1, "rejected": 0,
+            "upgradeCandidates": 0, "acceptedUpgradeCandidates": 0,
+            "rejectedUpgradeCandidates": 0, "allUpgradeCandidatesRejected": False,
+            "rejectionCounts": {},
+        }
+        self.assertEqual("NO_PUBLISHED_UPGRADE_CANDIDATE",
+                         no_target_diagnostic_code("no-target", no_upgrades))
+        with_accepted = dict(no_upgrades, examined=2, accepted=2,
+                             upgradeCandidates=1, acceptedUpgradeCandidates=1)
+        self.assertEqual("UNRESOLVED_TARGET_CONSTRAINT_OR_POLICY",
+                         no_target_diagnostic_code("no-target", with_accepted))
+
+    def test_untrusted_version_and_probe_status_never_leak_in_core_plan(self):
+        from registry_candidate_diagnostics import (
+            summarize_structural_candidates, with_observed_physical_probes,
+            safe_registry_artifact_url,
+        )
+        reg = "https://nexus.invalid/repository/npm"
+        packument = {"versions": {
+            "1.0.0": {"dist": {}},
+            "token=ULTRA_PRIVATE_KEY": {"dist": {}},
+        }}
+        structurally = summarize_structural_candidates(
+            reg, packument, ["1.0.0", "token=ULTRA_PRIVATE_KEY"],
+            lambda url: safe_registry_artifact_url(reg, url), current="0.9.0",
+        )
+        self.assertEqual(2, structurally["rejected"])
+        self.assertEqual([{"version": "1.0.0", "code": "MISSING_DIST_TARBALL"}],
+                         structurally["rejectionSamples"])
+        physical = with_observed_physical_probes(structurally, {
+            "1.0.0": {"status": "access_token=ULTRA_PRIVATE_KEY"},
+        }, current="0.9.0")
+        self.assertEqual({"unknown": 1}, physical["physicalProbe"]["statusCounts"])
+        self.assertFalse(physical["physicalProbe"]["unprobed"])
+        self.assertNotIn("ULTRA_PRIVATE_KEY", json.dumps(physical))
