@@ -259,3 +259,35 @@ def no_target_diagnostic_code(status: str, evidence: Mapping[str, Any]) -> str |
     if evidence.get("upgradeCandidates") == 0:
         return "NO_PUBLISHED_UPGRADE_CANDIDATE"
     return "UNRESOLVED_TARGET_CONSTRAINT_OR_POLICY"
+
+def valid_registry_packument_shape(data: Any) -> bool:
+    """Reject malformed registry metadata before caching or planning.
+
+    A legitimate empty version set is not a proof of installability. Missing
+    optional dist/tags/time fields are permitted, but if present their nested
+    shape must be safe for later version, URL and time consumers.
+    """
+    if not isinstance(data, dict):
+        return False
+    versions = data.get("versions")
+    if not isinstance(versions, dict):
+        return False
+    tags = data.get("dist-tags", {})
+    times = data.get("time", {})
+    if not isinstance(tags, dict) or not isinstance(times, dict):
+        return False
+    if any(not isinstance(k, str) or not isinstance(v, str) for k, v in tags.items()):
+        return False
+    if any(not isinstance(k, str) or not isinstance(v, str) for k, v in times.items()):
+        return False
+    for key, value in versions.items():
+        if not isinstance(key, str) or not isinstance(value, dict):
+            return False
+        dist = value.get("dist")
+        if dist is not None:
+            if not isinstance(dist, dict):
+                return False
+            tarball = dist.get("tarball")
+            if tarball is not None and not isinstance(tarball, str):
+                return False
+    return True
