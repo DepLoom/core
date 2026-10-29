@@ -113,7 +113,7 @@ class ExactVersionObjectiveTests(unittest.TestCase):
             {"sample-lib":row,"immutable-companion":immutable},
             {"sample-lib":domain,"immutable-companion":["7.0.0"]},
             self.client,"default")
-        self.assertIsNone(model.assignment_issue({
+        self.assertFalse(model.assignment_issue({
             "sample-lib":"2.3.0","immutable-companion":"7.0.0"}))
         self.assertIsNotNone(model.assignment_issue({
             "sample-lib":"1.0.0","immutable-companion":"7.0.0"}))
