@@ -89,7 +89,7 @@ from baseline_repair_handoff import (
 )
 from baseline_cohort_inference import infer_baseline_cohort
 from draft_decision_contract import (
-    LATEST_APPROVED, contract_from_snapshot, decision_contract_prompt,
+    LATEST_APPROVED, EXPLICIT_VERSIONS, contract_from_snapshot, decision_contract_prompt,
     normalize_decision_contract, package_is_mutable, version_line_allowed,
 )
 from draft_input_identity import capture_draft_semantic_inputs, aggregate_semantic_inputs
@@ -6699,6 +6699,57 @@ def apply_decision_contract_targets(rows_by_project: Dict[str, List[DependencyRo
     Candidate selection does not fill missing OSV evidence with a safe value.
     """
     contract = _baseline_intent_payload()["decisionContract"]
+    if contract["objective"] == EXPLICIT_VERSIONS:
+        # User-authorized *target declarations*, not source manifest ranges.
+        # The original manifest/lock remain frozen input evidence; the chosen
+        # upgrade may require a migration that changes those exact declarations.
+        # Source + install/build/runtime compatibility remain NOT_VERIFIED.
+        exact = contract["exactTargets"]
+        for rows in rows_by_project.values():
+            for row in rows:
+                if row.name not in exact:
+                    # The regular version-line scope pass still protects any
+                    # immutable package from the health-plan's unrelated goal.
+                    for mode in ("default", "yellow", "green"):
+                        target = getattr(row, f"target_{mode}")
+                        if target_is_action(target) and not version_line_allowed(
+                            row.name, row.current_version, target, contract
+                        ):
+                            _set_mode_target(row, mode, NO_ACTION,
+                                "EXACT_TARGET_SCOPE: package not authorized to move")
+                    continue
+                target = exact[row.name]
+                current = safe_version(row.current_version)
+                selected = safe_version(target)
+                reason = ""
+                if row.scope_excluded or row.planner_deferred or _baseline_intent_policy(row.name) == "keep-current":
+                    reason = "EXACT_TARGET_SCOPE_CONFLICT: package excluded, deferred or immutable"
+                elif current is None or selected is None or selected <= current:
+                    reason = "EXACT_TARGET_NOT_AN_UPGRADE: requested version must exceed installed baseline"
+                else:
+                    meta = client.npm_cache.get(row.name)
+                    if not isinstance(meta, dict) or target not in (meta.get("versions") or {}):
+                        reason = "EXACT_TARGET_UNAVAILABLE: target absent from registry metadata"
+                    else:
+                        eligible, rejection_notes = client.registry_structural_candidates(meta, [target])
+                        if target not in eligible:
+                            reason = "EXACT_TARGET_UNAVAILABLE: registry tarball origin or metadata rejected"
+                        elif client.registry_version_type_declarations_ok(row.name, meta, target):
+                            reason = "EXACT_TARGET_UNAVAILABLE: type declaration guard rejected target"
+                        elif client.registry_version_runtime_entrypoint_ok(row.name, meta, target):
+                            reason = "EXACT_TARGET_UNAVAILABLE: runtime entrypoint guard rejected target"
+                if reason:
+                    row.objective_note = reason
+                    row.compatibility_note = target_reason_join([row.compatibility_note, reason])
+                    for mode in ("default", "yellow", "green"):
+                        _set_mode_target(row, mode, NO_ACTION, reason)
+                else:
+                    row.objective_candidate = target
+                    row.objective_note = ("EXPLICIT_USER_TARGET: exact registry candidate; "
+                                          "peer/engine/OSV and runtime remain to be verified")
+                    for mode in ("default", "yellow", "green"):
+                        _set_mode_target(row, mode, target, row.objective_note)
+        return
     latest = contract["objective"] == LATEST_APPROVED
     for rows in rows_by_project.values():
         for row in rows:
@@ -7670,6 +7721,25 @@ def _candidate_domain(row: DependencyRow, mode: str, client: LiveDataClient) -> 
         return [row.current_version]
     if row.scope_excluded or row.planner_deferred:
         return [row.current_version]
+    contract = _baseline_intent_payload()["decisionContract"]
+    if contract["objective"] == EXPLICIT_VERSIONS:
+        requested = (contract.get("exactTargets") or {}).get(row.name)
+        # Non-target companions remain in the exact solver as immutable,
+        # constraint-bearing baseline packages: not excluded from health.
+        if not requested:
+            return [row.current_version]
+        desired = _desired_target_for_mode(row, mode)
+        meta = client.npm_cache.get(row.name)
+        # An unavailable / rejected target is not conjured into a model.
+        # Keep current as a blocked fallback for honest plan publication.
+        if desired != requested or not isinstance(meta, dict):
+            return [row.current_version]
+        structural, _ = client.registry_structural_candidates(meta, [requested])
+        if requested not in structural:
+            return [row.current_version]
+        if not version_line_allowed(row.name, row.current_version, requested, contract):
+            return [row.current_version]
+        return [requested, row.current_version]
     desired = _desired_target_for_mode(row, mode)
     meta = client.npm_cache.get(row.name)
     if not isinstance(meta, dict):
@@ -8290,10 +8360,24 @@ def _build_peer_optimization_model(
         seen_requirements.add(key)
         requirements.append(requirement)
 
+    exact_contract = _baseline_intent_payload()["decisionContract"]
+    exact_assignments = (exact_contract.get("exactTargets") or {}
+                         if exact_contract["objective"] == EXPLICIT_VERSIONS else {})
     for intent_name in sorted(component):
         intent_row = rows_by_name[intent_name]
         intent_policy = _baseline_intent_policy(intent_name)
-        if intent_policy == "required" and intent_row.current_version in domains.get(intent_name, []):
+        chosen_exact = exact_assignments.get(intent_name)
+        if chosen_exact and chosen_exact in domains.get(intent_name, []):
+            # Enforce the exact selected version *inside* Z3 / finite-domain
+            # constraints, never by rewriting the solver's published output.
+            for other in domains[intent_name]:
+                if other != chosen_exact:
+                    add_constraint(
+                        [(intent_name, other)],
+                        reason=f"USER_EXACT_TARGET: {intent_name} must be {chosen_exact}",
+                        provenance="user-exact-target",
+                    )
+        elif intent_policy == "required" and intent_row.current_version in domains.get(intent_name, []):
             add_constraint(
                 [(intent_name, intent_row.current_version)],
                 reason=f"USER_BASELINE_REQUIRED_UPDATE: {intent_name} must move away from current {intent_row.current_version}",
