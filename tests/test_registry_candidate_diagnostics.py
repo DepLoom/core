@@ -154,6 +154,14 @@ class RegistryCandidateDiagnosticsTests(unittest.TestCase):
         evidence = summarize_structural_candidates(reg, meta, ["1.0.0", "1.2.0"],
                                                    c.registry_artifact_url_allowed, current="1.0.0")
         row = _row(evidence)
+        # Reproduce the exact legacy fallback from a frozen registry with no
+        # structurally allowed tarballs; this is metadata KNOWN, not an OSV
+        # outage or a missing packument.
+        row.latest_version = c.latest_installable_version(
+            "sample", meta, current="1.0.0",
+        )
+        self.assertIn("не найден installable tarball", row.latest_version)
+        self.assertTrue(core._row_metadata_known(row))
         self.assertEqual("no-target", core._draft_row_status(row, core._draft_target_for_major(row)))
         plan = core.build_draft_plan({"sample": [row]}, {}, {"sample": _health()})
         pub = plan["proposals"][0]["rows"][0]
