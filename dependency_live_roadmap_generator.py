@@ -94,6 +94,10 @@ from draft_decision_contract import (
 )
 from draft_input_identity import capture_draft_semantic_inputs, aggregate_semantic_inputs
 from storybook_release_policy import is_storybook_release_package
+from registry_candidate_diagnostics import (
+    summarize_structural_candidates, with_observed_physical_probes,
+    no_target_diagnostic_code,
+)
 
 from deploom_failure import build_failure, write_diagnostic_artifact
 from cli_io import configure_utf8_stdio
@@ -1059,6 +1063,7 @@ class DependencyRow:
     planning_min_lag_3m: str = ""
     lag_planning_source: str = "live"
     registry_artifacts: Dict[str, Dict[str, Any]] = dataclasses.field(default_factory=dict)
+    registry_candidate_diagnostics: Dict[str, Any] = dataclasses.field(default_factory=dict)
     compatibility_cohort: str = ""
     compatibility_note: str = ""
     constraint_preflight: Dict[str, Any] = dataclasses.field(default_factory=dict)
@@ -4999,6 +5004,12 @@ def analyze_project(
         # "no installable target" for dependencies whose first N versions are
         # equally old (53/63 lag blockers on the production 77-package run).
         search_versions, _ = versions_from_current(meta, current, include_prerelease, 0)
+        # Explain structural rejection without changing the existing Core allowlist.
+        # This is not proof of physical tarball availability or solver feasibility.
+        registry_candidate_diagnostics = summarize_structural_candidates(
+            client.registry, meta, search_versions,
+            client.registry_artifact_url_allowed, current=current,
+        )
         structural_candidates, registry_candidate_notes = client.registry_structural_candidates(meta, search_versions)
         if registry_candidate_notes:
             notes.append(
@@ -5148,6 +5159,15 @@ def analyze_project(
                 registry_artifacts[candidate_target] = client.registry_version_artifact(
                     name, meta, candidate_target
                 )
+        # Physical evidence is read only from probes that Core already ran.
+        # A Draft planning-only row cannot claim an HTTP success or failure.
+        seen_versions = set(search_versions)
+        registry_candidate_diagnostics = with_observed_physical_probes(
+            registry_candidate_diagnostics,
+            {version: evidence for (pkg, version), evidence in client.registry_artifact_cache.items()
+             if pkg == name and version in seen_versions},
+            current=current,
+        )
         analysis = AnalysisInfo(
             metadata_available=True,
             non_registry=False,
@@ -5180,6 +5200,7 @@ def analyze_project(
             reason=reason,
             notes="; ".join(notes),
             registry_artifacts=registry_artifacts,
+            registry_candidate_diagnostics=registry_candidate_diagnostics,
             vuln_evidence_by_version={v: vuln_summary(entries) for v, entries in (vulns or {}).items()},
             draft_scan_state="done",
             draft_unknown="osv-unavailable" if vulns is None else "",
@@ -24210,6 +24231,7 @@ def build_draft_plan(
     manifests: Dict[str, Any] = {}
     projects: List[str] = sorted(rows_by_project)
     totals = {"proposed": 0, "no-change": 0, "ok": 0, "blocked": 0, "deferred": 0, "excluded": 0, "unknown-metadata": 0, "unknown-security": 0, "no-target": 0, "candidate-search-truncated": 0, "peer-compat-unresolved": 0,
+              "no-installable-artifact": 0,
               "not-attempted": 0, "interrupted": 0, "registry-failed": 0, "osv-unavailable": 0, "unrated": 0, "total": 0}
     scan: Dict[str, Dict[str, int]] = {}
     for project in projects:
@@ -24243,6 +24265,11 @@ def build_draft_plan(
             target = _draft_target_for_major(row)
             status = _draft_row_status(row, target)
             totals[status] = totals.get(status, 0) + 1
+            registry_no_target_code = no_target_diagnostic_code(
+                status, row.registry_candidate_diagnostics,
+            )
+            if registry_no_target_code == "NO_INSTALLABLE_ARTIFACT":
+                totals["no-installable-artifact"] += 1
             totals["total"] += 1
             target_reason = row.reason if row.reason else (
                 row.target_default_reason if row.target_default_reason != NO_ACTION else None
@@ -24285,6 +24312,10 @@ def build_draft_plan(
                 "breakingChanges": list(row.breaking_changes or []),
                 "migrationNotes": list(row.migration_notes or []),
             }
+            if row.registry_candidate_diagnostics:
+                entry["registryCandidateDiagnostics"] = row.registry_candidate_diagnostics
+            if registry_no_target_code:
+                entry["noTargetDiagnosticCode"] = registry_no_target_code
             if row.compatibility_cohort or row.compatibility_note:
                 entry["conflict"] = row.compatibility_note or row.compatibility_cohort
                 conflicts.append({"package": row.name, "project": project, "note": row.compatibility_note or row.compatibility_cohort, "cohort": row.compatibility_cohort})
@@ -24524,8 +24555,29 @@ def build_draft_plan(
             "rows": plan_rows,
             "health": post_health,
         })
+    # Aggregate only codes and counts (never raw package URL or credentials).
+    registry_rejections: Dict[str, int] = defaultdict(int)
+    registry_examined = 0
+    registry_rejected = 0
+    for project_rows in rows_by_project.values():
+        for row in project_rows:
+            evidence = row.registry_candidate_diagnostics
+            if not evidence:
+                continue
+            registry_examined += int(evidence.get("examined", 0))
+            registry_rejected += int(evidence.get("rejected", 0))
+            for code, count in evidence.get("rejectionCounts", {}).items():
+                registry_rejections[code] += int(count)
     return {
         "schemaVersion": 1,
+        "registryDiagnostics": {
+            "schemaVersion": 1,
+            "examinedVersions": registry_examined,
+            "rejectedVersions": registry_rejected,
+            "rejectionCounts": dict(sorted(registry_rejections.items())),
+            "noInstallableArtifactRows": totals["no-installable-artifact"],
+            "authority": "STRUCTURAL_REGISTRY_EVIDENCE_ONLY",
+        },
         "projects": projects,
         "proposals": proposals,
         "unknowns": unknowns,
