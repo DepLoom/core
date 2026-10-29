@@ -6,11 +6,14 @@ compatibility. Legacy callers retain pinned targets and the health-policy goal.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Mapping
 
 DECISION_CONTRACT_VERSION = 1
 MINIMUM_CHANGE = "minimum-change-to-policy"
 LATEST_APPROVED = "latest-compatible-in-approved-lines"
+EXPLICIT_VERSIONS = "explicit-version-targets"
+_EXACT_SEMVER = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
 
 
 def normalize_decision_contract(intent: Mapping[str, Any] | None = None) -> dict[str, Any]:
@@ -19,7 +22,7 @@ def normalize_decision_contract(intent: Mapping[str, Any] | None = None) -> dict
     objective = value.get("objective", MINIMUM_CHANGE)
     if target_mode not in ("pinned", "advisory"):
         raise ValueError("DECISION_CONTRACT_INVALID: targetMode must be pinned or advisory")
-    if objective not in (MINIMUM_CHANGE, LATEST_APPROVED):
+    if objective not in (MINIMUM_CHANGE, LATEST_APPROVED, EXPLICIT_VERSIONS):
         raise ValueError("DECISION_CONTRACT_INVALID: unsupported objective")
     mutable = value.get("mutablePackages")
     if mutable is not None:
@@ -36,17 +39,41 @@ def normalize_decision_contract(intent: Mapping[str, Any] | None = None) -> dict
         if any(type(major) is not int or major < 0 for major in majors):
             raise ValueError("DECISION_CONTRACT_INVALID: approved version lines must be nonnegative integer majors")
         approved[name.strip()] = sorted(set(majors))
+    # V2 is opt-in. Existing V1 snapshots retain their exact serialized
+    # shape, version, semantic identity and default behavior.
+    raw_exact = value.get("exactTargets", {})
+    if not isinstance(raw_exact, dict) or len(raw_exact) > 256:
+        raise ValueError("DECISION_CONTRACT_INVALID: exactTargets must be an object with at most 256 packages")
+    if objective != EXPLICIT_VERSIONS and raw_exact:
+        raise ValueError("DECISION_CONTRACT_INVALID: exactTargets require explicit-version-targets objective")
+    if objective == EXPLICIT_VERSIONS and not raw_exact:
+        raise ValueError("DECISION_CONTRACT_INVALID: explicit-version-targets requires non-empty exactTargets")
+    exact: dict[str, str] = {}
+    for name, version in raw_exact.items():
+        if (not isinstance(name, str) or not name.strip()
+            or not isinstance(version, str) or not _EXACT_SEMVER.fullmatch(version)):
+            raise ValueError("DECISION_CONTRACT_INVALID: exactTargets must map package names to exact stable semver")
+        name = name.strip()
+        if mutable is not None and name not in mutable:
+            raise ValueError("DECISION_CONTRACT_INVALID: exact target outside mutablePackages")
+        if name in approved and int(version.split(".", 1)[0]) not in approved[name]:
+            raise ValueError("DECISION_CONTRACT_INVALID: exact target outside approvedVersionLines")
+        exact[name] = version
     policies = value.get("policies") or {}
     if mutable is not None and isinstance(policies, dict):
         conflicts = sorted(str(n) for n, p in policies.items() if p == "required" and n not in mutable)
         if conflicts:
             raise ValueError("DECISION_CONTRACT_INVALID: required update outside mutablePackages: " + ", ".join(conflicts))
+    if any(name in exact and action == "keep-current"
+           for name, action in (policies.items() if isinstance(policies, dict) else ())):
+        raise ValueError("DECISION_CONTRACT_INVALID: exact target conflicts with keep-current")
     return {
-        "version": DECISION_CONTRACT_VERSION,
+        "version": 2 if objective == EXPLICIT_VERSIONS else DECISION_CONTRACT_VERSION,
         "targetMode": target_mode,
         "objective": objective,
         "mutablePackages": mutable,
         "approvedVersionLines": dict(sorted(approved.items())),
+        **({"exactTargets": dict(sorted(exact.items()))} if objective == EXPLICIT_VERSIONS else {}),
     }
 
 
@@ -83,6 +110,8 @@ def version_line_allowed(name: str, current: str, candidate: str, contract: Mapp
         return True
     if not package_is_mutable(name, contract):
         return False
+    if contract.get("objective") == EXPLICIT_VERSIONS:
+        return candidate == (contract.get("exactTargets") or {}).get(name)
     approved = contract.get("approvedVersionLines") or {}
     if name in approved:
         return _major(candidate) in approved[name]
