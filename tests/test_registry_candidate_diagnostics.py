@@ -97,7 +97,7 @@ class RegistryCandidateDiagnosticsTests(unittest.TestCase):
         self.assertEqual("NO_INSTALLABLE_ARTIFACT", no_target_diagnostic_code("no-target", evidence))
         self.assertEqual("https://registry.npmjs.org", evidence["rejectedArtifactOrigins"][0])
         self.assertEqual("http://127.0.0.1:42358", evidence["configuredRegistry"]["origin"])
-        self.assertEqual("/[redacted]", evidence["configuredRegistry"]["pathPrefix"])
+        self.assertEqual("/frozen", evidence["configuredRegistry"]["pathPrefix"])
 
     def test_registry_path_prefix_missing_tarball_and_malformed(self):
         registry = "https://nexus.example.invalid/repository/npm/"
@@ -269,6 +269,35 @@ class RegistryArtifactHttpFixtureTests(unittest.TestCase):
         observed = with_observed_physical_probes(diagnostic, {v: c.registry_artifact_cache[("sample", v)] for v in urls}, current="1.0.0")
         self.assertEqual({"FOREIGN_TARBALL_ORIGIN": 1, "HTTP_ARTIFACT_UNAVAILABLE": 1},
                          observed["physicalProbe"]["failureCounts"])
+
+
+class SecurityReviewIdentityTests(unittest.TestCase):
+    def test_registry_identity_redacts_encoded_secrets_and_controls(self):
+        from registry_candidate_diagnostics import _identity
+        for raw in (
+            "https://user:pass@host.invalid/repository/accessKey%3DSECRET123/npm?token=secret",
+            "https://host.invalid/npm/%2Fprivate%2Fcredentials/metadata",
+            "https://host.invalid/npm/line%0Abreak/data",
+            "https://host.invalid/npm/secret%40domain/", 
+            "https://host.invalid/npm/" + "a" * 80,
+        ):
+            with self.subTest(raw=raw[:90]):
+                result = _identity(raw)
+                self.assertEqual(result["origin"], "https://host.invalid")
+                self.assertNotIn("SECRET123", str(result))
+                self.assertNotIn("credentials", str(result))
+                self.assertNotIn("line\n", str(result))
+                self.assertNotIn("/private/", str(result))
+                self.assertNotIn("user:pass", str(result))
+                self.assertIn("[redacted]", result["pathPrefix"])
+
+    def test_no_installable_artifact_requires_all_newer_candidates_rejected(self):
+        from registry_candidate_diagnostics import no_target_diagnostic_code
+        self.assertEqual("UNRESOLVED_TARGET_CONSTRAINT_OR_POLICY", no_target_diagnostic_code(
+            "no-target", {"upgradeCandidates": 2, "acceptedUpgradeCandidates": 1,
+                          "allUpgradeCandidatesRejected": False}))
+        self.assertEqual("CANDIDATE_CAP", no_target_diagnostic_code(
+            "candidate-search-truncated", {"allUpgradeCandidatesRejected": True}))
 
 
 if __name__ == "__main__":
