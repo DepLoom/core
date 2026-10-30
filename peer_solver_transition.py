@@ -233,9 +233,20 @@ def refine_transition_safe_groups(
             # incorrectly yields INVALID_CURRENT_ENDPOINT. Keep the guard in
             # the final solver model; ignore it only for intermediate states.
             # Peer constraints and keep-current constraints remain active.
-            if (constraint.reason.startswith("USER_BASELINE_REQUIRED_UPDATE")
-                    and len(constraint.literals) == 1
-                    and current_assignment.get(constraint.literals[0][0]) == constraint.literals[0][1]):
+            if (len(constraint.literals) == 1
+                    and current_assignment.get(constraint.literals[0][0]) == constraint.literals[0][1]
+                    and (
+                        constraint.provenance == "user-exact-target"
+                        and constraint.reason.startswith("USER_EXACT_TARGET:")
+                        or constraint.provenance == "user-baseline-intent"
+                        and constraint.reason.startswith("USER_BASELINE_REQUIRED_UPDATE")
+                    )):
+                # Both directives require the FINAL assignment to move.
+                # The original installed/current endpoint necessarily violates
+                # that final-only obligation. Keep it enforced in Z3; exclude
+                # only its unary ban on the original endpoint from the
+                # transition hypercube. All peer/engine/registry constraints
+                # and actual target bans remain fully enforced here.
                 continue
             checks.append((
                 constraint.reason or "FORBIDDEN_COMBINATION",
