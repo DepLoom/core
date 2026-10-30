@@ -3168,6 +3168,10 @@ class LiveDataClient:
                 )
                 r.raise_for_status()
                 data = self._bounded_json(r).get("results", [])
+                self._prefetch_osv_details([
+                    ref["id"] for item in data for ref in (item.get("vulns", []) or [])
+                    if ref.get("id")
+                ])
                 for v, item in zip(batch, data):
                     details: List[Dict[str, Any]] = []
                     for ref in item.get("vulns", []) or []:
@@ -3194,6 +3198,54 @@ class LiveDataClient:
                 )
             result[v] = self.osv_cache[key]
         return result
+
+    def _prefetch_osv_details(self, references: Sequence[str]) -> None:
+        """Fetch unique fresh advisory bodies with isolated, bounded workers.
+
+        The parent cache is updated only after the complete batch succeeds.
+        Deadline expiry or any missing evidence remains an error; a late worker
+        can mutate only its private client, never the published parent state.
+        """
+        ids = sorted(set(references) - self.vuln_detail_cache.keys())
+        if len(ids) < 2:
+            return
+
+        local = threading.local()
+        workers: List[LiveDataClient] = []
+        workers_lock = threading.Lock()
+
+        def fetch_one(vuln_id: str) -> Dict[str, Any]:
+            worker = getattr(local, "client", None)
+            if worker is None:
+                worker = LiveDataClient(
+                    self.registry, timeout=self.timeout, batch_size=self.batch_size,
+                    sleep_sec=self.sleep_sec, use_system_proxy=self.use_system_proxy,
+                )
+                worker.set_deadline(self.deadline)
+                worker.session.trust_env = self.session.trust_env
+                worker.session.max_redirects = self.session.max_redirects
+                worker.session.params = shallow_copy(self.session.params)
+                worker.session.headers.update(self.session.headers)
+                worker.session.auth = self.session.auth
+                worker.session.proxies.update(self.session.proxies)
+                worker.session.cookies.update(self.session.cookies)
+                worker.session.verify = self.session.verify
+                worker.session.cert = self.session.cert
+                local.client = worker
+                with workers_lock:
+                    workers.append(worker)
+            return worker.fetch_osv_vuln(vuln_id)
+
+        def collect() -> Dict[str, Dict[str, Any]]:
+            try:
+                with ThreadPoolExecutor(max_workers=min(4, len(ids))) as pool:
+                    return dict(zip(ids, pool.map(fetch_one, ids)))
+            finally:
+                for worker in workers:
+                    worker.session.close()
+
+        evidence = run_supervised("osv-details", self.deadline, collect)
+        self.vuln_detail_cache.update(evidence)
 
     def fetch_osv_vuln(self, vuln_id: str) -> Dict[str, Any]:
         if vuln_id in self.vuln_detail_cache:
