@@ -236,10 +236,9 @@ def refine_transition_safe_groups(
             if (len(constraint.literals) == 1
                     and current_assignment.get(constraint.literals[0][0]) == constraint.literals[0][1]
                     and (
-                        constraint.provenance == "user-exact-target"
-                        and constraint.reason.startswith("USER_EXACT_TARGET:")
-                        or constraint.provenance == "user-baseline-intent"
-                        and constraint.reason.startswith("USER_BASELINE_REQUIRED_UPDATE")
+                        constraint.reason.startswith("USER_BASELINE_REQUIRED_UPDATE")
+                        or (constraint.provenance == "user-exact-target"
+                            and constraint.reason.startswith("USER_EXACT_TARGET:"))
                     )):
                 # Both directives require the FINAL assignment to move.
                 # The original installed/current endpoint necessarily violates
