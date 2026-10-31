@@ -30,6 +30,13 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from verification_invocation import (
+    observe_command as _observe_invocation_command,
+    observe_reused_command as _observe_invocation_reused_command,
+    observe_reused_profile as _observe_invocation_reused_profile,
+    defer_workspace_cleanup as _defer_invocation_cleanup,
+    run_observed as _run_invocation_observed,
+)
 from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 
@@ -4300,6 +4307,7 @@ def verify_assignment(
             for command_index, command in enumerate(config.commands, start=1):
                 receipt = command_checkpoints.lookup(command_index, command) if command_checkpoints else None
                 if receipt:
+                    _observe_invocation_reused_command(command_index, command, proof_identity.event_fields())
                     command_checkpoint_refs.append(receipt)
                     event("verify.project-check.checkpoint-hit", command=command, check=command_index, receipt=receipt)
                     _emit_progress(progress, f"{progress_label}: project check {command_index}/{len(config.commands)} checkpoint PASS: {command}")
@@ -4820,6 +4828,17 @@ def verify_assignment(
                             dependency_roots=(snapshot.dependency_roots
                                 if lower_check_clean and guarded_clone_is_active(command_root) else ()))
 
+                    if check_result is not None:
+                        _observe_invocation_command(
+                            command_index, command, check_result,
+                            guarded=bool(command_pass_verified and lower_check_clean
+                                and workspace_guard_started and workspace_changes is not None
+                                and not workspace_changes.errors
+                                and (not workspace_changes.changes or source_reset_for_reuse)),
+                            identities={**(proof_identity.event_fields() if proof_identity is not None else {}),
+                                "targetOnlyAssignmentFingerprint": assignment_hash,
+                                "resolvedLockfileHash": resolved_state.lockfile_hash if resolved_state is not None else ""},
+                        )
                     if command_checkpoints and check_result is not None:
                         # Command guards above retain their authority. A receipt
                         # also requires guaranteed process-tree quiescence.
@@ -4942,9 +4961,12 @@ def verify_assignment(
             except Exception as exc:
                 event("verify.project-check.guard-cleanup-failed", detail=str(exc), workspace=str(guarded_root))
         source_binding.close()
-        shutil.rmtree(temp_root, ignore_errors=True)
-        if temp_root.exists():
-            retire_trial(temp_root)
+        def cleanup_observed_workspace():
+            shutil.rmtree(temp_root, ignore_errors=True)
+            if temp_root.exists():
+                retire_trial(temp_root)
+        if not _defer_invocation_cleanup(cleanup_observed_workspace):
+            cleanup_observed_workspace()
 
 
 
@@ -5473,6 +5495,7 @@ def verify_assignment(
         project_record = proof_store.lookup_pass("project", identity.project_proof_key)
         if project_record is not None:
             cache_event("proof.cache.hit", "project", identity.project_proof_key)
+            _observe_invocation_reused_profile(config.commands, identity.event_fields())
             emit_verification_event(
                 telemetry_path,
                 "verify.resolver.skipped",
@@ -5723,3 +5746,24 @@ def verify_assignment(
         )
         return result
 
+
+
+# Optional code-only observations; default callers retain immediate cleanup.
+_verify_assignment_before_invocation_observer = verify_assignment
+
+
+def verify_assignment(
+    project_dir: Path, assignment: Mapping[str, str], *, config: BaselineVerifyConfig,
+    run_project_checks: bool = False, remove_packages: Iterable[str] = (),
+    progress: Optional[ProgressCallback] = None, progress_label: str = "assignment verification",
+    runtime_env: Optional[Mapping[str, str]] = None,
+    invocation_observer: Optional[Callable[[Mapping[str, object]], None]] = None,
+) -> BaselineVerifyResult:
+    arguments = dict(config=config, run_project_checks=run_project_checks,
+        remove_packages=remove_packages, progress=progress,
+        progress_label=progress_label, runtime_env=runtime_env)
+    if invocation_observer is None:
+        return _verify_assignment_before_invocation_observer(project_dir, assignment, **arguments)
+    return _run_invocation_observed(invocation_observer, assignment_fingerprint(assignment),
+        config.commands if run_project_checks else (),
+        lambda: _verify_assignment_before_invocation_observer(project_dir, assignment, **arguments))
