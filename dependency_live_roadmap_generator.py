@@ -94,6 +94,7 @@ from draft_decision_contract import (
 )
 from draft_input_identity import capture_draft_semantic_inputs, aggregate_semantic_inputs
 from draft_publication_guard import guard_draft_publication
+import draft_npm_preflight
 from storybook_release_policy import is_storybook_release_package
 from registry_candidate_diagnostics import (
     summarize_structural_candidates, with_observed_physical_probes,
@@ -26056,6 +26057,7 @@ def publish_draft_result(
     solver_component_reports: Optional[List[Dict[str, Any]]] = None,
     execution_context: Optional[Dict[str, Any]] = None,
     planning_complete: bool = True,
+    npm_preflight: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Publish the Draft result set atomically and return its manifest.
 
@@ -26083,6 +26085,7 @@ def publish_draft_result(
     contract = contract_from_snapshot(snapshot)
     plan["decisionContract"] = contract
     plan["publicationGuard"] = publication_guard
+    plan["constraintModel"] = draft_npm_preflight.root_model_coverage()
     semantic_inputs = aggregate_semantic_inputs({
         name: (spec.draft_semantic_inputs or capture_draft_semantic_inputs(
             spec.path, topology=spec.lockfile_state.get("projectTopology"),
@@ -26108,11 +26111,23 @@ def publish_draft_result(
     exec_ctx.setdefault("inputHashes", input_hashes or {})
     exec_ctx.setdefault("policy", dict(snapshot or {}))
     exec_ctx.setdefault("artifactsDir", str(draft_dir))
+    pm_validation = {"status": "NOT_RUN", "learningAllowed": False}
+    if npm_preflight is not None:
+        pm_validation = draft_npm_preflight.validate_draft_plan(
+            plan, {name: spec.path for name, spec in projects_by_name.items()},
+            artifacts_dir=draft_dir, registry=str(exec_ctx.get("registry") or ""),
+            options=npm_preflight, remaining=lambda: deadline.remaining,
+        )
+        if pm_validation["status"] != "RESOLUTION_PASSED":
+            status = "DRAFT_PARTIAL"
+            partial_reason = "Package-manager preflight: " + pm_validation["status"] + "; diagnosis/replanning required"
+    plan["packageManagerValidation"] = pm_validation
     prompt_md = build_draft_prompt(
         run_id, workspace_id, project_id, mode, policy_hash, plan, projects_by_name,
         language=language, snapshot=snapshot,
         execution_context=exec_ctx, artifacts_dir=str(draft_dir),
     )
+    prompt_md += draft_npm_preflight.validation_notice(pm_validation, language)
     counts = plan["counts"]
     proposed = counts.get("proposed", 0)
     # R12: `unknown`/`unknownPackages` list packages whose plan genuinely needs
@@ -26368,6 +26383,8 @@ def publish_draft_result(
         "deadline": deadline.as_dict(),
         "policyHash": policy_hash,
         "decisionContract": contract,
+        "constraintModel": plan["constraintModel"],
+        "packageManagerValidation": pm_validation,
         "planningOptions": {
             "draftMaxCandidates": effective_cap,
             "candidateCapScope": "SECURITY_EVIDENCE_SEARCH",
@@ -26868,7 +26885,15 @@ def main() -> None:
         type=int,
         help="Minimum share (0..100) of lag-policy-compliant libraries for the goal to count as met (default 80). Part of the versioned policy hash.",
     )
+    ap.add_argument("--draft-npm-preflight", action="store_true", help="Opt-in strict full npm resolution in an isolated fresh-lock workspace; never grants installation/runtime authority.")
+    ap.add_argument("--draft-npm-preflight-cache", help="CLI npm cache root for the optional resolver preflight.")
+    ap.add_argument("--draft-npm-preflight-offline", action="store_true", help="Use only saved npm cache metadata; a cache miss remains UNKNOWN.")
+    ap.add_argument("--draft-npm-preflight-seconds", type=int, default=60, help="Preflight cap1..60s, also bounded by remaining Draft deadline.")
     args = ap.parse_args()
+    if args.draft_npm_preflight and not args.draft_baseline:
+        ap.error("--draft-npm-preflight requires --draft-baseline")
+    if not 1 <= args.draft_npm_preflight_seconds <= 60:
+        ap.error("--draft-npm-preflight-seconds must be1..60")
     if args.capture_baseline and args.draft_baseline:
         ap.error("--capture-baseline and --draft-baseline are mutually exclusive")
     source_baseline_mode = bool(args.capture_baseline or args.draft_baseline)
@@ -27747,6 +27772,11 @@ def main() -> None:
                 health_by_project=health_by_project,
                 status="DRAFT_READY",
                 partial_reason=None,
+                npm_preflight=({
+                    "cache": args.draft_npm_preflight_cache,
+                    "offline": args.draft_npm_preflight_offline,
+                    "timeoutSeconds": args.draft_npm_preflight_seconds,
+                } if args.draft_npm_preflight else None),
                 deadline=deadline_clock,
                 input_hashes=draft_input_hashes,
                 input_files_by_project=draft_input_files_by_project,
