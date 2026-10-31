@@ -93,6 +93,7 @@ from draft_decision_contract import (
     normalize_decision_contract, package_is_mutable, version_line_allowed,
 )
 from draft_input_identity import capture_draft_semantic_inputs, aggregate_semantic_inputs
+from draft_publication_guard import guard_draft_publication
 from storybook_release_policy import is_storybook_release_package
 from registry_candidate_diagnostics import (
     summarize_structural_candidates, with_observed_physical_probes,
@@ -1097,6 +1098,8 @@ class DependencyRow:
     # (registry request raised) / "osv-unavailable" (metadata OK, OSV failed).
     # Pending/interrupted rows are derived from draft_scan_state instead.
     draft_unknown: str = ""
+    # Publication-only uncertainty; registry/OSV observations stay unchanged.
+    draft_planning_unknown: str = ""
     # R12: an explicitly bounded candidate search (draft-max-candidates / max-candidates)
     # left versions outside the covered evidence network. Such a row is never a
     # proven "no target" -- the honest status is `candidate-search-truncated`.
@@ -24252,7 +24255,7 @@ def _draft_target_for_major(row: DependencyRow) -> str:
     """
     if row.scope_excluded:
         return NO_ACTION
-    if row.planner_deferred:
+    if row.planner_deferred or row.draft_planning_unknown:
         return NO_ACTION
     # F5: the chosen level is the row's OWN project acceptance policy
     # (`targetLevel`), which for the CLI equals --target-level and for a
@@ -24408,6 +24411,8 @@ def _draft_row_status(row: DependencyRow, chosen_target: str) -> str:
         return "peer-compat-unresolved"
     if not _row_metadata_known(row):
         return "unknown-metadata"
+    if row.draft_planning_unknown:
+        return "planning-incomplete"
     current = str(row.current_version or "").strip()
     target = str(chosen_target or "").strip()
     if target == NO_ACTION or target == "":
@@ -24514,7 +24519,9 @@ def build_draft_plan(
             target_reason = row.reason if row.reason else (
                 row.target_default_reason if row.target_default_reason != NO_ACTION else None
             )
-            if status in ("no-target", "candidate-search-truncated", "blocked"):
+            if status == "planning-incomplete":
+                target_reason = row.draft_planning_unknown
+            elif status in ("no-target", "candidate-search-truncated", "blocked"):
                 # R12: no-target rows must state the REAL planner reason, never
                 # the display-group cause; a truncated search names the limit.
                 target_reason = (
@@ -24587,7 +24594,7 @@ def build_draft_plan(
             # with a security uncertainty add here (no double counting).
             if (sec_unknown or sec_unrated) and status != "unknown-security":
                 totals["unknown-security"] = totals.get("unknown-security", 0) + 1
-            if meta_unknown or sec_unknown or sec_unrated or status in ("unknown-metadata", "unknown-security", "candidate-search-truncated", "blocked", "no-target", "peer-compat-unresolved"):
+            if meta_unknown or sec_unknown or sec_unrated or status in ("unknown-metadata", "unknown-security", "candidate-search-truncated", "blocked", "no-target", "peer-compat-unresolved", "planning-incomplete"):
                 # T3: metadata (registry availability) and security (OSV) are
                 # separate unknown classes; an unassessed OSV state must reach
                 # the plan/summary/prompt even when the registry metadata is
@@ -24604,6 +24611,8 @@ def build_draft_plan(
                 # flag, the candidateTruncated/candidateTruncatedTargetless/
                 # candidateTruncatedProposed counters and a prompt not�.
                 causes = []
+                if row.draft_planning_unknown:
+                    causes.append(row.draft_planning_unknown)
                 if meta_unknown:
                     causes.append(_draft_metadata_unknown_reason(row))
                 if sec_unknown:
@@ -24629,6 +24638,8 @@ def build_draft_plan(
                           else ("truncated" if tr_blocked and not (meta_unknown or sec_blocked or peer_blocked) \
                                 else ("peer-compat" if peer_blocked and not (meta_unknown or sec_blocked or tr_blocked) \
                                       else "both")))
+                if row.draft_planning_unknown and not (meta_unknown or sec_blocked or tr_blocked or peer_blocked):
+                    clarity = "planning"
                 unknowns.append({
                     "package": row.name,
                     "project": project,
@@ -24753,6 +24764,8 @@ def build_draft_plan(
             target_level=target_level, projected_moderate=sec_moderate, projected_low=sec_low,
             lag_unknown=lag_unprovable, project_name=project,
         )
+        if goal_verdict == "feasible" and any(r.draft_planning_unknown for r in active_rows):
+            goal_verdict = "unknown"
         truncated_proposed = sum(
             1 for er in plan_rows if er.get("status") == "proposed" and er.get("candidateSearchTruncated")
         )
@@ -26042,6 +26055,7 @@ def publish_draft_result(
     input_files_by_project: Optional[Dict[str, List[str]]] = None,
     solver_component_reports: Optional[List[Dict[str, Any]]] = None,
     execution_context: Optional[Dict[str, Any]] = None,
+    planning_complete: bool = True,
 ) -> Dict[str, Any]:
     """Publish the Draft result set atomically and return its manifest.
 
@@ -26054,9 +26068,21 @@ def publish_draft_result(
     raw_cap = str(cap_value).strip() if cap_value is not None else ""
     effective_cap = int(raw_cap) if raw_cap.isdecimal() else None
     generated_at = dt.datetime.now(dt.timezone.utc).isoformat()
+    rows_by_project, publication_guard = guard_draft_publication(
+        rows_by_project, snapshot, planning_complete=planning_complete,
+        no_action=NO_ACTION, is_action=target_is_action,
+    )
+    if publication_guard["changedProjects"]:
+        health_by_project = dict(health_by_project)
+        for project in publication_guard["changedProjects"]:
+            health_by_project[project] = compute_project_health(rows_by_project[project], project, None)
+    if publication_guard["issues"] and status == "DRAFT_READY":
+        status = "DRAFT_PARTIAL"
+        partial_reason = "Owner contract publication guard withheld unplanned or disallowed recommendations"
     plan = build_draft_plan(rows_by_project, projects_by_name, health_by_project)
     contract = contract_from_snapshot(snapshot)
     plan["decisionContract"] = contract
+    plan["publicationGuard"] = publication_guard
     semantic_inputs = aggregate_semantic_inputs({
         name: (spec.draft_semantic_inputs or capture_draft_semantic_inputs(
             spec.path, topology=spec.lockfile_state.get("projectTopology"),
@@ -26096,7 +26122,7 @@ def publish_draft_result(
     # their per-row evidence carries a truncation caveat; they must not be
     # reported as "needs clarification" (previously the whole unknowns list was
     # used and 61 actionable truncated rows inflated the counter).
-    clarification_statuses = {"unknown-metadata", "unknown-security", "candidate-search-truncated", "blocked", "no-target", "peer-compat-unresolved"}
+    clarification_statuses = {"unknown-metadata", "unknown-security", "candidate-search-truncated", "blocked", "no-target", "peer-compat-unresolved", "planning-incomplete"}
     clarification_names: List[str] = []
     truncated_rows = 0
     for project_rows in rows_by_project.values():
@@ -26407,6 +26433,7 @@ def publish_draft_result(
             "candidateTruncatedProposed": truncated_proposed,
             "blocked": counts.get("blocked", 0),
             "peerCompatUnresolved": peer_unresolved,
+            "planningUnknown": counts.get("planning-incomplete", 0),
             "ok": counts.get("ok", 0),
             "postPlanLagOk": post_plan_ok,
             "postPlanLagOkPct": post_plan_pct,
@@ -26703,6 +26730,7 @@ def _publish_draft_and_exit(
     input_hashes: Optional[Dict[str, str]] = None,
     input_files_by_project: Optional[Dict[str, List[str]]] = None,
     solver_component_reports: Optional[List[Dict[str, Any]]] = None,
+    planning_complete: bool = False,
 ) -> None:
     """Publish whatever Draft data was gathered before an abort and exit 0.
 
@@ -26732,6 +26760,7 @@ def _publish_draft_and_exit(
         input_hashes=input_hashes,
         input_files_by_project=input_files_by_project,
         solver_component_reports=solver_component_reports,
+        planning_complete=planning_complete,
         execution_context=_build_draft_execution_context(
             projects_by_name,
             registry=registry,
@@ -27583,6 +27612,7 @@ def main() -> None:
                         f"this is not a proven conflict and not a proven solution. {unresolved_groups}"
                     ),
                     solver_component_reports=draft_incomplete_components,
+                    planning_complete=True,
                     input_hashes=draft_input_hashes,
                     input_files_by_project=draft_input_files_by_project,
                 )
@@ -27740,6 +27770,7 @@ def main() -> None:
                 deadline_clock=deadline_clock,
                 status="DRAFT_PARTIAL",
                 partial_reason=f"Draft deadline ({deadline_clock.deadline_seconds}s) exceeded at {budget_exc.phase}; plan is partial.",
+                planning_complete=True,
                 input_hashes=draft_input_hashes,
                 input_files_by_project=draft_input_files_by_project,
             )
