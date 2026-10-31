@@ -51,6 +51,8 @@ def _validate_project(
     rows: list[dict[str, Any]], source: Path, output: Path, *, registry: str,
     options: Mapping[str, Any], remaining: Callable[[], float | None],
 ) -> dict[str, Any]:
+    if not registry:
+        return {"status": "UNKNOWN", "code": "REGISTRY_NOT_CONFIGURED"}
     before = {name: _digest(source / name) for name in ("package.json", "package-lock.json", ".npmrc")}
     package = json.loads((source / "package.json").read_text(encoding="utf-8-sig"))
     if package.get("workspaces") or str(package.get("packageManager", "npm")).split("@", 1)[0] not in ("", "npm"):

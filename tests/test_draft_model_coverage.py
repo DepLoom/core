@@ -47,5 +47,13 @@ class DraftModelCoverageTests(unittest.TestCase):
         self.assertEqual(1, result['metadata']['postPlanScopeTotal'])
         self.assertEqual('UNKNOWN', result['compatibility'])
 
+    def test_runtime_registry_never_comes_from_redacted_display_context(self):
+        registry = 'https://registry.example.invalid/repository/custom-feed/'
+        evidence = {'status': 'RESOLUTION_FAILED', 'learningAllowed': False, 'projects': {}}
+        with patch('draft_npm_preflight.validate_draft_plan', return_value=evidence) as check:
+            self.publish([fixtures.row()], {}, npm_preflight={'registry': registry},
+                         execution_context={'registry': 'https://registry.example.invalid/repository/[redacted]/'})
+        self.assertEqual(registry, check.call_args.kwargs['registry'])
+
 if __name__ == '__main__':
     unittest.main()

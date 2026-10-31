@@ -26115,7 +26115,7 @@ def publish_draft_result(
     if npm_preflight is not None:
         pm_validation = draft_npm_preflight.validate_draft_plan(
             plan, {name: spec.path for name, spec in projects_by_name.items()},
-            artifacts_dir=draft_dir, registry=str(exec_ctx.get("registry") or ""),
+            artifacts_dir=draft_dir, registry=str(npm_preflight.get("registry") or ""),
             options=npm_preflight, remaining=lambda: deadline.remaining,
         )
         if pm_validation["status"] != "RESOLUTION_PASSED":
@@ -27773,6 +27773,7 @@ def main() -> None:
                 status="DRAFT_READY",
                 partial_reason=None,
                 npm_preflight=({
+                    "registry": str(getattr(client, "registry", "") or ""),
                     "cache": args.draft_npm_preflight_cache,
                     "offline": args.draft_npm_preflight_offline,
                     "timeoutSeconds": args.draft_npm_preflight_seconds,

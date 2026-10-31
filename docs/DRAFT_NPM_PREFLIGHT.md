@@ -20,7 +20,8 @@ It preserves other manifest fields and project `.npmrc`, never edits source or
 its lock, and explicitly enforces strict peers, engine checks, scripts disabled,
 no force, no legacy peers, and ordinary hoisted placement. Saved cache is used
 only when offline is requested. Cache misses are unknown evidence. Network
-registry selection comes from the same Draft execution context.
+registry selection comes directly from the operational client settings. The
+redacted display context is never used as an execution URL.
 
 The per-project cap is at most60 seconds and is also clamped to the remaining
 absolute Draft budget; it never renews the planning deadline. The existing

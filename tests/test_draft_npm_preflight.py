@@ -87,5 +87,11 @@ class NpmPreflightTests(unittest.TestCase):
         self.assertEqual('SOURCE_INPUT_CHANGED',result['projects']['fixture']['code'])
         self.assertEqual('UNKNOWN',result['status'])
 
+    def test_missing_runtime_registry_never_uses_a_default_network_origin(self):
+        with patch.object(preflight, 'run_supervised', side_effect=AssertionError('must not run')):
+            result=preflight.validate_draft_plan(self.plan, {'fixture':self.source}, artifacts_dir=self.base/'out', registry='', options={}, remaining=lambda:60)
+        self.assertEqual('UNKNOWN',result['status'])
+        self.assertEqual('REGISTRY_NOT_CONFIGURED',result['projects']['fixture']['code'])
+
 if __name__=='__main__':
     unittest.main()
