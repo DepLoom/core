@@ -49,12 +49,12 @@ class VerificationInvocationTests(unittest.TestCase):
                 observe_command(1,COMMAND,observed,guarded=True,identities=identities())
                 return expected
             def callback(event):
-                if event["type"]=="INVOCATION_FINISHED":self.assertTrue(trial.exists())
+                if event["type"]=="INVOCATION_RESULT_OBSERVED":self.assertTrue(trial.exists())
                 events.append(event)
             self.assertIs(run_observed(callback,FINGERPRINT,[COMMAND],action),expected)
             self.assertFalse(trial.exists())
-        self.assertEqual(events[-1]["status"],"OBSERVATION_COMPLETE")
-        self.assertTrue(events[-1]["beforeWorkspaceCleanup"])
+        self.assertEqual(events[-1]["status"],"RESULT_OBSERVED_COMPLETE")
+        self.assertTrue(events[-1]["beforePrivateWorkspaceDeletion"])
         self.assertFalse(events[-1]["fullAcceptance"])
         self.assertEqual(events[-1]["metadataNecessityCheck"],"UNKNOWN")
     def test_callback_return_and_payload_mutation_cannot_change_owner_result(self):
@@ -97,7 +97,7 @@ class VerificationInvocationTests(unittest.TestCase):
         def action():
             defer_workspace_cleanup(lambda:cleanup.append(True));observe_command(1,COMMAND,supervised(),guarded=True,identities=identities());return result()
         with self.assertRaises(InvocationObservationError):run_observed(callback,FINGERPRINT,[COMMAND],action)
-        self.assertEqual(cleanup,[True]);self.assertFalse(any(e["type"]=="INVOCATION_FINISHED" for e in events))
+        self.assertEqual(cleanup,[True]);self.assertFalse(any(e["type"]=="INVOCATION_RESULT_OBSERVED" for e in events))
     def test_cancellation_and_early_exception_never_leave_successful_final(self):
         for error in [asyncio.CancelledError(),RuntimeError("early control")]:
             cleanup=[];events=[]

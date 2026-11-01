@@ -2923,10 +2923,18 @@ def verify_assignment(
         dir=str(trial_parent) if trial_parent is not None else None,
     )).resolve()
     from verification_storage_maintenance import register_trial_owner, retire_trial
-    register_trial_owner(temp_root)
+    def cleanup_observed_workspace():
+        shutil.rmtree(temp_root, ignore_errors=True)
+        if temp_root.exists():
+            retire_trial(temp_root)
+            if cleanup_deferred:
+                raise OSError("OBSERVED_PRIVATE_WORKSPACE_CLEANUP_INCOMPLETE")
+    # Register at ownership acquisition, before any resource release can fail.
+    cleanup_deferred = _defer_invocation_cleanup(cleanup_observed_workspace)
     source_binding = contextlib.ExitStack()
     guarded_trial_roots: set[Path] = set()
     try:
+        register_trial_owner(temp_root)
         workspace_root = temp_root / "repo"
         workspace_started = time.monotonic()
         event("verify.workspace.start")
@@ -4960,13 +4968,11 @@ def verify_assignment(
                 cleanup_guarded_clone(guarded_root)
             except Exception as exc:
                 event("verify.project-check.guard-cleanup-failed", detail=str(exc), workspace=str(guarded_root))
-        source_binding.close()
-        def cleanup_observed_workspace():
-            shutil.rmtree(temp_root, ignore_errors=True)
-            if temp_root.exists():
-                retire_trial(temp_root)
-        if not _defer_invocation_cleanup(cleanup_observed_workspace):
-            cleanup_observed_workspace()
+        try:
+            source_binding.close()
+        finally:
+            if not cleanup_deferred:
+                cleanup_observed_workspace()
 
 
 

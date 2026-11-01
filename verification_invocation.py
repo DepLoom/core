@@ -27,7 +27,7 @@ class InvocationObservation:
         self.commands=tuple(commands);self.events=[];self.cleanups=[];self.finished=False;self.failed=False;self.identity=None
         self.id=uuid.uuid4().hex
     def emit(self,event):
-        payload={"schemaVersion":1,"invocationId":self.id,"sequence":len(self.events)+1,
+        payload={"schemaVersion":2,"invocationId":self.id,"sequence":len(self.events)+1,
                  "authority":"NON_REUSABLE_INVOCATION_OBSERVATION","reuseAllowed":False,"fullAcceptance":False,**event}
         self.events.append(copy.deepcopy(payload))
         try:self.callback(copy.deepcopy(payload))
@@ -60,15 +60,16 @@ class InvocationObservation:
             else:missing.append(index)
         identity_complete=bool(self.identity) and all(self.identity.values()) and self.identity.get("verified_assignment_fingerprint")==self.assignment
         complete=bool(result is not None and getattr(result,"ok",False) and getattr(result,"kind","")=="passed" and not error and not missing and self.commands and identity_complete and before_cleanup)
-        self.emit({"type":"INVOCATION_FINISHED","outcome":str(getattr(result,"kind","unknown")),
-                   "status":"OBSERVATION_COMPLETE" if complete else "INCOMPLETE_UNKNOWN",
-                   "beforeWorkspaceCleanup":before_cleanup,"identities":self.identity,
+        self.emit({"type":"INVOCATION_RESULT_OBSERVED","outcome":str(getattr(result,"kind","unknown")),
+                   "status":"RESULT_OBSERVED_COMPLETE" if complete else "INCOMPLETE_UNKNOWN",
+                   "beforePrivateWorkspaceDeletion":before_cleanup,"sourceGuardsActive":"NOT_ATTESTED",
+                   "invocationReturned":False,"identities":self.identity,
                    "targetOnlyAssignmentFingerprint":self.assignment,"requiredCommandCount":len(self.commands),
                    "freshPassedCommandIndexes":fresh,"unconfirmedCommandIndexes":missing,
                    "errorType":type(error).__name__ if error is not None else None,
                    "localWorkspace":str(getattr(result,"workspace","") or "") if result is not None else "",
                    "metadataNecessityCheck":"UNKNOWN",
-                   "publicationEligibility":"PENDING_ADAPTER_BINDING_VALIDATION"})
+                   "publicationEligibility":"FORBIDDEN_UNTIL_OUTER_CALL_RETURNS"})
 
 def observe_command(index,command,result,*,guarded,identities):
     state=_CURRENT.get()
@@ -89,15 +90,21 @@ def defer_workspace_cleanup(cleanup):
 
 def run_observed(callback,assignment_fingerprint,commands,action):
     state=InvocationObservation(callback,assignment_fingerprint,commands);token=_CURRENT.set(state)
+    primary_error=None
     try:
         try:result=action()
         except BaseException as exc:
-            state.finish(error=exc)
+            try:state.finish(error=exc)
+            except BaseException as observation_error:
+                exc.add_note("Invocation observation also failed: "+type(observation_error).__name__)
             raise
         state.finish(result,before_cleanup=bool(state.cleanups))
         if state.identity!=_result_identity(result):
             raise InvocationObservationError("RESULT_IDENTITY_CHANGED_AFTER_OBSERVATION")
         return result
+    except BaseException as exc:
+        primary_error=exc
+        raise
     finally:
         cleanup_error=None
         try:
@@ -106,4 +113,7 @@ def run_observed(callback,assignment_fingerprint,commands,action):
                 except BaseException as exc:cleanup_error=exc
         finally:_CURRENT.reset(token)
         if cleanup_error is not None:
-            raise InvocationObservationError("OBSERVED_WORKSPACE_CLEANUP_FAILED") from cleanup_error
+            if primary_error is not None:
+                primary_error.add_note("Owned invocation cleanup also failed: "+type(cleanup_error).__name__)
+            else:
+                raise InvocationObservationError("OBSERVED_WORKSPACE_CLEANUP_FAILED") from cleanup_error
