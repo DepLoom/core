@@ -75,6 +75,16 @@ class ObserverLifecycleTests(unittest.TestCase):
             run_observed(events.append,FINGERPRINT,[COMMAND],action)
         self.assertEqual(released,["guard","source","workspace"])
         self.assertEqual(events[-1]["status"],"INCOMPLETE_UNKNOWN")
+    def test_nonthrowing_guard_result_errors_also_block_observed_success(self):
+        events=[]
+        def action():
+            defer_workspace_cleanup(lambda:None)
+            observe_command(1,COMMAND,supervised(),guarded=True,identities=identities())
+            verifier._observe_guarded_cleanup(lambda target:SimpleNamespace(errors=("guard incomplete",),mutations=()),Path("owned"))
+            return result()
+        with self.assertRaisesRegex(InvocationObservationError,"CLEANUP_FAILED"):
+            run_observed(events.append,FINGERPRINT,[COMMAND],action)
+        self.assertEqual(events[-1]["status"],"INCOMPLETE_UNKNOWN")
     def test_legacy_guard_cleanup_remains_best_effort_but_releases_other_resources(self):
         released=[]
         def bad_guard(path):raise OSError("legacy guard cleanup fault")

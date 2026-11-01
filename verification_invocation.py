@@ -88,14 +88,23 @@ def defer_workspace_cleanup(cleanup):
     state.cleanups.append(cleanup)
     return True
 
+def guarded_cleanup(cleanup_guard,target):
+    state=_CURRENT.get()
+    try:result=cleanup_guard(target)
+    except Exception as exc:
+        if state is not None:state.cleanup_failures.append(exc)
+        raise
+    if state is not None and (getattr(result,"errors",()) or getattr(result,"mutations",())):
+        state.cleanup_failures.append(InvocationObservationError("GUARDED_CLEANUP_RESULT_NOT_CLEAN"))
+    return result
+
+
 def close_owned_resources(guarded_roots,cleanup_guard,source_binding,cleanup_workspace,cleanup_deferred,event):
     """Release all owner resources; legacy logging never grants observed success."""
     try:
         for guarded_root in guarded_roots:
-            try:cleanup_guard(guarded_root)
+            try:guarded_cleanup(cleanup_guard,guarded_root)
             except Exception as exc:
-                state=_CURRENT.get()
-                if state is not None:state.cleanup_failures.append(exc)
                 event("verify.project-check.guard-cleanup-failed",detail=str(exc),workspace=str(guarded_root))
     finally:
         try:source_binding.close()

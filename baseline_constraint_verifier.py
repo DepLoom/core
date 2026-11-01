@@ -36,6 +36,7 @@ from verification_invocation import (
     observe_reused_profile as _observe_invocation_reused_profile,
     defer_workspace_cleanup as _defer_invocation_cleanup,
     close_owned_resources as _close_invocation_resources,
+    guarded_cleanup as _observe_guarded_cleanup,
     run_observed as _run_invocation_observed,
 )
 from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -4539,7 +4540,7 @@ def verify_assignment(
                             detail=precheck_failure,
                         )
                         if clone_isolation == "ntfs-junction-guarded":
-                            cleanup_guarded_clone(command_root)
+                            _observe_guarded_cleanup(cleanup_guarded_clone, command_root)
                         _disable_prepared_command_fastpath(project_dir, command)
                         _disable_prepared_snapshot_fastpath(
                             proof_identity.preparation_proof_key, project_dir
@@ -4632,7 +4633,7 @@ def verify_assignment(
                         )
                         budget_cutoff = isinstance(exc, subprocess.TimeoutExpired) and _budget_deadline_hit(config)
                         if clone_isolation == "ntfs-junction-guarded":
-                            cleanup_guarded_clone(command_root)
+                            _observe_guarded_cleanup(cleanup_guarded_clone, command_root)
                             _evict_prepared_workspace_snapshot(
                                 proof_identity.preparation_proof_key, project_dir
                             )
@@ -4668,7 +4669,7 @@ def verify_assignment(
                         # authoritative for the preparation identity. Even an
                         # integrity-matched final state may have been transiently
                         # mutated while another consumer was reading it.
-                        cleanup_guarded_clone(command_root)
+                        _observe_guarded_cleanup(cleanup_guarded_clone, command_root)
                         # This is performance state only. The command is still
                         # freshly executed in an isolated private clone.
                         _disable_prepared_command_fastpath(project_dir, command)
@@ -4910,7 +4911,7 @@ def verify_assignment(
                         reusable_private_root = None
                         reusable_private_project = None
                         if clone_isolation == "ntfs-junction-guarded":
-                            cleanup_guarded_clone(command_root)
+                            _observe_guarded_cleanup(cleanup_guarded_clone, command_root)
                         _cleanup_trial_root(command_root, event=event, command=command)
 
             if project_failures:
