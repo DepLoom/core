@@ -20,6 +20,7 @@ import json
 import os
 import shutil
 import stat
+import sys
 import subprocess
 import tempfile
 import threading
@@ -1402,6 +1403,7 @@ def verification_source_snapshot_scope(
     progress_interval_seconds: int = 15,
     reuse_completed: bool = False,
     recovery_directory: Optional[Path] = None,
+    strict_cleanup: bool = False,
 ):
     """Pin one source subject for identity, cache lookup and all attempt retries.
 
@@ -1409,8 +1411,12 @@ def verification_source_snapshot_scope(
     by existing sealed and live-source continuity guards, never the cache key.
     Context-local registration prevents concurrent requests or later cohorts
     from consuming a stale epoch belonging to another verification.
+    strict_cleanup requires an owned non-reused scope and confirms physical
+    container retirement; legacy scopes retain their best-effort cleanup.
     """
     existing = active_source_snapshot(project_dir)
+    if strict_cleanup and (existing is not None or reuse_completed):
+        raise SourceCaptureError("SOURCE_SNAPSHOT_STRICT_SCOPE_OWNERSHIP_REQUIRED")
     if existing is not None:
         yield existing
         return
@@ -1469,6 +1475,12 @@ def verification_source_snapshot_scope(
                 _retire_completed_request(candidate)
         else:
             _retire_completed_request(snapshot)
+            if strict_cleanup and snapshot.container.exists():
+                primary = sys.exc_info()[1]
+                if primary is not None:
+                    primary.add_note("SOURCE_SNAPSHOT_CLEANUP_INCOMPLETE")
+                else:
+                    raise SourceCaptureError("SOURCE_SNAPSHOT_CLEANUP_INCOMPLETE")
 
 
 def _retire_completed_request(snapshot):
