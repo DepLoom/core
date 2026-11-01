@@ -51,8 +51,12 @@ def verify_current_workspace(project_dir, *, expected_source_key, dependency_pla
     """
     from baseline_constraint_verifier import (project_check_command_argv,
         observed_resolved_assignment, observed_resolved_hash)
+    operation_started=time.monotonic()
+    operations=[]
     def fail(code):
-        raise MaterializedWorkspaceVerificationError(code)
+        error=MaterializedWorkspaceVerificationError(code)
+        error.operation_observations=tuple(operations)
+        raise error
     def remaining():
         value=deadline-time.time()
         if value <= 0: fail('CURRENT_WORKSPACE_DEADLINE_EXCEEDED')
@@ -99,11 +103,17 @@ def verify_current_workspace(project_dir, *, expected_source_key, dependency_pla
     tools={'nodeSha256':_sha(Path(node).read_bytes()),'npmCliSha256':_sha(npm.read_bytes())}
     lock=(project/'package-lock.json').read_bytes()
     if _sha(lock)!=dependency_plan['approvedLockSha256']:fail('CURRENT_WORKSPACE_APPROVED_LOCK_MISMATCH')
-    def run(argv,label):
+    def run(argv,label,command_index=None):
+        started=time.monotonic()
         x=run_supervised(argv,project,timeout_seconds=remaining(),base_env=env,
             progress_label=label,max_output_bytes=65536)
-        remaining()
         s=getattr(x,'supervision',None)
+        operations.append({'operation':'strict-frozen-install' if command_index is None else 'project-command',
+            'commandIndex':command_index,'argvDigest':_digest(argv),'elapsedStartMs':int((started-operation_started)*1000),
+            'durationMs':int((time.monotonic()-started)*1000),'returnCode':x.returncode,
+            'supervision':getattr(s,'quality',None),'descendantsRemaining':getattr(s,'descendants_remaining',None),
+            'timedOut':bool(getattr(x,'timed_out',False)),'cancelled':bool(getattr(x,'cancelled',False))})
+        remaining()
         if (getattr(s,'quality',None)!='guaranteed-tree'
                 or getattr(s,'descendants_remaining',None)!=0
                 or getattr(x,'timed_out',False) or getattr(x,'cancelled',False)):
@@ -147,7 +157,7 @@ def verify_current_workspace(project_dir, *, expected_source_key, dependency_pla
             if before!=initial:fail('CURRENT_WORKSPACE_TREE_CHANGED')
             inline=pinned_inline_node_invocation(command,env)
             argv=inline['argv'] if inline else project_check_command_argv(command,env)
-            result=run(argv,'current-workspace project check')
+            result=run(argv,'current-workspace project check',index)
             source_guard();after=tree()
             if after!=initial:fail('CURRENT_WORKSPACE_TREE_CHANGED')
             if result.returncode!=0:fail('CURRENT_WORKSPACE_COMMAND_FAILED')
@@ -177,4 +187,6 @@ def verify_current_workspace(project_dir, *, expected_source_key, dependency_pla
     remaining()
     result['sourceSnapshotCleanupClosed']=True
     result['ownedCleanupConfirmed']=True
+    result['ownerOperationObservations']=operations
+    result['ownerElapsedMs']=int((time.monotonic()-operation_started)*1000)
     return result

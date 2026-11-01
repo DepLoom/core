@@ -55,6 +55,10 @@ class CurrentWorkspaceVerificationTests(unittest.TestCase):
         self.assertEqual(row['stdoutDigest'],expected)
         self.assertEqual(row['origin'],'EXECUTED_FRESH')
         self.assertEqual(value['installation']['supervision'],'guaranteed-tree')
+        self.assertEqual([row['operation'] for row in value['ownerOperationObservations']],
+            ['strict-frozen-install','project-command'])
+        self.assertEqual([row['commandIndex'] for row in value['ownerOperationObservations']],[None,1])
+        self.assertTrue(all(row['supervision']=='guaranteed-tree' and row['descendantsRemaining']==0 for row in value['ownerOperationObservations']))
         self.assertTrue(value['sourceSnapshotCleanupClosed'])
         self.assertFalse(value['currentWorkspaceVerified'])
         self.assertFalse(value['checkpointPublished'])
@@ -87,6 +91,7 @@ class CurrentWorkspaceVerificationTests(unittest.TestCase):
             dependency_plan=self.plan,commands=[command('console.log(process.cwd());')],
             cache_dir=self.cache,final_profile_digest='c'*64,deadline=time.time()+60)
         self.assertEqual(value['installation']['status'],'EXISTING_TREE_PHYSICALLY_OBSERVED')
+        self.assertEqual([row['operation'] for row in value['ownerOperationObservations']],['project-command'])
         self.assertEqual(sentinel.read_text(),'preserve me')
 
     def test_cold_install_does_not_destroy_existing_dependency_tree(self):
