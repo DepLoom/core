@@ -49,6 +49,20 @@ class StrictSnapshotCleanupTests(unittest.TestCase):
         with core.verification_source_snapshot_scope(self.project,timeout_seconds=10):
             with self.assertRaisesRegex(core.SourceCaptureError,'STRICT_SCOPE_OWNERSHIP_REQUIRED'):
                 with core.verification_source_snapshot_scope(self.project,timeout_seconds=10,strict_cleanup=True):pass
+    def test_throwing_retirement_preserves_primary_failure_in_strict_scope(self):
+        original=RuntimeError('primary engineering failure');snapshot=None
+        try:
+            with self.assertRaises(RuntimeError) as caught:
+                with patch.object(core,'_retire_completed_request',side_effect=OSError('engineering retirement throw')):
+                    with core.verification_source_snapshot_scope(self.project,timeout_seconds=10,strict_cleanup=True) as snapshot:
+                        raise original
+            self.assertIs(caught.exception,original)
+            self.assertIn('SOURCE_SNAPSHOT_RETIREMENT_FAILED: OSError',original.__notes__)
+        finally:
+            if snapshot is not None:
+                core._retire_completed_request(snapshot)
+                self.cleanup_owned(snapshot)
+
     def test_watcher_retirement_error_rejects_even_when_container_removed(self):
         from types import SimpleNamespace
         snapshot=None

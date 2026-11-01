@@ -1482,7 +1482,13 @@ def verification_source_snapshot_scope(
                 _retire_completed_request(candidate)
         else:
             owned_watchers = strict_owned_watchers + _owned_source_snapshot_watchers(snapshot) if strict_cleanup else ()
-            _retire_completed_request(snapshot)
+            retirement_primary = sys.exc_info()[1]
+            try:
+                _retire_completed_request(snapshot)
+            except BaseException as retirement_error:
+                if not strict_cleanup or retirement_primary is None:
+                    raise
+                retirement_primary.add_note("SOURCE_SNAPSHOT_RETIREMENT_FAILED: " + type(retirement_error).__name__)
             retirement_failed = any(getattr(watcher, "errors", ()) or
                 (getattr(watcher, "_thread", None) is not None and watcher._thread.is_alive())
                 for watcher in owned_watchers)
