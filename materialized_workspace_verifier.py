@@ -42,7 +42,7 @@ def _sha(raw):
 
 def verify_current_workspace(project_dir, *, expected_source_key, dependency_plan,
         commands, cache_dir, deadline, final_profile_digest, environment=None, materialize=False,
-        environment_contract='LEGACY_INHERITED_ENV_V1'):
+        environment_contract='LEGACY_INHERITED_ENV_V1', trusted_pre_popen_guard=None):
     """Freshly check THIS authorized workspace; optional cold-only npm-ci.
 
     No caller-provided evidence, reusable command PASS or previous prepared tree
@@ -109,6 +109,11 @@ def verify_current_workspace(project_dir, *, expected_source_key, dependency_pla
         launch_options={}
         if environment_contract=='HOST_OWNED_PROJECT_EXECUTION_ENV_V1':
             launch_options['expected_project_environment_digest']=project_environment_fingerprint(env,contract=environment_contract)
+        if trusted_pre_popen_guard is not None:
+            launch_options.update(trusted_pre_popen_guard=trusted_pre_popen_guard,
+                trusted_pre_popen_context={'invocationId':invocation_id,'operation':'strict-frozen-install' if command_index is None else 'project-command',
+                    'commandIndex':command_index,'sealedCommandHash':None if command_index is None else _sha(commands[command_index-1].encode()),
+                    'profileDigest':final_profile_digest,'argvDigest':_digest(argv)})
         x=run_supervised(argv,project,timeout_seconds=remaining(),base_env=env,
             progress_label=label,max_output_bytes=65536,**launch_options)
         s=getattr(x,'supervision',None)
@@ -123,6 +128,8 @@ def verify_current_workspace(project_dir, *, expected_source_key, dependency_pla
             if not native_launch_observation_matches(launch,launch_options['expected_project_environment_digest'],_digest(str(project))):
                 fail('CURRENT_WORKSPACE_ACTUAL_ENVIRONMENT_UNPROVEN')
             operations[-1]['projectExecutionEnvironment']=dict(launch)
+        witness=getattr(x,'guarded_spawn_witness',None)
+        if witness is not None:operations[-1]['guardedSpawnWitness']=dict(witness)
         remaining()
         if (getattr(s,'quality',None)!='guaranteed-tree'
                 or getattr(s,'descendants_remaining',None)!=0

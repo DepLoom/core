@@ -467,6 +467,38 @@ def terminate_process_tree(
                     pass
 
 
+def _trusted_guard_observation(guard,context,argv,launch_args,popen_kwargs,launch_environment):
+    """Code-only host guard on final immutable Popen values; never a JSON API."""
+    import hashlib,json,re
+    from types import MappingProxyType
+    def digest(value):return hashlib.sha256(json.dumps(value,sort_keys=True,separators=(',',':'),ensure_ascii=False).encode()).hexdigest()
+    def hashed(value,n=64):return isinstance(value,str) and re.fullmatch('[0-9a-f]{'+str(n)+'}',value) is not None
+    fields={'invocationId','operation','commandIndex','sealedCommandHash','profileDigest','argvDigest'}
+    if (not callable(guard) or not isinstance(context,dict) or set(context)!=fields
+            or not hashed(context['invocationId'],32) or not hashed(context['profileDigest'])
+            or context['argvDigest']!=digest(list(argv)) or launch_environment is None):
+        raise ProcessSupervisionError('TRUSTED_PRE_POPEN_CONTEXT_INVALID')
+    install=context['operation']=='strict-frozen-install'
+    if (context['operation'] not in {'strict-frozen-install','project-command'}
+            or (install and (context['commandIndex'] is not None or context['sealedCommandHash'] is not None))
+            or (not install and (type(context['commandIndex']) is not int or context['commandIndex']<1 or not hashed(context['sealedCommandHash'])))):
+        raise ProcessSupervisionError('TRUSTED_PRE_POPEN_CONTEXT_INVALID')
+    result_id=uuid.uuid4().hex
+    native={'schemaVersion':1,'kind':'TRUSTED_PRE_POPEN_GUARD_V1',**context,
+        'launchArgvDigest':digest(launch_args),'environmentDigest':launch_environment['environmentDigest'],
+        'cwdDigest':launch_environment['cwdDigest'],'nativeProcessResultId':result_id}
+    observation_hash=digest(native)
+    event=MappingProxyType({**context,'actualArgv':launch_args if isinstance(launch_args,str) else tuple(launch_args),
+        'actualCwd':popen_kwargs['cwd'],'actualEnv':popen_kwargs['env'],
+        'nativeProcessResultId':result_id,'prePopenObservationHash':observation_hash})
+    approval=guard(event)  # Exceptions prevent Popen. No launch transformations follow.
+    if approval is None:return None
+    if (not isinstance(approval,dict) or set(approval)!={'role','inputBindingHash'}
+            or approval['role'] not in {'private','final'} or not hashed(approval['inputBindingHash'])):
+        raise ProcessSupervisionError('TRUSTED_PRE_POPEN_APPROVAL_INVALID')
+    return {**native,**approval,'prePopenObservationHash':observation_hash}
+
+
 def run_supervised(
     argv: Sequence[str],
     cwd: Path,
@@ -480,7 +512,11 @@ def run_supervised(
     output_observer: Optional[OutputObserver] = None,
     max_output_bytes: int = 1024 * 1024,
     expected_project_environment_digest: Optional[str] = None,
+    trusted_pre_popen_guard=None,
+    trusted_pre_popen_context=None,
 ) -> subprocess.CompletedProcess[str]:
+    if trusted_pre_popen_guard is None and trusted_pre_popen_context is not None:
+        raise ProcessSupervisionError("TRUSTED_PRE_POPEN_CONTEXT_WITHOUT_GUARD")
     merged_env = dict(base_env) if base_env is not None else os.environ.copy()
     if env:
         merged_env.update({str(k): str(v) for k, v in env.items()})
@@ -523,6 +559,10 @@ def run_supervised(
         popen_kwargs['env']=MappingProxyType(dict(popen_kwargs['env']))
         try:launch_environment=native_launch_environment_observation(popen_kwargs['env'],launch_cwd,expected_project_environment_digest)
         except ProjectExecutionEnvironmentError as exc:raise ProcessSupervisionError(str(exc)) from exc
+    guarded_spawn=None
+    if trusted_pre_popen_guard is not None:
+        guarded_spawn=_trusted_guard_observation(trusted_pre_popen_guard,trusted_pre_popen_context,
+            argv,launch_args,popen_kwargs,launch_environment)
     process: subprocess.Popen[str] = subprocess.Popen(launch_args, **popen_kwargs)
     # A handful of historical unit tests use minimal Popen doubles. Keep that
     # seam without weakening production: real subprocess.Popen always exposes
@@ -680,6 +720,8 @@ def run_supervised(
         )
         setattr(completed, "supervision", metadata)
         if launch_environment is not None:setattr(completed, 'project_execution_environment', launch_environment)
+        if guarded_spawn is not None:
+            setattr(completed,'guarded_spawn_witness',{**guarded_spawn,'spawnStarted':True,'nativePid':process.pid})
         setattr(completed, "captured_bytes", captured_bytes)
         setattr(completed, "dropped_bytes", dropped_bytes)
         setattr(completed, "output_truncated", truncated)
