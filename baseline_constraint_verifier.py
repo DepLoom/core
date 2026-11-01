@@ -2506,10 +2506,13 @@ def _apply_assignment(
         if package_changed:
             changed.append(name)
 
-    (project_dir / "package.json").write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    # A pre-applied exact candidate must retain its approved manifest bytes.
+    # Formatting a no-op silently changes source identity without changing scope.
+    if changed:
+        (project_dir / "package.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
     return changed
 
 OBSERVED_REMOVED = "<removed>"
@@ -4961,6 +4964,8 @@ def verify_assignment(
                             _observe_guarded_cleanup(cleanup_guarded_clone, command_root)
                         _cleanup_trial_root(command_root, event=event, command=command)
 
+            if inline_execution_unproven:
+                return BaselineVerifyResult(False,"unknown","INLINE_NODE_TOOLCHAIN_DRIFT")
             if project_failures:
                 summary_commands = ", ".join(item.command for item in project_failures)
                 output = "\n\n".join(
@@ -4994,8 +4999,6 @@ def verify_assignment(
                     reason="process-tree-supervision-not-guaranteed",
                 )
 
-        if inline_execution_unproven:
-            return BaselineVerifyResult(False,"unknown","INLINE_NODE_TOOLCHAIN_DRIFT")
         _emit_progress(progress, f"{progress_label}: completed; elapsed={int(time.monotonic() - attempt_started)}s")
         return BaselineVerifyResult(
             True, "passed", f"resolver preflight passed for {len(changed)} changed direct package(s)",

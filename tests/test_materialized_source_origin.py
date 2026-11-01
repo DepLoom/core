@@ -27,6 +27,14 @@ class MaterializedOriginTests(unittest.TestCase):
         lock=(target/"package-lock.json").read_bytes()
         state=ResolvedDependencyState("b"*64,"c"*64,"npm","package-lock.json",hashlib.sha256(lock).hexdigest(),"d"*64,"",lock)
         return prepared,state
+    def test_noop_assignment_preserves_exact_approved_manifest_bytes(self):
+        from baseline_constraint_verifier import _apply_assignment
+        for manifest,assignment in (({"name":"source-origin-unit","version":"1.0.0"},{}),
+                ({"name":"source-origin-unit","dependencies":{"x":"1.0.0"}},{"x":"1.0.0"})):
+            before=(json.dumps(manifest,separators=(",",":"))+"\n").encode("utf-8")
+            (self.project/"package.json").write_bytes(before)
+            self.assertEqual(_apply_assignment(self.project,assignment),[])
+            self.assertEqual((self.project/"package.json").read_bytes(),before)
     def test_equal_physical_source_and_prepared_seals(self):
         with verification_source_snapshot_scope(self.project,timeout_seconds=15,strict_cleanup=True) as source:
             prepared,state=self.prepare(source)
@@ -67,5 +75,48 @@ class MaterializedOriginTests(unittest.TestCase):
             modified=SimpleNamespace(**vars(prepared));modified.source_closure_content_key="0"*64
             with self.assertRaisesRegex(MaterializedSourceOriginError,"SOURCE_ORIGIN_UNPROVEN"):
                 compare_materialized_source_origin(source,modified,state)
+
+
+    def real_preparation(self,*,lifecycle=False,tool_drift=False):
+        import base64,os,time
+        from unittest.mock import patch
+        from baseline_constraint_verifier import verify_assignment,BaselineVerifyConfig,resolve_executable,_command_prefix
+        if not resolve_executable("node") or not resolve_executable("npm"):self.skipTest("Node/npm required for real preparation regression")
+        if any(os.environ.get(k,"").strip() for k in ("NODE_OPTIONS","NODE_PATH")):
+            self.skipTest("active external Node loader is unsupported by inline closure")
+        if lifecycle:
+            manifest=json.loads((self.project/"package.json").read_text(encoding="utf-8"))
+            manifest["scripts"]={"postinstall":"node -e \"require('fs').writeFileSync('UNAPPROVED_PM_OUTPUT','bad')\""}
+            (self.project/"package.json").write_text(json.dumps(manifest)+"\n",encoding="utf-8")
+        env={**os.environ,"npm_config_cache":str(self.base/"npm-cache"),"npm_config_offline":"true",
+            "npm_config_audit":"false","npm_config_fund":"false","npm_config_lockfile_version":"2"}
+        argv,shell=_command_prefix(resolve_executable("npm"),["install","--package-lock-only","--ignore-scripts","--offline","--lockfile-version=2"])
+        subprocess.run(argv,shell=shell,cwd=self.project,env=env,check=True,capture_output=True,timeout=30)
+        body=b"throw new Error('intentional project failure');" if tool_drift else b"console.log('MUST_NOT_START');"
+        encoded=base64.b64encode(body).decode("ascii")
+        command="node -e "+json.dumps("eval(Buffer.from('"+encoded+"','base64').toString('utf8'))")
+        config=BaselineVerifyConfig(enabled=True,project_checks="strict",lifecycle_scripts=lifecycle,
+            observe_materialized_source_origin=True,commands=(command,),verification_purpose="intermediate-candidate",
+            publish_durable_prepared_artifact=False,timeout_seconds=45,attempt_timeout_seconds=60,
+            project_check_timeout_seconds=10,snapshot_copy_timeout_seconds=15,budget_phase_deadline=time.monotonic()+90)
+        events=[]
+        with patch.dict(os.environ,env):
+            with verification_source_snapshot_scope(self.project,timeout_seconds=15,strict_cleanup=True):
+                if tool_drift:
+                    with patch("verification_stage_checkpoint.file_digest",side_effect=["a"*64,"b"*64]):
+                        result=verify_assignment(self.project,{},config=config,run_project_checks=True,invocation_observer=events.append)
+                else:result=verify_assignment(self.project,{},config=config,run_project_checks=True,invocation_observer=events.append)
+        return result,events
+    def test_real_pm_unapproved_source_output_is_unknown_before_project_commands(self):
+        result,events=self.real_preparation(lifecycle=True)
+        self.assertFalse(result.ok);self.assertEqual(result.kind,"unknown");self.assertFalse(result.hard_failure)
+        self.assertIn("SOURCE_ORIGIN_MISMATCH",result.summary);self.assertIn("UNAPPROVED_PM_OUTPUT",result.summary)
+        self.assertEqual([e for e in events if e["type"]=="COMMAND_COMPLETED"],[])
+        self.assertFalse((self.project/"UNAPPROVED_PM_OUTPUT").exists())
+    def test_tool_identity_drift_overrides_real_nonzero_node_without_hard_failure(self):
+        result,events=self.real_preparation(tool_drift=True)
+        self.assertFalse(result.ok);self.assertEqual(result.kind,"unknown");self.assertFalse(result.hard_failure)
+        self.assertEqual(result.summary,"INLINE_NODE_TOOLCHAIN_DRIFT")
+        self.assertEqual([e["returnCode"] for e in events if e["type"]=="COMMAND_COMPLETED"],[1])
 
 if __name__=="__main__":unittest.main()
