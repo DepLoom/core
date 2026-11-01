@@ -187,6 +187,8 @@ class BaselineVerifyConfig:
     commands: Tuple[str, ...] = ()
     # Explicit verification policy; default retains legacy lifecycle execution.
     lifecycle_scripts: bool = True
+    # Code-only opt-in observation; never execution/goal admission authority.
+    observe_materialized_source_origin: bool = False
     registry: str = ""
     telemetry_path: str = ""
     proof_cache_dir: str = ""
@@ -379,6 +381,7 @@ class BaselineVerifyResult:
     command_checkpoint_refs: Tuple[str, ...] = ()
     verified_source_snapshot_key: str = ""
     verified_assignment_fingerprint: str = ""
+    materialized_source_origin: Mapping[str, object] = dataclasses.field(default_factory=dict)
 
     @property
     def hard_failure(self) -> bool:
@@ -2852,6 +2855,9 @@ def verify_assignment(
     remove_packages = tuple(sorted({str(item) for item in remove_packages}))
     telemetry_path = Path(config.telemetry_path).resolve() if config.telemetry_path else None
     assignment_hash = assignment_fingerprint(assignment)
+    materialized_source_origin = {}
+    source_origin_observation_digest = ""
+    inline_execution_unproven = False
 
     try:
         _validate_assignment_materialization(
@@ -4304,6 +4310,18 @@ def verify_assignment(
             if snapshot is None:
                 return BaselineVerifyResult(False, "infrastructure", "PREPARED_SNAPSHOT_UNAVAILABLE: project checks require a sealed preparation tree")
 
+            if config.observe_materialized_source_origin:
+                from verification_source_closure import compare_materialized_source_origin
+                try:
+                    materialized_source_origin = compare_materialized_source_origin(source_snapshot,snapshot,resolved_state)
+                    source_origin_observation_digest = hashlib.sha256(json.dumps(materialized_source_origin,
+                        sort_keys=True,separators=(",",":"),ensure_ascii=False).encode("utf-8")).hexdigest()
+                except Exception as exc:
+                    event("verify.source-origin.rejected",detail=str(exc))
+                    return BaselineVerifyResult(False,"unknown",f"SOURCE_ORIGIN_UNPROVEN: {exc}",workspace=str(workspace_project))
+                event("verify.source-origin.observed",sourceOriginObservationDigest=source_origin_observation_digest,
+                    preparedSourceContentKey=snapshot.source_closure_content_key)
+
             project_failures: List[BaselineProjectFailure] = []
             project_publication_allowed = True
             reusable_private_root: Optional[Path] = None
@@ -4326,7 +4344,7 @@ def verify_assignment(
                     proof_identity, checkpoint_artifact, config.commands, base_env)
 
             for command_index, command in enumerate(config.commands, start=1):
-                receipt = command_checkpoints.lookup(command_index, command) if command_checkpoints else None
+                receipt = command_checkpoints.lookup(command_index, command) if command_checkpoints and not config.observe_materialized_source_origin else None
                 if receipt:
                     _observe_invocation_reused_command(command_index, command, proof_identity.event_fields())
                     command_checkpoint_refs.append(receipt)
@@ -4485,6 +4503,8 @@ def verify_assignment(
                 check_result: Optional[subprocess.CompletedProcess[str]] = None
                 lower_check_clean = False
                 command_pass_verified = False
+                inline_node = None
+                inline_node_tool_unchanged = True
                 try:
                     removed_caches = clean_ephemeral_verification_caches(command_root, snapshot.dependency_roots)
                     if removed_caches:
@@ -4607,7 +4627,12 @@ def verify_assignment(
                         checks=len(config.commands),
                         isolation=clone_isolation,
                     )
-                    shell_argv = project_check_command_argv(command)
+                    if config.observe_materialized_source_origin:
+                        from verification_stage_checkpoint import pinned_inline_node_invocation
+                        try:inline_node = pinned_inline_node_invocation(command,base_env)
+                        except (ValueError,OSError) as exc:
+                            return BaselineVerifyResult(False,"unknown",str(exc),workspace=str(command_project))
+                    shell_argv = inline_node["argv"] if inline_node else project_check_command_argv(command)
                     try:
                         check_result = _run(
                             shell_argv,
@@ -4849,23 +4874,34 @@ def verify_assignment(
                             dependency_roots=(snapshot.dependency_roots
                                 if lower_check_clean and guarded_clone_is_active(command_root) else ()))
 
+                    if inline_node:
+                        from verification_stage_checkpoint import file_digest
+                        try:inline_node_tool_unchanged = file_digest(inline_node["argv"][0])==inline_node["nodeExecutableSha256"]
+                        except OSError:inline_node_tool_unchanged = False
+                        inline_execution_unproven = inline_execution_unproven or not inline_node_tool_unchanged
+                        project_publication_allowed = project_publication_allowed and inline_node_tool_unchanged
                     if check_result is not None:
                         _observe_invocation_command(
                             command_index, command, check_result,
-                            guarded=bool(command_pass_verified and lower_check_clean
+                            guarded=bool(command_pass_verified and lower_check_clean and inline_node_tool_unchanged
                                 and workspace_guard_started and workspace_changes is not None
                                 and not workspace_changes.errors
                                 and (not workspace_changes.changes or source_reset_for_reuse)),
                             identities={**(proof_identity.event_fields() if proof_identity is not None else {}),
                                 "targetOnlyAssignmentFingerprint": assignment_hash,
-                                "resolvedLockfileHash": resolved_state.lockfile_hash if resolved_state is not None else ""},
+                                "resolvedLockfileHash": resolved_state.lockfile_hash if resolved_state is not None else "",
+                                "preparedSourceContentKey": snapshot.source_closure_content_key if materialized_source_origin else "",
+                                "sourceOriginObservationDigest": source_origin_observation_digest,
+                                "inlineNodeBodySha256": inline_node["bodySha256"] if inline_node else "",
+                                "inlineNodeExecutionMode": inline_node["executionMode"] if inline_node and inline_node_tool_unchanged else "",
+                                "nodeExecutableSha256": inline_node["nodeExecutableSha256"] if inline_node else ""},
                         )
                     if command_checkpoints and check_result is not None:
                         # Command guards above retain their authority. A receipt
                         # also requires guaranteed process-tree quiescence.
                         receipt = command_checkpoints.complete(
                             command_index, command, check_result,
-                            safe=command_pass_verified and lower_check_clean
+                            safe=command_pass_verified and lower_check_clean and inline_node_tool_unchanged
                                 and _durable_proof_publication_allowed(check_result))
                         if receipt:
                             command_checkpoint_refs.append(receipt)
@@ -4958,6 +4994,8 @@ def verify_assignment(
                     reason="process-tree-supervision-not-guaranteed",
                 )
 
+        if inline_execution_unproven:
+            return BaselineVerifyResult(False,"unknown","INLINE_NODE_TOOLCHAIN_DRIFT")
         _emit_progress(progress, f"{progress_label}: completed; elapsed={int(time.monotonic() - attempt_started)}s")
         return BaselineVerifyResult(
             True, "passed", f"resolver preflight passed for {len(changed)} changed direct package(s)",
@@ -4972,6 +5010,7 @@ def verify_assignment(
             command_checkpoint_refs=tuple(command_checkpoint_refs) if run_project_checks and config.commands else (),
             verified_source_snapshot_key=source_snapshot.key,
             verified_assignment_fingerprint=assignment_hash,
+            materialized_source_origin=materialized_source_origin,
         )
     finally:
         # Early return may retain a trial provisionally. Release every owned
@@ -5502,7 +5541,8 @@ def verify_assignment(
 
     # Arbitrary shell commands may invoke undeclared external runtimes. Their
     # PASS is not durable-reusable until a declared tool closure exists.
-    project_cache_reusable = wants_project_proof and project_proof_cache_reusable(config.commands)
+    project_cache_reusable = (wants_project_proof and not config.observe_materialized_source_origin
+                              and project_proof_cache_reusable(config.commands))
     if project_cache_reusable and resolver_hit:
         cache_event("proof.cache.lookup", "project", identity.project_proof_key)
         project_record = proof_store.lookup_pass("project", identity.project_proof_key)

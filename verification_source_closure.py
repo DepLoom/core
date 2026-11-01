@@ -263,3 +263,73 @@ def reset_observed_trial_outputs(root, expected, changes, *, progress=None, prep
         if progress:
             progress(f"private trial delta reuse rejected: {type(exc).__name__}: {exc}")
         return False
+
+
+class MaterializedSourceOriginError(RuntimeError):
+    """Unproven origin is not dependency incompatibility or a learned nogood."""
+
+
+def compare_materialized_source_origin(candidate, prepared, resolved_state):
+    """Join existing input/prepared seals without dropping source information.
+
+    This metadata observation is consumed together with actual Core command-clone
+    validation and guards. It is never a reusable goal proof or user permission.
+    Unknown reparse representations are rejected rather than normalized away.
+    """
+    import hashlib
+    import json
+    from collections.abc import Mapping
+    from source_snapshot import validate_source_snapshot, sealed_source_manifest_entries, SourceInputPolicy
+    from resolved_dependency_state import assert_resolved_dependency_state
+    from artifact_integrity import source_entry_integrity_key
+    from substrate_identity import tool_build_id
+    validate_source_snapshot(candidate)
+    require_complete_source_policy(candidate.input_policy or SourceInputPolicy())
+    if (resolved_state is None or not resolved_state.key or not resolved_state.lockfile_hash
+            or Path(candidate.project_relative).as_posix()!=Path(prepared.project_relative).as_posix()):
+        raise MaterializedSourceOriginError("SOURCE_ORIGIN_UNPROVEN: missing resolved state or different root layout")
+    assert_resolved_dependency_state(prepared.workspace_root/prepared.project_relative,resolved_state)
+
+    def normalized(entries):
+        result={};aliases=set()
+        for entry in entries:
+            if not isinstance(entry,Mapping):raise MaterializedSourceOriginError("SOURCE_ORIGIN_UNPROVEN: malformed entry")
+            row=dict(entry);name=row.get("path");kind=row.get("kind")
+            if (not isinstance(name,str) or not name or "\\" in name or ":" in name or name.startswith("/")
+                    or any(p in {"",".",".."} for p in name.split("/"))
+                    or name in result or name.casefold() in aliases):
+                raise MaterializedSourceOriginError("SOURCE_ORIGIN_UNPROVEN: ambiguous source path")
+            aliases.add(name.casefold())
+            if kind=="directory":
+                valid=set(row)=={"path","kind"}
+            elif kind=="file":
+                digest=row.get("sha256")
+                valid=(set(row)=={"path","kind","size","sha256","executable"}
+                    and type(row["size"]) is int and row["size"]>=0 and type(row["executable"]) is bool
+                    and isinstance(digest,str) and len(digest)==64 and all(c in "0123456789abcdef" for c in digest))
+            else:valid=False
+            if not valid:raise MaterializedSourceOriginError("SOURCE_ORIGIN_UNPROVEN: unsupported source entry representation")
+            result[name]=row
+        if not result:raise MaterializedSourceOriginError("SOURCE_ORIGIN_UNPROVEN: empty source seal")
+        return [result[name] for name in sorted(result)]
+
+    expected=normalized(sealed_source_manifest_entries(candidate))
+    observed=normalized(prepared.source_closure_entries)
+    build=tool_build_id()
+    prepared_key=source_entry_integrity_key(observed,build)
+    if not prepared.source_closure_content_key or prepared_key!=prepared.source_closure_content_key:
+        raise MaterializedSourceOriginError("SOURCE_ORIGIN_UNPROVEN: prepared source seal identity mismatch")
+    if expected!=observed:
+        a={e["path"]:e for e in expected};b={e["path"]:e for e in observed}
+        changed=[name for name in sorted(set(a)|set(b)) if a.get(name)!=b.get(name)]
+        raise MaterializedSourceOriginError("SOURCE_ORIGIN_MISMATCH: "+json.dumps({"changedPathCount":len(changed),"changedPaths":changed[:20]},sort_keys=True))
+    # Actual approved manifest/lock bytes participate in this full source map.
+    # The resolved-state guard additionally binds the physical prepared lock.
+    validate_source_snapshot(candidate)
+    source_key=source_entry_integrity_key(expected,build)
+    return {"schemaVersion":1,"authority":"NON_REUSABLE_CORE_OBSERVATION","status":"SOURCE_ORIGIN_OBSERVED",
+        "inputSourceSnapshotKey":candidate.key,"inputManifestKey":candidate.manifest_key,"sourcePolicyKey":candidate.policy_key,
+        "projectRelative":Path(candidate.project_relative).as_posix(),"normalizedInputSourceKey":source_key,
+        "normalizedPreparedSourceKey":prepared_key,"preparedSourceContentKey":prepared_key,"sourceEntryCount":len(expected),
+        "resolvedStateKey":resolved_state.key,"resolvedLockfilePath":resolved_state.lockfile_path,
+        "resolvedLockfileHash":resolved_state.lockfile_hash,"toolBuildId":build,"fullAcceptance":False}
