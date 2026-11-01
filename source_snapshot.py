@@ -1452,9 +1452,16 @@ def verification_source_snapshot_scope(
     emit_observability_event("source.request.reuse", reused=reused,
                             snapshotKey=snapshot.key, authority="SOURCE_TRUTH_GUARD")
     completed = False
+    strict_owned_watchers = ()
     try:
         with bind_source_snapshot(snapshot, retain_watchers=reuse_completed):
-            yield snapshot
+            try:
+                yield snapshot
+            finally:
+                # bind_source_snapshot retires sealed watchers on exit. Keep
+                # their owned references before it removes the registry entries.
+                if strict_cleanup:
+                    strict_owned_watchers = _owned_source_snapshot_watchers(snapshot)
         completed = True
     finally:
         # This cache contains candidates, not verification authority. The next
@@ -1474,13 +1481,26 @@ def verification_source_snapshot_scope(
             for candidate in retired:
                 _retire_completed_request(candidate)
         else:
+            owned_watchers = strict_owned_watchers + _owned_source_snapshot_watchers(snapshot) if strict_cleanup else ()
             _retire_completed_request(snapshot)
-            if strict_cleanup and snapshot.container.exists():
+            retirement_failed = any(getattr(watcher, "errors", ()) or
+                (getattr(watcher, "_thread", None) is not None and watcher._thread.is_alive())
+                for watcher in owned_watchers)
+            if strict_cleanup and (snapshot.container.exists() or retirement_failed):
                 primary = sys.exc_info()[1]
                 if primary is not None:
                     primary.add_note("SOURCE_SNAPSHOT_CLEANUP_INCOMPLETE")
                 else:
                     raise SourceCaptureError("SOURCE_SNAPSHOT_CLEANUP_INCOMPLETE")
+
+
+def _owned_source_snapshot_watchers(snapshot):
+    with _LOCK:
+        watchers = [entry[1] for entry in _ACTIVE_WATCHERS.values() if entry[0] is snapshot]
+        live = _LIVE_SOURCE_WATCHERS.get(_active_key(snapshot.original_project_path))
+        if live is not None and live[0] is snapshot:
+            watchers.append(live[1])
+        return tuple(watchers)
 
 
 def _retire_completed_request(snapshot):

@@ -49,6 +49,17 @@ class StrictSnapshotCleanupTests(unittest.TestCase):
         with core.verification_source_snapshot_scope(self.project,timeout_seconds=10):
             with self.assertRaisesRegex(core.SourceCaptureError,'STRICT_SCOPE_OWNERSHIP_REQUIRED'):
                 with core.verification_source_snapshot_scope(self.project,timeout_seconds=10,strict_cleanup=True):pass
+    def test_watcher_retirement_error_rejects_even_when_container_removed(self):
+        from types import SimpleNamespace
+        snapshot=None
+        with self.assertRaisesRegex(core.SourceCaptureError,'SOURCE_SNAPSHOT_CLEANUP_INCOMPLETE'):
+            with core.verification_source_snapshot_scope(self.project,timeout_seconds=10,strict_cleanup=True) as snapshot:
+                # Negative resource-control double alongside actual Core capture.
+                with core._LOCK:
+                    core._ACTIVE_WATCHERS['engineering-retirement-fault-'+snapshot.key]=(snapshot,
+                        SimpleNamespace(stop=lambda:None,errors=['engineering watcher stop failed'],_thread=None))
+        self.assertFalse(snapshot.container.exists())
+
     def test_strict_scope_refuses_completed_request_reuse(self):
         with self.assertRaisesRegex(core.SourceCaptureError,'STRICT_SCOPE_OWNERSHIP_REQUIRED'):
             with core.verification_source_snapshot_scope(self.project,timeout_seconds=10,strict_cleanup=True,reuse_completed=True):pass
