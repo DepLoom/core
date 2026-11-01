@@ -69,6 +69,25 @@ class CurrentWorkspaceVerificationTests(unittest.TestCase):
         with self.assertRaisesRegex(MaterializedWorkspaceVerificationError,'COMMAND_FAILED'):
             self.invoke('process.exit(7);')
 
+    def test_failed_command_private_tail_is_bounded_and_not_public(self):
+        import traceback
+        with self.assertRaises(MaterializedWorkspaceVerificationError) as caught:
+            self.invoke("process.stdout.write('x'.repeat(16000)+'PRIVATE_LAST_COMMAND');process.exit(7);")
+        error=caught.exception;private=error._private_failed_command_diagnostic
+        self.assertEqual(private['commandIndex'],1);self.assertEqual(private['returnCode'],7)
+        self.assertEqual(len(private['stdoutTail'].encode()),8192)
+        self.assertTrue(private['stdoutTail'].endswith('PRIVATE_LAST_COMMAND'))
+        self.assertNotIn('PRIVATE_LAST_COMMAND',str(error));self.assertNotIn('PRIVATE_LAST_COMMAND',repr(error))
+        self.assertNotIn('PRIVATE_LAST_COMMAND',json.dumps(error.operation_observations))
+        self.assertNotIn('PRIVATE_LAST_COMMAND',''.join(traceback.format_exception_only(type(error),error)))
+        self.assertEqual(error.operation_observations[-1]['returnCode'],7)
+
+    def test_failure_diagnostic_preserves_source_guard_precedence(self):
+        with self.assertRaisesRegex(MaterializedWorkspaceVerificationError,'INPUT_CHANGED') as caught:
+            self.invoke("console.log('PRIVATE_FAILURE');require('fs').writeFileSync('marker.txt','changed');process.exit(9);")
+        self.assertEqual(caught.exception._private_failed_command_diagnostic['returnCode'],9)
+        self.assertEqual(caught.exception._private_failed_command_diagnostic['commandIndex'],1)
+
     def test_actual_source_write_is_not_accepted_as_a_check(self):
         with self.assertRaisesRegex(MaterializedWorkspaceVerificationError,'INPUT_CHANGED'):
             self.invoke("require('node:fs').writeFileSync('marker.txt','changed');")

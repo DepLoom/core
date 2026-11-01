@@ -53,10 +53,11 @@ def verify_current_workspace(project_dir, *, expected_source_key, dependency_pla
     from baseline_constraint_verifier import (project_check_command_argv,
         observed_resolved_assignment, observed_resolved_hash)
     operation_started=time.monotonic()
-    operations=[]
+    operations=[];failed_command_diagnostic=None
     def fail(code):
         error=MaterializedWorkspaceVerificationError(code)
         error.operation_observations=tuple(operations)
+        if failed_command_diagnostic is not None:error._private_failed_command_diagnostic=failed_command_diagnostic
         raise error
     def remaining():
         value=deadline-time.time()
@@ -105,6 +106,8 @@ def verify_current_workspace(project_dir, *, expected_source_key, dependency_pla
     lock=(project/'package-lock.json').read_bytes()
     if _sha(lock)!=dependency_plan['approvedLockSha256']:fail('CURRENT_WORKSPACE_APPROVED_LOCK_MISMATCH')
     def run(argv,label,command_index=None):
+        nonlocal failed_command_diagnostic
+        failed_command_diagnostic=None
         started=time.monotonic()
         launch_options={}
         if environment_contract=='HOST_OWNED_PROJECT_EXECUTION_ENV_V1':
@@ -116,6 +119,9 @@ def verify_current_workspace(project_dir, *, expected_source_key, dependency_pla
                     'profileDigest':final_profile_digest,'argvDigest':_digest(argv)})
         x=run_supervised(argv,project,timeout_seconds=remaining(),base_env=env,
             progress_label=label,max_output_bytes=65536,**launch_options)
+        if command_index is not None and x.returncode!=0:
+            failed_command_diagnostic={'commandIndex':command_index,'returnCode':x.returncode,
+                'invocationId':invocation_id,'stdoutTail':(x.stdout or '').encode('utf-8')[-8192:].decode('utf-8',errors='ignore')}
         s=getattr(x,'supervision',None)
         operations.append({'operation':'strict-frozen-install' if command_index is None else 'project-command',
             'commandIndex':command_index,'argvDigest':_digest(argv),'elapsedStartMs':int((started-operation_started)*1000),
