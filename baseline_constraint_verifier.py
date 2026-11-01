@@ -185,6 +185,8 @@ class BaselineVerifyConfig:
     unbounded_preparation: bool = False
     project_checks: str = "adaptive"  # off | diagnostic | adaptive | strict
     commands: Tuple[str, ...] = ()
+    # Explicit verification policy; default retains legacy lifecycle execution.
+    lifecycle_scripts: bool = True
     registry: str = ""
     telemetry_path: str = ""
     proof_cache_dir: str = ""
@@ -265,6 +267,7 @@ class BaselineVerifyConfig:
                 ),
             ),
             project_checks=mode,
+            lifecycle_scripts=_as_bool(raw.get("lifecycleScripts"), True),
             commands=commands,
             recovery_checkpoints=_as_bool(raw.get("recoveryCheckpoints"), True),
             resolver_overrides=resolver_overrides,
@@ -1039,6 +1042,13 @@ _SAME_RUN_PRIVATE_PREPARED_ACTIVE_ATTEMPTS: Dict[Tuple[str, str], str] = {}
 _SAME_RUN_PRIVATE_PREPARED_MAX_COUNT = 2
 
 
+def _verification_environment(config, runtime_env=None):
+    environment = project_verification_environment(runtime_env)
+    # Bind the actual lifecycle policy even when ambient env claims otherwise.
+    environment["DEPLOOM_VERIFIER_LIFECYCLE_SCRIPTS"] = "allow" if config.lifecycle_scripts else "deny"
+    return environment
+
+
 def _preparation_coordination_key(
     project_dir: Path,
     assignment: Mapping[str, str],
@@ -1051,6 +1061,7 @@ def _preparation_coordination_key(
         tuple(sorted(str(item) for item in remove_packages)),
         tuple(sorted(normalized_resolver_overrides(config.resolver_overrides).items())),
         str(config.registry or "").rstrip("/"),
+        config.lifecycle_scripts,
         tuple(sorted(semantic_verification_environment(os.environ).items())),
     )
 
@@ -2831,13 +2842,13 @@ def verify_assignment(
     attempt_started = time.monotonic()
     attempt_deadline = (float("inf") if config.unbounded_preparation
                         else attempt_started + config.attempt_timeout_seconds)
-    base_env = project_verification_environment()
+    base_env = _verification_environment(config)
     if runtime_env:
         # An EXPLICIT project/CI Node runtime beats ambient PATH exactly where
         # the runtime is the subject: proof/tool identity and subprocess PATH
         # must reflect the requested Node, matching what CI would run. The host
         # ambient runtime remains untouched.
-        base_env = project_verification_environment(runtime_env)
+        base_env = _verification_environment(config, runtime_env)
     remove_packages = tuple(sorted({str(item) for item in remove_packages}))
     telemetry_path = Path(config.telemetry_path).resolve() if config.telemetry_path else None
     assignment_hash = assignment_fingerprint(assignment)
@@ -3942,15 +3953,15 @@ def verify_assignment(
 
                 full_install = install_args_for_profile(
                     workspace_topology.profile,
-                    ignore_scripts=False,
+                    ignore_scripts=not config.lifecycle_scripts,
                     frozen=True,
                 )
                 full_argv, _ = _command_prefix(executable, full_install)
                 lifecycle_env = {
                     "CI": "1",
                     "YARN_ENABLE_IMMUTABLE_INSTALLS": "true",
-                    "YARN_ENABLE_SCRIPTS": "true",
-                    "npm_config_ignore_scripts": "false",
+                    "YARN_ENABLE_SCRIPTS": "true" if config.lifecycle_scripts else "false",
+                    "npm_config_ignore_scripts": "false" if config.lifecycle_scripts else "true",
                 }
                 lifecycle_env.update(_package_manager_cache_environment(config, manager))
                 if workspace_topology.profile.family == "yarn-berry" and config.registry:
@@ -5404,13 +5415,13 @@ def verify_assignment(
             progress_label=progress_label,
         )
 
-    environment = project_verification_environment()
+    environment = _verification_environment(config)
     if runtime_env:
         # The EXPLICIT project/CI Node runtime participates in proof identity:
         # a proof cached under the ambient host Node must never be reused for a
         # different requested runtime, and tool identity in the proof must name
         # the runtime CI actually uses.
-        environment = project_verification_environment(runtime_env)
+        environment = _verification_environment(config, runtime_env)
     try:
         identity = build_verification_proof_identity(
             project_dir,
