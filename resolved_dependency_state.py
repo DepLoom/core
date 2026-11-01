@@ -372,8 +372,12 @@ def compile_npm_dependency_obligations(baseline_lock_bytes, candidate_lock_bytes
             or lock['lockfileVersion']==3 and 'dependencies' in lock for lock in (before, after))
             or before['lockfileVersion']!=after['lockfileVersion']):
         raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_LOCK_UNSUPPORTED')
+    omission_proof={}
     if optional_absence_rules:
-        raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_OMISSION_RULE_UNSUPPORTED')
+        from npm_platform_obligations import verify_platform_absence,NpmPlatformEvidenceError
+        try:omission_proof=verify_platform_absence(after,optional_absence_rules)
+        except (NpmPlatformEvidenceError,OSError) as exc:
+            raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_PLATFORM_UNPROVEN: '+str(exc)) from exc
     if any(not isinstance(value, str) or re.fullmatch('[0-9a-f]{64}', value) is None
             for value in (delta_digest, scope_digest)):
         raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_AUTHORIZATION_UNPROVEN')
@@ -423,7 +427,8 @@ def compile_npm_dependency_obligations(baseline_lock_bytes, candidate_lock_bytes
         'approvedLockSha256': _sha256_bytes(candidate_lock_bytes),
         'approvedDeltaDigest': delta_digest, 'allowedChangeScopeDigest': scope_digest,
         'rootDeclarations': root_after, 'instances': instances, 'changedInstanceCount': len(changed),
-        'optionalAbsenceRules': []}
+        'optionalAbsenceRules': optional_absence_rules if omission_proof else []}
+    if omission_proof:plan['platformAbsenceProof']=omission_proof
     return {**plan, 'obligationPlanDigest': _canonical_hash(plan)}
 
 
@@ -436,6 +441,7 @@ def observe_npm_dependency_obligations(project_dir, plan, *, source_origin_diges
     """
     import re
     from semantic_version import NpmSpec, Version
+    from project_runtime import normalize_npm_range
     import time
     def budget():
         if deadline is not None and time.monotonic() >= deadline:
@@ -461,6 +467,16 @@ def observe_npm_dependency_obligations(project_dir, plan, *, source_origin_diges
     if {key: manifest.get(key, {}) for key in plan['rootDeclarations']} != plan['rootDeclarations']:
         raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_MANIFEST_DRIFT')
     expected = {row['path']: row for row in plan['instances']}
+    omission_proof={}
+    if plan.get('optionalAbsenceRules'):
+        from npm_platform_obligations import verify_platform_absence,NpmPlatformEvidenceError
+        try:omission_proof=verify_platform_absence(locked,plan['optionalAbsenceRules'])
+        except (NpmPlatformEvidenceError,OSError) as exc:
+            raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_PLATFORM_UNPROVEN: '+str(exc)) from exc
+        if omission_proof!=plan.get('platformAbsenceProof'):
+            raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_PLATFORM_PROOF_DRIFT')
+    elif plan.get('platformAbsenceProof'):
+        raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_PLATFORM_PROOF_UNBOUND')
     actual = {}; folded = set(); manifest_bytes_read = 0
     def no_link(path):
         if path.is_symlink() or (hasattr(path, 'is_junction') and path.is_junction()):
@@ -503,7 +519,7 @@ def observe_npm_dependency_obligations(project_dir, plan, *, source_origin_diges
                 actual[relative] = (value, _sha256_bytes(raw))
                 scan_modules(package / 'node_modules', relative, depth+1)
     scan_modules(project / 'node_modules')
-    if set(actual) != set(expected):
+    if set(actual) != set(expected)-set(omission_proof):
         raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_INSTANCE_SET_MISMATCH: '
             + json.dumps({'missing': sorted(set(expected)-set(actual))[:20], 'extra': sorted(set(actual)-set(expected))[:20]}))
     rows = []; edges = []
@@ -519,11 +535,23 @@ def observe_npm_dependency_obligations(project_dir, plan, *, source_origin_diges
             if not base:
                 return None
             base = parent_instance(base)
-    def edge(source, name, spec, peer=False):
+    def edge(source, name, spec, peer=False, optional=False, optional_peer=False):
         if not isinstance(spec, str):
             raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_EDGE_UNPROVEN')
         destination = resolve(source, name, peer)
         if destination is None:
+            if optional and omission_proof:
+                matches=[path for path,proof in omission_proof.items() if any(
+                    r['owner']==source and r['name']==name and r['specifier']==spec for r in proof['incoming'])]
+                if len(matches)==1:
+                    edges.append({'source':source,'name':name,'destination':matches[0],'peer':peer,'specifier':spec,
+                        'outcome':'VERIFIED_PLATFORM_INAPPLICABLE'});return
+            if optional_peer and plan.get('optionalAbsenceRules'):
+                try:NpmSpec(normalize_npm_range(spec))
+                except (ValueError,TypeError) as exc:
+                    raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_OPTIONAL_PEER_RANGE_UNPROVEN') from exc
+                edges.append({'source':source,'name':name,'destination':None,'peer':True,'specifier':spec,
+                    'outcome':'DECLARED_OPTIONAL_PEER_ABSENT'});return
             raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_EDGE_MISSING')
         wanted_name = None
         if spec.startswith('npm:'):
@@ -532,7 +560,7 @@ def observe_npm_dependency_obligations(project_dir, plan, *, source_origin_diges
                 raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_ALIAS_UNPROVEN')
             wanted_name, spec = match.groups()
         try:
-            matched = NpmSpec(spec).match(Version(actual[destination][0]['version']))
+            matched = NpmSpec(normalize_npm_range(spec)).match(Version(actual[destination][0]['version']))
         except (ValueError, KeyError) as exc:
             raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_EDGE_UNPROVEN') from exc
         expected_name = wanted_name if wanted_name is not None else name
@@ -542,6 +570,7 @@ def observe_npm_dependency_obligations(project_dir, plan, *, source_origin_diges
             raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_EDGE_MISMATCH')
         edges.append({'source': source, 'name': name, 'destination': destination, 'peer': peer, 'specifier': spec})
     for location, wanted in expected.items():
+        if location in omission_proof:continue
         value, digest = actual[location]
         if value.get('name') != wanted['name'] or value.get('version') != wanted['version']:
             raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_IDENTITY_MISMATCH: '+location)
@@ -554,7 +583,9 @@ def observe_npm_dependency_obligations(project_dir, plan, *, source_origin_diges
                     continue  # npm optionalDependencies override ordinary declarations.
                 # Optional absence is intentionally not inferred from a missing
                 # file or a successful npm exit. It remains a visible UNKNOWN.
-                edge(location, name, spec, key == 'peerDependencies')
+                peer_optional=(key=='peerDependencies' and isinstance(wanted['metadata']['peerDependenciesMeta'].get(name),dict)
+                    and wanted['metadata']['peerDependenciesMeta'][name].get('optional') is True)
+                edge(location,name,spec,key=='peerDependencies',optional=key=='optionalDependencies',optional_peer=peer_optional)
         rows.append({'path': location, 'name': wanted['name'], 'version': wanted['version'],
             'packageManifestSha256': digest, 'lockRecordDigest': wanted['lockRecordDigest'], 'held': wanted['held']})
     for key, declarations in plan['rootDeclarations'].items():
@@ -563,14 +594,19 @@ def observe_npm_dependency_obligations(project_dir, plan, *, source_origin_diges
         for name, spec in declarations.items():
             if key == 'dependencies' and name in plan['rootDeclarations']['optionalDependencies']:
                 continue
-            edge('', name, spec)
+            edge('',name,spec,optional=key=='optionalDependencies')
     budget()
+    platform_counts=({'observedInstanceCount':len(rows),'platformInapplicableInstanceCount':len(omission_proof),
+        'platformInapplicableInstances':[omission_proof[k] for k in sorted(omission_proof)]} if omission_proof else {})
     return {'schemaVersion': 1, 'authority': 'NON_REUSABLE_CORE_OBSERVATION',
         'status': 'MATERIALIZED_NPM_INSTANCE_OBLIGATIONS_OBSERVED',
         'sourceOriginObservationDigest': source_origin_digest, 'resolvedStateKey': resolved_state_key,
         'approvedLockSha256': plan['approvedLockSha256'], 'obligationPlanDigest': plan['obligationPlanDigest'],
-        'materializedTreeObservationDigest': _canonical_hash({'instances': rows, 'edges': edges}),
-        'instanceCount': len(rows), 'heldInstanceCount': sum(row['held'] for row in rows),
+        'materializedTreeObservationDigest': _canonical_hash({'instances': rows, 'edges': edges,
+            **({'platformInapplicable':omission_proof} if omission_proof else {})}),
+        'instanceCount': len(rows)+len(omission_proof),
+        'heldInstanceCount': sum(row['held'] for row in rows)+sum(expected[path]['held'] for path in omission_proof),
+        **platform_counts,
         'protectedEdgeCount': len(edges), 'changedInstanceCount': plan['changedInstanceCount'],
         'unknownCount': 0, 'violations': [], 'payloadAuthenticity': 'NOT_ATTESTED',
         'scope': 'PHYSICAL_INSTANCE_MANIFESTS_AND_SUPPORTED_NODE_EDGES_AT_BOUNDARIES', 'fullAcceptance': False}

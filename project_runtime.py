@@ -344,6 +344,13 @@ def runtime_env_for_path(
     return source
 
 
+def normalize_npm_range(range_spec: str) -> str:
+    """Preserve npm comparator semantics while joining operator whitespace."""
+    if not isinstance(range_spec,str):
+        raise ValueError('npm range must be text')
+    return re.sub(r"([<>]=?|[~^=])\s+(?=[vV]?\d)",r"\1",range_spec.strip())
+
+
 def node_range_satisfied(range_spec: str, exact_version: str) -> bool:
     """npm-semver match of an engines.node range against an exact version.
 
@@ -359,7 +366,7 @@ def node_range_satisfied(range_spec: str, exact_version: str) -> bool:
     try:
         # npm permits whitespace between an operator and its version (">= 18").
         # semantic_version requires the comparator to be one token.
-        normalized = re.sub(r"([<>]=?|[~^=])\s+(?=[vV]?\d)", r"\1", str(range_spec).strip())
+        normalized = normalize_npm_range(range_spec)
         return bool(NpmSpec(normalized).match(parsed))
     except ValueError:
         return False
