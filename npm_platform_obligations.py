@@ -25,7 +25,7 @@ def _object(raw):
 def validate_rules_shape(rules):
  if (not isinstance(rules,dict) or set(rules)!={'schemaVersion','kind','host','artifacts'}
    or type(rules['schemaVersion']) is not int or rules['schemaVersion']!=1
-   or rules['kind']!='NPM_V3_SRI_PLATFORM_ABSENCE_V1'):_fail('RULE_SCHEMA')
+   or rules['kind'] not in {'NPM_V3_SRI_PLATFORM_ABSENCE_V1','NPM_V2_SRI_PLATFORM_ABSENCE_V1'}):_fail('RULE_SCHEMA')
  host=rules['host']
  if (not isinstance(host,dict) or set(host)!={'platform','arch','nodeSha256'}
    or host['platform']!='win32' or host['arch'] not in ('x64','ia32','arm64')
@@ -98,9 +98,24 @@ def _archive(path,row,canonical):
   if key in row and row[key]!=manifest.get(key):_fail('ARTIFACT_PLATFORM_MISMATCH')
  return manifest,{'archiveSha256':_sha(raw),'packageManifestDigest':_digest(manifest),'integrity':sri},len(raw)
 
+def _v2_view_record(lock,location,record):
+ """Platform evidence must agree with npm-v2's compatible tree view."""
+ parts=location.split('/node_modules/');parts[0]=parts[0].removeprefix('node_modules/')
+ tree=lock.get('dependencies');other=None
+ for name in parts:
+  if re.fullmatch(r'(?:@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*',name) is None:_fail('V2_INSTANCE_PATH')
+  if not isinstance(tree,dict) or not isinstance(tree.get(name),dict):_fail('V2_VIEW_MISSING')
+  other=tree[name];tree=other.get('dependencies',{})
+ for key in ('version','resolved','integrity','optional','dev','devOptional'):
+  if other.get(key)!=record.get(key):_fail('V2_VIEW_MISMATCH')
+ if record.get('inBundle') or other.get('bundled') or record.get('link') or other.get('link'):_fail('V2_CONDITIONAL_OWNER_UNSUPPORTED')
+ if {**record.get('dependencies',{}),**record.get('optionalDependencies',{})}!=other.get('requires',{}):_fail('V2_VIEW_REQUIREMENTS_MISMATCH')
+
 def verify_platform_absence(lock,rules):
  validate_rules_shape(rules)
- if type(lock.get('lockfileVersion')) is not int or lock['lockfileVersion']!=3 or 'dependencies' in lock:_fail('LOCK_UNSUPPORTED')
+ version=lock.get('lockfileVersion')
+ if (type(version) is not int or version not in (2,3) or rules['kind']!='NPM_V'+str(version)+'_SRI_PLATFORM_ABSENCE_V1'
+   or version==3 and 'dependencies' in lock or version==2 and not isinstance(lock.get('dependencies'),dict)):_fail('LOCK_UNSUPPORTED')
  host=observe_node_host()
  if host!=rules['host']:_fail('HOST_CHANGED')
  graph=lock.get('packages');proof={};total=0
@@ -116,6 +131,7 @@ def verify_platform_absence(lock,rules):
   if not isinstance(resolved,str):_fail('RESOLVED_UNPROVEN')
   url=urlsplit(resolved)
   if url.scheme!='https' or not url.hostname or url.username or url.password or url.query or url.fragment:_fail('RESOLVED_UNPROVEN')
+  if version==2:_v2_view_record(lock,location,row)
   manifest,artifact,size=_archive(evidence['archivePath'],row,canonical);total+=size
   if total>134217728:_fail('TOTAL_ARCHIVE_LIMIT')
   os_ok=_selectors(manifest.get('os'),host['platform']);cpu_ok=_selectors(manifest.get('cpu'),host['arch'])
@@ -141,6 +157,7 @@ def verify_platform_absence(lock,rules):
      try:valid=NpmSpec(normalize_npm_range(requirement)).match(Version(row['version']))
      except (ValueError,KeyError,TypeError) as exc:raise NpmPlatformEvidenceError('NPM_PLATFORM_EDGE_RANGE_UNPROVEN') from exc
      if not valid:_fail('EDGE_RANGE_MISMATCH')
+     if version==2 and owner:_v2_view_record(lock,owner,parent)
      incoming.append({'owner':owner,'section':section,'name':name,'specifier':spec,'target':location})
   if not incoming:_fail('ORPHAN_OMISSION')
   proof[location]={'path':location,'installName':install_name,'canonicalName':canonical,'version':row['version'],

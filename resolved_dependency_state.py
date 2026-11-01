@@ -329,12 +329,12 @@ def _obligation_json(raw, limit=8*1024*1024):
         raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_JSON_UNPROVEN') from exc
 
 
-def _ordinary_npm_obligation_mode(record):
+def _ordinary_npm_obligation_mode(record, *, bundle_verified=False):
     for key in ('link', 'inBundle'):
-        if key in record and (type(record[key]) is not bool or record[key]):
+        if key in record and (type(record[key]) is not bool or record[key] and not (key=='inBundle' and bundle_verified)):
             raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_BUNDLE_OR_LINK_UNSUPPORTED')
     for key in ('bundleDependencies', 'bundledDependencies'):
-        if key in record and not (record[key] is False or type(record[key]) is list and not record[key]):
+        if key in record and not (record[key] is False or type(record[key]) is list and (not record[key] or bundle_verified)):
             raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_BUNDLED_UNSUPPORTED')
 
 
@@ -359,7 +359,7 @@ def _npm_obligation_name(location, record):
 
 def compile_npm_dependency_obligations(baseline_lock_bytes, candidate_lock_bytes, *,
         exact_targets, changed_instances, immutable_packages=(), excluded_packages=(),
-        delta_digest, scope_digest, optional_absence_rules=()):
+        delta_digest, scope_digest, optional_absence_rules=(), bundled_owner_rules=None):
     """Compile expected npm-v2/v3 obligations BEFORE observing installed output.
 
     Exact host delta/scope authorization remains with its existing owner. This
@@ -381,6 +381,13 @@ def compile_npm_dependency_obligations(baseline_lock_bytes, candidate_lock_bytes
     if any(not isinstance(value, str) or re.fullmatch('[0-9a-f]{64}', value) is None
             for value in (delta_digest, scope_digest)):
         raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_AUTHORIZATION_UNPROVEN')
+    bundle_proofs={};bundle_paths=set()
+    if bundled_owner_rules is not None:
+        from npm_bundle_obligations import compile_bundle_rules,NpmBundleEvidenceError
+        try:bundle_proofs=compile_bundle_rules(before,after,bundled_owner_rules,baseline_lock_bytes)
+        except (NpmBundleEvidenceError,OSError) as exc:
+            raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_BUNDLE_UNPROVEN: '+str(exc)) from exc
+        for owner,proof in bundle_proofs.items():bundle_paths.update([owner,*proof['memberRecordDigests']])
     graphs = []
     for lock in (before, after):
         graph = lock.get('packages')
@@ -389,7 +396,7 @@ def compile_npm_dependency_obligations(baseline_lock_bytes, candidate_lock_bytes
                 or len({name.casefold() for name in graph}) != len(graph)):
             raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_GRAPH_UNPROVEN')
         for location, row in graph.items():
-            _ordinary_npm_obligation_mode(row)
+            _ordinary_npm_obligation_mode(row,bundle_verified=location in bundle_paths)
             if location:
                 _npm_obligation_name(location, row)
         graphs.append(graph)
@@ -429,6 +436,7 @@ def compile_npm_dependency_obligations(baseline_lock_bytes, candidate_lock_bytes
         'rootDeclarations': root_after, 'instances': instances, 'changedInstanceCount': len(changed),
         'optionalAbsenceRules': optional_absence_rules if omission_proof else []}
     if omission_proof:plan['platformAbsenceProof']=omission_proof
+    if bundle_proofs:plan.update(bundledOwnerRules=bundled_owner_rules,unchangedBundledOwners=bundle_proofs)
     return {**plan, 'obligationPlanDigest': _canonical_hash(plan)}
 
 
@@ -507,6 +515,22 @@ def observe_npm_dependency_obligations(project_dir, plan, *, source_origin_diges
             raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_PLATFORM_PROOF_DRIFT')
     elif plan.get('platformAbsenceProof'):
         raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_PLATFORM_PROOF_UNBOUND')
+    bundle_proofs={};bundle_paths=set()
+    if plan.get('bundledOwnerRules') is not None:
+        from npm_bundle_obligations import compile_bundle_rules,NpmBundleEvidenceError,compare_installed_owner
+        rules=plan['bundledOwnerRules']
+        try:
+            baseline=(Path(rules['baselineProjectPath'])/'package-lock.json').read_bytes()
+            if _sha256_bytes(baseline)!=plan['baselineLockSha256']:raise NpmBundleEvidenceError('BASELINE_LOCK_DRIFT')
+            bundle_proofs=compile_bundle_rules(_obligation_json(baseline),locked,rules,baseline)
+            if bundle_proofs!=plan.get('unchangedBundledOwners'):raise NpmBundleEvidenceError('PROOF_DRIFT')
+            for owner,proof in bundle_proofs.items():
+                compare_installed_owner(project,proof)
+                bundle_paths.update([owner,*proof['memberRecordDigests']])
+        except (NpmBundleEvidenceError,OSError,KeyError,TypeError) as exc:
+            raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_BUNDLE_UNPROVEN: '+str(exc)) from exc
+    elif plan.get('unchangedBundledOwners'):
+        raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_BUNDLE_PROOF_UNBOUND')
     actual = {}; folded = set(); manifest_bytes_read = 0
     auxiliary=[]
     locked_paths_folded={path.casefold() for path in expected}
@@ -566,7 +590,7 @@ def observe_npm_dependency_obligations(project_dir, plan, *, source_origin_diges
                 if manifest_bytes_read > 64*1024*1024:
                     raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_MANIFEST_BUDGET_LIMIT')
                 value = _obligation_json(raw, 1024*1024)
-                _ordinary_npm_obligation_mode(value)
+                _ordinary_npm_obligation_mode(value,bundle_verified=relative in bundle_paths)
                 actual[relative] = (value, _sha256_bytes(raw))
                 scan_modules(package / 'node_modules', relative, depth+1)
     scan_modules(project / 'node_modules')
@@ -648,6 +672,8 @@ def observe_npm_dependency_obligations(project_dir, plan, *, source_origin_diges
             edge('',name,spec,optional=key=='optionalDependencies')
     budget()
     if auxiliary_directory_observer is not None:auxiliary_directory_observer(auxiliary)
+    bundle_counts=({'bundledMemberCount':sum(p['memberCount'] for p in bundle_proofs.values()),
+        'unchangedBundledOwnerCount':len(bundle_proofs),'bundledPreservationDigest':_canonical_hash(bundle_proofs)} if bundle_proofs else {})
     platform_counts=({'observedInstanceCount':len(rows),'platformInapplicableInstanceCount':len(omission_proof),
         'platformInapplicableInstances':[omission_proof[k] for k in sorted(omission_proof)]} if omission_proof else {})
     return {'schemaVersion': 1, 'authority': 'NON_REUSABLE_CORE_OBSERVATION',
@@ -655,10 +681,10 @@ def observe_npm_dependency_obligations(project_dir, plan, *, source_origin_diges
         'sourceOriginObservationDigest': source_origin_digest, 'resolvedStateKey': resolved_state_key,
         'approvedLockSha256': plan['approvedLockSha256'], 'obligationPlanDigest': plan['obligationPlanDigest'],
         'materializedTreeObservationDigest': _canonical_hash({'instances': rows, 'edges': edges,
-            **({'platformInapplicable':omission_proof} if omission_proof else {})}),
+            **({'platformInapplicable':omission_proof} if omission_proof else {}), **bundle_counts}),
         'instanceCount': len(rows)+len(omission_proof),
         'heldInstanceCount': sum(row['held'] for row in rows)+sum(expected[path]['held'] for path in omission_proof),
-        **platform_counts,
+        **platform_counts, **bundle_counts,
         'protectedEdgeCount': len(edges), 'changedInstanceCount': plan['changedInstanceCount'],
         'unknownCount': 0, 'violations': [], 'payloadAuthenticity': 'NOT_ATTESTED',
         'scope': 'PHYSICAL_INSTANCE_MANIFESTS_AND_SUPPORTED_NODE_EDGES_AT_BOUNDARIES', 'fullAcceptance': False}

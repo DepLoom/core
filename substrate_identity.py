@@ -41,6 +41,8 @@ _COMPONENT_FILES: Mapping[str, tuple[str, ...]] = {
         "yarn_berry.py",
         "lockfile_consistency.py",
         "resolved_dependency_state.py",
+        "npm_bundle_obligations.py",
+        "npm_platform_obligations.py",
         "proven_dependency_state.py",
         "peer_solver_model.py",
         "peer_solver_transition.py",
