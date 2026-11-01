@@ -41,7 +41,8 @@ def _sha(raw):
 
 
 def verify_current_workspace(project_dir, *, expected_source_key, dependency_plan,
-        commands, cache_dir, deadline, final_profile_digest, environment=None, materialize=False):
+        commands, cache_dir, deadline, final_profile_digest, environment=None, materialize=False,
+        environment_contract='LEGACY_INHERITED_ENV_V1'):
     """Freshly check THIS authorized workspace; optional cold-only npm-ci.
 
     No caller-provided evidence, reusable command PASS or previous prepared tree
@@ -90,12 +91,12 @@ def verify_current_workspace(project_dir, *, expected_source_key, dependency_pla
         fail('CURRENT_WORKSPACE_DEPENDENCY_ROOT_REPARSE_UNPROVEN')
     if materialize and modules.exists() and (not modules.is_dir() or any(modules.iterdir())):
         fail('CURRENT_WORKSPACE_EXISTING_TREE_REQUIRES_RECOVERABLE_STAGING')
-    env=dict(os.environ if environment is None else environment)
-    env.update(CI='1',NX_DAEMON='false',npm_config_offline='true',
-        npm_config_ignore_scripts='true',npm_config_strict_peer_deps='true',
-        npm_config_engine_strict='true',npm_config_legacy_peer_deps='false',
-        npm_config_force='false',npm_config_audit='false',npm_config_fund='false',
-        npm_config_update_notifier='false',npm_config_cache=str(cache))
+    from project_execution_environment import (workspace_execution_environment,
+        project_environment_fingerprint,project_environment_observation)
+    if environment_contract=='HOST_OWNED_PROJECT_EXECUTION_ENV_V1' and (os.name!='nt' or str(project).startswith('\\\\')):
+        fail('CURRENT_WORKSPACE_ENVIRONMENT_BOUNDARY_UNSUPPORTED')
+    env=workspace_execution_environment(os.environ if environment is None else environment,cache,
+        contract=environment_contract)
     if any(str(env.get(k,'')).strip() for k in ('NODE_OPTIONS','NODE_PATH')):
         fail('CURRENT_WORKSPACE_EXTERNAL_NODE_LOADER_UNPROVEN')
     node=shutil.which('node',path=env.get('PATH'));npm=Path(node).parent/'node_modules/npm/bin/npm-cli.js' if node else None
@@ -188,11 +189,13 @@ def verify_current_workspace(project_dir, *, expected_source_key, dependency_pla
             'sourceSnapshotKey':snapshot.key,'workspacePathDigest':_digest(str(project)),
             'resolvedStateKey':state.key,'resolvedLockfileHash':state.lockfile_hash,
             'materializedSourceOrigin':origin,'materializedDependencyObligations':final,
-            'environmentDigest':environment_snapshot_fingerprint(env),'commandObservations':rows,
+            'environmentDigest':project_environment_fingerprint(env,contract=environment_contract),'commandObservations':rows,
             'installation':installation,
             'currentWorkspaceVerified':False,'checkpointPublished':False,'fullAcceptance':False}
     remaining()
     result['sourceSnapshotCleanupClosed']=True
+    execution_environment=project_environment_observation(env,contract=environment_contract)
+    if execution_environment is not None:result['projectExecutionEnvironment']=execution_environment
     result['ownedCleanupConfirmed']=True
     result['auxiliaryDirectoryObservations']=auxiliary_observations
     result['arbitraryFilesystemSemanticsVerified']=False

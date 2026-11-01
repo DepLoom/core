@@ -14,6 +14,7 @@ TOOL_BUILD_ID_SCHEMA = "deploom-tool-build-v1"
 _COMPONENT_FILES: Mapping[str, tuple[str, ...]] = {
     "environment": (
         "block_vex_storage.py",
+        "project_execution_environment.py",
     ),
     "source": (
         "checkpoint_build_upgrade.py",
@@ -58,6 +59,7 @@ _COMPONENT_FILES: Mapping[str, tuple[str, ...]] = {
         "iterative_state_transaction.py",
         "run_writer_lock.py",
         "migration_validation.py",
+        "materialized_workspace_verifier.py",
         "baseline_constraint_verifier.py",
         "verification_process_supervisor.py",
         "verification_proof.py",
