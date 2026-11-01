@@ -4326,7 +4326,7 @@ def verify_assignment(
                     preparedSourceContentKey=snapshot.source_closure_content_key)
 
             project_failures: List[BaselineProjectFailure] = []
-            project_publication_allowed = True
+            project_publication_allowed = not config.observe_materialized_source_origin
             reusable_private_root: Optional[Path] = None
             reusable_private_project: Optional[Path] = None
             source_entries_by_path = {os.path.normcase(str(item["path"])).replace("\\", "/"): item
@@ -4336,7 +4336,7 @@ def verify_assignment(
 
             command_checkpoints = None
             command_checkpoint_refs = []
-            if config.recovery_checkpoints and proof_store.root is not None:
+            if config.recovery_checkpoints and not config.observe_materialized_source_origin and proof_store.root is not None:
                 # Reopened snapshots have no same-call publication flag. The
                 # durable loader (or None) owns cross-process receipt authority.
                 from verification_stage_checkpoint import CommandCheckpoint
@@ -4996,7 +4996,7 @@ def verify_assignment(
                     "proof.cache.publish-skipped",
                     proofType="project",
                     cacheKey=proof_identity.project_proof_key,
-                    reason="process-tree-supervision-not-guaranteed",
+                    reason="non-reusable-source-origin-mode" if config.observe_materialized_source_origin else "process-tree-supervision-not-guaranteed",
                 )
 
         _emit_progress(progress, f"{progress_label}: completed; elapsed={int(time.monotonic() - attempt_started)}s")

@@ -346,6 +346,7 @@ def pinned_inline_node_invocation(command, environment):
     prefix="eval(Buffer.from('"
     suffix="','base64').toString('utf8'))"
     if not command.startswith('node -e "'+prefix):return None
+    if len(command)>4096:raise ValueError("INLINE_NODE_BODY_OR_WRAPPER_UNPROVEN")
     try:
         code=json.loads(command[len("node -e "):])
         if not isinstance(code,str) or not code.startswith(prefix) or not code.endswith(suffix):raise ValueError()

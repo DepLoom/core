@@ -77,7 +77,7 @@ class MaterializedOriginTests(unittest.TestCase):
                 compare_materialized_source_origin(source,modified,state)
 
 
-    def real_preparation(self,*,lifecycle=False,tool_drift=False):
+    def real_preparation(self,*,lifecycle=False,tool_drift=False,cache_probe=False):
         import base64,os,time
         from unittest.mock import patch
         from baseline_constraint_verifier import verify_assignment,BaselineVerifyConfig,resolve_executable,_command_prefix
@@ -97,6 +97,8 @@ class MaterializedOriginTests(unittest.TestCase):
         command="node -e "+json.dumps("eval(Buffer.from('"+encoded+"','base64').toString('utf8'))")
         config=BaselineVerifyConfig(enabled=True,project_checks="strict",lifecycle_scripts=lifecycle,
             observe_materialized_source_origin=True,commands=(command,),verification_purpose="intermediate-candidate",
+            proof_cache_dir=str(self.base/"proof-cache") if cache_probe else "",recovery_checkpoints=cache_probe,
+            recovery_journal_dir=str(self.base/"stage-journal") if cache_probe else "",
             publish_durable_prepared_artifact=False,timeout_seconds=45,attempt_timeout_seconds=60,
             project_check_timeout_seconds=10,snapshot_copy_timeout_seconds=15,budget_phase_deadline=time.monotonic()+90)
         events=[]
@@ -118,5 +120,21 @@ class MaterializedOriginTests(unittest.TestCase):
         self.assertFalse(result.ok);self.assertEqual(result.kind,"unknown");self.assertFalse(result.hard_failure)
         self.assertEqual(result.summary,"INLINE_NODE_TOOLCHAIN_DRIFT")
         self.assertEqual([e["returnCode"] for e in events if e["type"]=="COMMAND_COMPLETED"],[1])
+
+
+    def test_optin_fresh_commands_do_not_read_or_write_reusable_project_or_command_proofs(self):
+        from unittest.mock import patch
+        from verification_proof import VerificationProofStore
+        from verification_stage_checkpoint import CommandCheckpoint
+        publish=VerificationProofStore.publish_pass;lookup=VerificationProofStore.lookup_pass
+        with patch.object(VerificationProofStore,"publish_pass",autospec=True,side_effect=publish) as writes,patch.object(VerificationProofStore,"lookup_pass",autospec=True,side_effect=lookup) as reads,patch("verification_stage_checkpoint.CommandCheckpoint",wraps=CommandCheckpoint) as checkpoints:
+            result,events=self.real_preparation(cache_probe=True)
+        self.assertTrue(result.ok,result.summary)
+        self.assertEqual([e["origin"] for e in events if e["type"]=="COMMAND_COMPLETED"],["EXECUTED_FRESH"])
+        project_reads=[c for c in reads.call_args_list if c.args[1]=="project"]
+        project_writes=[c for c in writes.call_args_list if c.args[1]=="project"]
+        print("NONREUSABLE_PROBE",{"projectReads":len(project_reads),"projectWriteAttempts":len(project_writes),"commandCheckpointConstructors":checkpoints.call_count})
+        self.assertEqual(project_reads,[]);self.assertEqual(project_writes,[])
+        checkpoints.assert_not_called()
 
 if __name__=="__main__":unittest.main()
