@@ -74,6 +74,20 @@ class CurrentWorkspaceVerificationTests(unittest.TestCase):
             self.invoke("require('node:fs').writeFileSync('marker.txt','changed');")
         self.assertEqual((self.project/'marker.txt').read_text(),'changed')
 
+    def test_empty_auxiliary_directory_observed_separately_from_graph(self):
+        value=self.invoke("require('node:fs').mkdirSync('node_modules/.generated-empty',{recursive:true});")
+        self.assertEqual(value['materializedDependencyObligations']['instanceCount'],0)
+        self.assertEqual(value['materializedDependencyObligations']['unknownCount'],0)
+        last=value['auxiliaryDirectoryObservations'][-1]
+        self.assertEqual(last['directories'][0]['relativePath'],'node_modules/.generated-empty')
+        self.assertFalse(last['arbitraryFilesystemSemanticsVerified'])
+    def test_empty_auxiliary_directory_cannot_hide_nonzero_check(self):
+        with self.assertRaisesRegex(MaterializedWorkspaceVerificationError,'COMMAND_FAILED'):
+            self.invoke("require('node:fs').mkdirSync('node_modules/.generated-empty',{recursive:true});process.exit(7);")
+    def test_generated_dist_is_not_implicitly_excluded(self):
+        with self.assertRaisesRegex(MaterializedWorkspaceVerificationError,'INPUT_CHANGED'):
+            self.invoke("require('node:fs').mkdirSync('dist');require('node:fs').writeFileSync('dist/result.js','changed');")
+
     def test_stale_source_stops_before_install(self):
         with self.assertRaisesRegex(MaterializedWorkspaceVerificationError,'SOURCE_MISMATCH'):
             self.invoke('process.exit(0);',key='0'*32)

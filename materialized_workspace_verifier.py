@@ -146,19 +146,26 @@ def verify_current_workspace(project_dir, *, expected_source_key, dependency_pla
         origin={'schemaVersion':1,'scope':'CURRENT_HOST_WORKSPACE',
             'inputSourceSnapshotKey':snapshot.key,'workspacePathDigest':_digest(str(project)),
             'resolvedLockfileHash':state.lockfile_hash,'toolchain':tools}
-        def tree():
-            return observe_npm_dependency_obligations(project,dependency_plan,
-                source_origin_digest=_digest(origin),resolved_state_key=state.key,
-                deadline=time.monotonic()+max(0,deadline-time.time()))
-        initial=tree();rows=[]
+        auxiliary_observations=[]
+        def tree(phase):
+            def auxiliary(rows):
+                auxiliary_observations.append({'phase':phase,'directories':rows,'arbitraryFilesystemSemanticsVerified':False})
+            try:
+                return observe_npm_dependency_obligations(project,dependency_plan,
+                    source_origin_digest=_digest(origin),resolved_state_key=state.key,
+                    deadline=time.monotonic()+max(0,deadline-time.time()),auxiliary_directory_observer=auxiliary)
+            except Exception as exc:
+                exc.operation_observations=tuple(operations)
+                raise
+        initial=tree('initial');rows=[]
         if not materialize:installation['status']='EXISTING_TREE_PHYSICALLY_OBSERVED'
         for index,command in enumerate(commands,1):
-            source_guard();before=tree()
+            source_guard();before=tree('before-command-'+str(index))
             if before!=initial:fail('CURRENT_WORKSPACE_TREE_CHANGED')
             inline=pinned_inline_node_invocation(command,env)
             argv=inline['argv'] if inline else project_check_command_argv(command,env)
             result=run(argv,'current-workspace project check',index)
-            source_guard();after=tree()
+            source_guard();after=tree('after-command-'+str(index))
             if after!=initial:fail('CURRENT_WORKSPACE_TREE_CHANGED')
             if result.returncode!=0:fail('CURRENT_WORKSPACE_COMMAND_FAILED')
             rows.append({'commandIndex':index,'commandDigest':_sha(command.encode()),
@@ -169,7 +176,7 @@ def verify_current_workspace(project_dir, *, expected_source_key, dependency_pla
                 'obligationPlanDigest':dependency_plan['obligationPlanDigest'],
                 'materializedTreeObservationDigest':initial['materializedTreeObservationDigest'],
                 'inlineExecution':inline,'stdoutDigest':_sha((result.stdout or '').encode())})
-        source_guard();final=tree()
+        source_guard();final=tree('final')
         if final!=initial:fail('CURRENT_WORKSPACE_TREE_CHANGED')
         result={'schemaVersion':1,'status':'CURRENT_WORKSPACE_PROFILE_OBSERVED',
             'authority':'NON_REUSABLE_CORE_CURRENT_WORKSPACE_OBSERVATION',
@@ -187,6 +194,8 @@ def verify_current_workspace(project_dir, *, expected_source_key, dependency_pla
     remaining()
     result['sourceSnapshotCleanupClosed']=True
     result['ownedCleanupConfirmed']=True
+    result['auxiliaryDirectoryObservations']=auxiliary_observations
+    result['arbitraryFilesystemSemanticsVerified']=False
     result['ownerOperationObservations']=operations
     result['ownerElapsedMs']=int((time.monotonic()-operation_started)*1000)
     return result

@@ -459,10 +459,13 @@ def npm_root_assignment_from_obligations(plan):
     return result
 
 
-def observe_npm_dependency_obligations(project_dir, plan, *, source_origin_digest, resolved_state_key, deadline=None):
+def observe_npm_dependency_obligations(project_dir, plan, *, source_origin_digest, resolved_state_key, deadline=None, auxiliary_directory_observer=None):
     """Observe actual physical instance manifests and supported Node edge paths.
 
     Boundary observation, not continuous mutation or package-payload attestation.
+    Only empty unlocked unscoped dot directories are auxiliary non-packages;
+    scoped slots, nonempty entries and reparse paths remain unproven. Optional
+    auxiliary diagnostics are separate from the package graph and denominator.
     Missing optional instances remain UNKNOWN until explicit omission semantics
     are supported; they never disappear from the expected denominator.
     """
@@ -505,6 +508,10 @@ def observe_npm_dependency_obligations(project_dir, plan, *, source_origin_diges
     elif plan.get('platformAbsenceProof'):
         raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_PLATFORM_PROOF_UNBOUND')
     actual = {}; folded = set(); manifest_bytes_read = 0
+    auxiliary=[]
+    locked_paths_folded={path.casefold() for path in expected}
+    if auxiliary_directory_observer is not None and not callable(auxiliary_directory_observer):
+        raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_AUXILIARY_OBSERVER_INVALID')
     def no_link(path):
         if path.is_symlink() or (hasattr(path, 'is_junction') and path.is_junction()):
             raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_REPARSE_UNPROVEN')
@@ -520,6 +527,23 @@ def observe_npm_dependency_obligations(project_dir, plan, *, source_origin_diges
             if entry.name in {'.bin', '.package-lock.json'}:
                 continue
             no_link(entry)
+            # Only unscoped direct slots here: NEVER apply this predicate to
+            # children inside @scope, where dot names may denote packages.
+            if entry.name.startswith('.') and entry.name not in {'.','..'} and entry.is_dir():
+                relative=entry.relative_to(project).as_posix()
+                if relative.casefold() not in locked_paths_folded:
+                    first=entry.lstat()
+                    if getattr(first,'st_file_attributes',0)&0x400:
+                        raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_REPARSE_UNPROVEN')
+                    if not any(entry.iterdir()):
+                        no_link(entry);last=entry.lstat()
+                        identity=lambda st:(st.st_dev,st.st_ino,st.st_mode,st.st_mtime_ns,st.st_ctime_ns)
+                        if (identity(first)!=identity(last) or getattr(last,'st_file_attributes',0)&0x400
+                                or entry.resolve().parent!=directory.resolve() or not entry.resolve().is_relative_to(project)):
+                            raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_AUXILIARY_LAYOUT_UNPROVEN')
+                        auxiliary.append({'relativePath':relative,'classification':'UNSCOPED_NONPACKAGE_EMPTY_DIRECTORY',
+                            'emptyObserved':True,'linkFreeObserved':True})
+                        continue
             if entry.name.startswith('@'):
                 if not entry.is_dir():
                     raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_LAYOUT_UNPROVEN')
@@ -623,6 +647,7 @@ def observe_npm_dependency_obligations(project_dir, plan, *, source_origin_diges
                 continue
             edge('',name,spec,optional=key=='optionalDependencies')
     budget()
+    if auxiliary_directory_observer is not None:auxiliary_directory_observer(auxiliary)
     platform_counts=({'observedInstanceCount':len(rows),'platformInapplicableInstanceCount':len(omission_proof),
         'platformInapplicableInstances':[omission_proof[k] for k in sorted(omission_proof)]} if omission_proof else {})
     return {'schemaVersion': 1, 'authority': 'NON_REUSABLE_CORE_OBSERVATION',
