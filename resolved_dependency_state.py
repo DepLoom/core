@@ -360,7 +360,7 @@ def _npm_obligation_name(location, record):
 def compile_npm_dependency_obligations(baseline_lock_bytes, candidate_lock_bytes, *,
         exact_targets, changed_instances, immutable_packages=(), excluded_packages=(),
         delta_digest, scope_digest, optional_absence_rules=()):
-    """Compile expected npm-v2 obligations BEFORE observing installed output.
+    """Compile expected npm-v2/v3 obligations BEFORE observing installed output.
 
     Exact host delta/scope authorization remains with its existing owner. This
     compiler independently binds that delta to both lock graphs. It does not
@@ -368,8 +368,9 @@ def compile_npm_dependency_obligations(baseline_lock_bytes, candidate_lock_bytes
     """
     import re
     before, after = (_obligation_json(raw) for raw in (baseline_lock_bytes, candidate_lock_bytes))
-    if any(type(lock.get('lockfileVersion')) is not int or lock['lockfileVersion'] != 2
-            for lock in (before, after)):
+    if (any(type(lock.get('lockfileVersion')) is not int or lock['lockfileVersion'] not in (2,3)
+            or lock['lockfileVersion']==3 and 'dependencies' in lock for lock in (before, after))
+            or before['lockfileVersion']!=after['lockfileVersion']):
         raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_LOCK_UNSUPPORTED')
     if optional_absence_rules:
         raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_OMISSION_RULE_UNSUPPORTED')
@@ -417,7 +418,7 @@ def compile_npm_dependency_obligations(baseline_lock_bytes, candidate_lock_bytes
             'lockRecordDigest': _canonical_hash(row), 'held': location in old and location not in changed,
             'metadata': {key: row.get(key, {}) for key in
                 ('dependencies', 'optionalDependencies', 'peerDependencies', 'peerDependenciesMeta')}})
-    plan = {'schemaVersion': 1, 'kind': 'APPROVED_NPM_V2_INSTANCE_OBLIGATIONS',
+    plan = {'schemaVersion': 1, 'kind': 'APPROVED_NPM_V'+str(after['lockfileVersion'])+'_INSTANCE_OBLIGATIONS',
         'baselineLockSha256': _sha256_bytes(baseline_lock_bytes),
         'approvedLockSha256': _sha256_bytes(candidate_lock_bytes),
         'approvedDeltaDigest': delta_digest, 'allowedChangeScopeDigest': scope_digest,
@@ -450,6 +451,11 @@ def observe_npm_dependency_obligations(project_dir, plan, *, source_origin_diges
     lock = project / 'package-lock.json'
     if not lock.is_file() or _sha256_bytes(lock.read_bytes()) != plan['approvedLockSha256']:
         raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_LOCK_DRIFT')
+    locked=_obligation_json(lock.read_bytes())
+    if (type(locked.get('lockfileVersion')) is not int or locked['lockfileVersion'] not in (2,3)
+            or locked['lockfileVersion']==3 and 'dependencies' in locked
+            or plan.get('kind')!='APPROVED_NPM_V'+str(locked['lockfileVersion'])+'_INSTANCE_OBLIGATIONS'):
+        raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_LOCK_UNSUPPORTED')
     manifest = _obligation_json((project / 'package.json').read_bytes(), 1024*1024)
     _ordinary_npm_obligation_mode(manifest)
     if {key: manifest.get(key, {}) for key in plan['rootDeclarations']} != plan['rootDeclarations']:
