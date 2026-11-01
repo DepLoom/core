@@ -24,7 +24,7 @@ class InvocationObservation:
     def __init__(self,callback,assignment_fingerprint,commands):
         if not callable(callback):raise TypeError("invocation_observer must be callable")
         self.callback=callback;self.assignment=assignment_fingerprint
-        self.commands=tuple(commands);self.events=[];self.cleanups=[];self.finished=False;self.failed=False;self.identity=None
+        self.commands=tuple(commands);self.events=[];self.cleanups=[];self.cleanup_failures=[];self.finished=False;self.failed=False;self.identity=None
         self.id=uuid.uuid4().hex
     def emit(self,event):
         payload={"schemaVersion":2,"invocationId":self.id,"sequence":len(self.events)+1,
@@ -59,7 +59,7 @@ class InvocationObservation:
             if len(rows)==1 and rows[0]["origin"]=="EXECUTED_FRESH" and rows[0]["status"]=="PASS" and aligned:fresh.append(index)
             else:missing.append(index)
         identity_complete=bool(self.identity) and all(self.identity.values()) and self.identity.get("verified_assignment_fingerprint")==self.assignment
-        complete=bool(result is not None and getattr(result,"ok",False) and getattr(result,"kind","")=="passed" and not error and not missing and self.commands and identity_complete and before_cleanup)
+        complete=bool(result is not None and getattr(result,"ok",False) and getattr(result,"kind","")=="passed" and not error and not missing and self.commands and identity_complete and before_cleanup and not self.cleanup_failures)
         self.emit({"type":"INVOCATION_RESULT_OBSERVED","outcome":str(getattr(result,"kind","unknown")),
                    "status":"RESULT_OBSERVED_COMPLETE" if complete else "INCOMPLETE_UNKNOWN",
                    "beforePrivateWorkspaceDeletion":before_cleanup,"sourceGuardsActive":"NOT_ATTESTED",
@@ -88,6 +88,21 @@ def defer_workspace_cleanup(cleanup):
     state.cleanups.append(cleanup)
     return True
 
+def close_owned_resources(guarded_roots,cleanup_guard,source_binding,cleanup_workspace,cleanup_deferred,event):
+    """Release all owner resources; legacy logging never grants observed success."""
+    try:
+        for guarded_root in guarded_roots:
+            try:cleanup_guard(guarded_root)
+            except Exception as exc:
+                state=_CURRENT.get()
+                if state is not None:state.cleanup_failures.append(exc)
+                event("verify.project-check.guard-cleanup-failed",detail=str(exc),workspace=str(guarded_root))
+    finally:
+        try:source_binding.close()
+        finally:
+            if not cleanup_deferred:cleanup_workspace()
+
+
 def run_observed(callback,assignment_fingerprint,commands,action):
     state=InvocationObservation(callback,assignment_fingerprint,commands);token=_CURRENT.set(state)
     primary_error=None
@@ -106,7 +121,7 @@ def run_observed(callback,assignment_fingerprint,commands,action):
         primary_error=exc
         raise
     finally:
-        cleanup_error=None
+        cleanup_error=state.cleanup_failures[0] if state.cleanup_failures else None
         try:
             for cleanup in reversed(state.cleanups):
                 try:cleanup()

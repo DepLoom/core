@@ -62,6 +62,26 @@ class ObserverLifecycleTests(unittest.TestCase):
         self.assertEqual(len(events),1)
         self.assertEqual(events[-1]["status"],"INCOMPLETE_UNKNOWN")
         self.assertEqual(events[-1]["unconfirmedCommandIndexes"],[1])
+    def test_real_owner_guarded_clone_cleanup_error_blocks_observed_success(self):
+        released=[];events=[]
+        def bad_guard(path):released.append("guard");raise OSError("injected guarded clone cleanup failure")
+        def action():
+            defer_workspace_cleanup(lambda:released.append("workspace"))
+            observe_command(1,COMMAND,supervised(),guarded=True,identities=identities())
+            verifier._close_invocation_resources([Path("owned-guard")],bad_guard,
+                SimpleNamespace(close=lambda:released.append("source")),lambda:None,True,lambda *a,**kw:None)
+            return result()
+        with self.assertRaisesRegex(InvocationObservationError,"CLEANUP_FAILED"):
+            run_observed(events.append,FINGERPRINT,[COMMAND],action)
+        self.assertEqual(released,["guard","source","workspace"])
+        self.assertEqual(events[-1]["status"],"INCOMPLETE_UNKNOWN")
+    def test_legacy_guard_cleanup_remains_best_effort_but_releases_other_resources(self):
+        released=[]
+        def bad_guard(path):raise OSError("legacy guard cleanup fault")
+        verifier._close_invocation_resources([Path("owned-guard")],bad_guard,
+            SimpleNamespace(close=lambda:released.append("source")),lambda:released.append("workspace"),False,
+            lambda *a,**kw:released.append("logged"))
+        self.assertEqual(released,["logged","source","workspace"])
     def test_actual_owner_removes_trial_when_source_binding_close_raises(self):
         # Executes the owning Core filesystem/finally path, no npm or source capture.
         class BrokenClose:

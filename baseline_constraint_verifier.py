@@ -35,6 +35,7 @@ from verification_invocation import (
     observe_reused_command as _observe_invocation_reused_command,
     observe_reused_profile as _observe_invocation_reused_profile,
     defer_workspace_cleanup as _defer_invocation_cleanup,
+    close_owned_resources as _close_invocation_resources,
     run_observed as _run_invocation_observed,
 )
 from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -4963,16 +4964,10 @@ def verify_assignment(
     finally:
         # Early return may retain a trial provisionally. Release every owned
         # lower lease/guard even when a later check or evidence adapter aborts.
-        for guarded_root in guarded_trial_roots:
-            try:
-                cleanup_guarded_clone(guarded_root)
-            except Exception as exc:
-                event("verify.project-check.guard-cleanup-failed", detail=str(exc), workspace=str(guarded_root))
-        try:
-            source_binding.close()
-        finally:
-            if not cleanup_deferred:
-                cleanup_observed_workspace()
+        _close_invocation_resources(
+            guarded_trial_roots, cleanup_guarded_clone, source_binding,
+            cleanup_observed_workspace, cleanup_deferred, event,
+        )
 
 
 
