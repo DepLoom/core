@@ -69,6 +69,7 @@ class InvocationObservation:
                    "errorType":type(error).__name__ if error is not None else None,
                    "localWorkspace":str(getattr(result,"workspace","") or "") if result is not None else "",
                    "materializedSourceOrigin":copy.deepcopy(getattr(result,"materialized_source_origin",{}) or {}),
+                   "materializedDependencyObligations":copy.deepcopy(getattr(result,"materialized_dependency_obligations",{}) or {}),
                    "metadataNecessityCheck":"UNKNOWN",
                    "publicationEligibility":"FORBIDDEN_UNTIL_OUTER_CALL_RETURNS"})
 

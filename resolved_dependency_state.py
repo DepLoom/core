@@ -303,3 +303,253 @@ def assert_resolved_dependency_state(
             "RESOLVED_STATE_LOCKFILE_DRIFT: "
             f"expected={state.lockfile_hash} current={current_hash} path={state.lockfile_path}"
         )
+
+
+class MaterializedDependencyObligationError(RuntimeError):
+    """Unknown installed evidence is never solver incompatibility or a nogood."""
+
+
+def _obligation_json(raw, limit=8*1024*1024):
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError('duplicate key')
+            result[key] = value
+        return result
+    try:
+        if not isinstance(raw, bytes) or len(raw) > limit:
+            raise ValueError('size/type')
+        result = json.loads(raw, object_pairs_hook=pairs,
+            parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)))
+        if not isinstance(result, dict):
+            raise ValueError('object required')
+        return result
+    except (UnicodeError, ValueError) as exc:
+        raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_JSON_UNPROVEN') from exc
+
+
+def _npm_obligation_name(location, record):
+    import re
+    segment = r'(?:@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*'
+    if (not isinstance(location, str)
+            or re.fullmatch(r'node_modules/'+segment+r'(?:/node_modules/'+segment+r')*', location) is None):
+        raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_PATH_UNPROVEN')
+    installed_name = location.rsplit('/node_modules/', 1)[-1].removeprefix('node_modules/')
+    canonical_name = record.get('name', installed_name)
+    if (not isinstance(canonical_name, str) or re.fullmatch(segment, canonical_name) is None
+            or record.get('link') or not isinstance(record.get('version'), str)):
+        raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_IDENTITY_UNPROVEN')
+    from semantic_version import Version
+    try:
+        Version(record['version'])
+    except ValueError as exc:
+        raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_VERSION_UNPROVEN') from exc
+    return installed_name, canonical_name
+
+
+def compile_npm_dependency_obligations(baseline_lock_bytes, candidate_lock_bytes, *,
+        exact_targets, changed_instances, immutable_packages=(), excluded_packages=(),
+        delta_digest, scope_digest, optional_absence_rules=()):
+    """Compile expected npm-v2 obligations BEFORE observing installed output.
+
+    Exact host delta/scope authorization remains with its existing owner. This
+    compiler independently binds that delta to both lock graphs. It does not
+    infer authorization, tarball authenticity or arbitrary runtime behavior.
+    """
+    import re
+    before, after = (_obligation_json(raw) for raw in (baseline_lock_bytes, candidate_lock_bytes))
+    if any(type(lock.get('lockfileVersion')) is not int or lock['lockfileVersion'] != 2
+            for lock in (before, after)):
+        raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_LOCK_UNSUPPORTED')
+    if optional_absence_rules:
+        raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_OMISSION_RULE_UNSUPPORTED')
+    if any(not isinstance(value, str) or re.fullmatch('[0-9a-f]{64}', value) is None
+            for value in (delta_digest, scope_digest)):
+        raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_AUTHORIZATION_UNPROVEN')
+    graphs = []
+    for lock in (before, after):
+        graph = lock.get('packages')
+        if (not isinstance(graph, dict) or '' not in graph or not isinstance(graph[''], dict)
+                or len(graph) > 10001 or any(not isinstance(row, dict) for row in graph.values())
+                or len({name.casefold() for name in graph}) != len(graph)):
+            raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_GRAPH_UNPROVEN')
+        for location, row in graph.items():
+            if location:
+                _npm_obligation_name(location, row)
+        graphs.append(graph)
+    old, new = graphs
+    changed = {name for name in set(old) | set(new) if name and old.get(name) != new.get(name)}
+    if (not isinstance(changed_instances, (list, tuple))
+            or any(not isinstance(name, str) for name in changed_instances)
+            or len(set(changed_instances)) != len(changed_instances) or set(changed_instances) != changed):
+        raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_DELTA_MISMATCH')
+    protected = set(immutable_packages) | set(excluded_packages)
+    for location in changed:
+        for graph in (old, new):
+            if location in graph and protected.intersection(_npm_obligation_name(location, graph[location])):
+                raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_PROTECTED_DELTA')
+    sections = ('dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies')
+    root_before = {key: old[''].get(key, {}) for key in sections}
+    root_after = {key: new[''].get(key, {}) for key in sections}
+    expected = json.loads(json.dumps(root_before))
+    for name, version in exact_targets.items():
+        found = [key for key in sections if isinstance(expected[key], dict) and name in expected[key]]
+        if len(found) != 1:
+            raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_ROOT_UNPROVEN')
+        expected[found[0]][name] = version
+    if expected != root_after:
+        raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_ROOT_SCOPE_MISMATCH')
+    instances = []
+    for location in sorted(set(new) - {''}):
+        row = new[location]; alias, name = _npm_obligation_name(location, row)
+        instances.append({'path': location, 'installName': alias, 'name': name, 'version': row['version'],
+            'lockRecordDigest': _canonical_hash(row), 'held': location in old and location not in changed,
+            'metadata': {key: row.get(key, {}) for key in
+                ('dependencies', 'optionalDependencies', 'peerDependencies', 'peerDependenciesMeta')}})
+    plan = {'schemaVersion': 1, 'kind': 'APPROVED_NPM_V2_INSTANCE_OBLIGATIONS',
+        'baselineLockSha256': _sha256_bytes(baseline_lock_bytes),
+        'approvedLockSha256': _sha256_bytes(candidate_lock_bytes),
+        'approvedDeltaDigest': delta_digest, 'allowedChangeScopeDigest': scope_digest,
+        'rootDeclarations': root_after, 'instances': instances, 'changedInstanceCount': len(changed),
+        'optionalAbsenceRules': []}
+    return {**plan, 'obligationPlanDigest': _canonical_hash(plan)}
+
+
+def observe_npm_dependency_obligations(project_dir, plan, *, source_origin_digest, resolved_state_key, deadline=None):
+    """Observe actual physical instance manifests and supported Node edge paths.
+
+    Boundary observation, not continuous mutation or package-payload attestation.
+    Missing optional instances remain UNKNOWN until explicit omission semantics
+    are supported; they never disappear from the expected denominator.
+    """
+    import re
+    from semantic_version import NpmSpec, Version
+    import time
+    def budget():
+        if deadline is not None and time.monotonic() >= deadline:
+            raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_DEADLINE_EXCEEDED')
+    budget()
+    project = Path(project_dir).resolve()
+    if (not isinstance(plan, dict) or type(plan.get('schemaVersion')) is not int or plan['schemaVersion'] != 1
+            or plan.get('obligationPlanDigest') != _canonical_hash({k: v for k, v in plan.items() if k != 'obligationPlanDigest'})):
+        raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_PLAN_UNPROVEN')
+    if any(not isinstance(value, str) or re.fullmatch('[0-9a-f]{64}', value) is None
+            for value in (source_origin_digest, resolved_state_key)):
+        raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_ORIGIN_UNPROVEN')
+    lock = project / 'package-lock.json'
+    if not lock.is_file() or _sha256_bytes(lock.read_bytes()) != plan['approvedLockSha256']:
+        raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_LOCK_DRIFT')
+    manifest = _obligation_json((project / 'package.json').read_bytes(), 1024*1024)
+    if {key: manifest.get(key, {}) for key in plan['rootDeclarations']} != plan['rootDeclarations']:
+        raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_MANIFEST_DRIFT')
+    expected = {row['path']: row for row in plan['instances']}
+    actual = {}; folded = set(); manifest_bytes_read = 0
+    def no_link(path):
+        if path.is_symlink() or (hasattr(path, 'is_junction') and path.is_junction()):
+            raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_REPARSE_UNPROVEN')
+    def scan_modules(directory, prefix='', depth=0):
+        nonlocal manifest_bytes_read
+        budget()
+        if depth > 64:
+            raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_DEPTH_LIMIT')
+        if not directory.exists():
+            return
+        no_link(directory)
+        for entry in sorted(directory.iterdir(), key=lambda p: p.name):
+            if entry.name in {'.bin', '.package-lock.json'}:
+                continue
+            no_link(entry)
+            if entry.name.startswith('@'):
+                if not entry.is_dir():
+                    raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_LAYOUT_UNPROVEN')
+                paths = sorted(entry.iterdir(), key=lambda p: p.name)
+            else:
+                paths = [entry]
+            for package in paths:
+                budget()
+                no_link(package)
+                relative = package.relative_to(project).as_posix()
+                if relative.casefold() in folded or not package.is_dir() or len(actual) >= 10000:
+                    raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_LAYOUT_UNPROVEN')
+                folded.add(relative.casefold())
+                package_file = package / 'package.json'; no_link(package_file)
+                if not package_file.is_file():
+                    raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_PACKAGE_MISSING')
+                if package_file.stat().st_size > 1024*1024:
+                    raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_MANIFEST_SIZE_LIMIT')
+                raw = package_file.read_bytes(); manifest_bytes_read += len(raw)
+                if manifest_bytes_read > 64*1024*1024:
+                    raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_MANIFEST_BUDGET_LIMIT')
+                value = _obligation_json(raw, 1024*1024)
+                actual[relative] = (value, _sha256_bytes(raw))
+                scan_modules(package / 'node_modules', relative, depth+1)
+    scan_modules(project / 'node_modules')
+    if set(actual) != set(expected):
+        raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_INSTANCE_SET_MISMATCH: '
+            + json.dumps({'missing': sorted(set(expected)-set(actual))[:20], 'extra': sorted(set(actual)-set(expected))[:20]}))
+    rows = []; edges = []
+    def parent_instance(location):
+        return location.rpartition('/node_modules/')[0] if '/node_modules/' in location else ''
+    def resolve(location, name, peer=False):
+        _npm_obligation_name('node_modules/'+name, {'version': '0.0.0'})
+        base = parent_instance(location) if peer else location
+        while True:
+            candidate = (base+'/' if base else '')+'node_modules/'+name
+            if candidate in actual:
+                return candidate
+            if not base:
+                return None
+            base = parent_instance(base)
+    def edge(source, name, spec, peer=False):
+        if not isinstance(spec, str):
+            raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_EDGE_UNPROVEN')
+        destination = resolve(source, name, peer)
+        if destination is None:
+            raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_EDGE_MISSING')
+        wanted_name = None
+        if spec.startswith('npm:'):
+            match = re.fullmatch(r'npm:((?:@[^/]+/)?[^@]+)@(.+)', spec)
+            if not match:
+                raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_ALIAS_UNPROVEN')
+            wanted_name, spec = match.groups()
+        try:
+            matched = NpmSpec(spec).match(Version(actual[destination][0]['version']))
+        except (ValueError, KeyError) as exc:
+            raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_EDGE_UNPROVEN') from exc
+        if not matched or (wanted_name and actual[destination][0].get('name') != wanted_name):
+            raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_EDGE_MISMATCH')
+        edges.append({'source': source, 'name': name, 'destination': destination, 'peer': peer, 'specifier': spec})
+    for location, wanted in expected.items():
+        value, digest = actual[location]
+        if value.get('name') != wanted['name'] or value.get('version') != wanted['version']:
+            raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_IDENTITY_MISMATCH: '+location)
+        for key, metadata in wanted['metadata'].items():
+            if not isinstance(metadata, dict) or value.get(key, {}) != metadata:
+                raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_METADATA_UNPROVEN: '+location)
+        for key in ('dependencies', 'optionalDependencies', 'peerDependencies'):
+            for name, spec in wanted['metadata'][key].items():
+                if key == 'dependencies' and name in wanted['metadata']['optionalDependencies']:
+                    continue  # npm optionalDependencies override ordinary declarations.
+                # Optional absence is intentionally not inferred from a missing
+                # file or a successful npm exit. It remains a visible UNKNOWN.
+                edge(location, name, spec, key == 'peerDependencies')
+        rows.append({'path': location, 'name': wanted['name'], 'version': wanted['version'],
+            'packageManifestSha256': digest, 'lockRecordDigest': wanted['lockRecordDigest'], 'held': wanted['held']})
+    for key, declarations in plan['rootDeclarations'].items():
+        if not isinstance(declarations, dict):
+            raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_ROOT_UNPROVEN')
+        for name, spec in declarations.items():
+            if key == 'dependencies' and name in plan['rootDeclarations']['optionalDependencies']:
+                continue
+            edge('', name, spec)
+    budget()
+    return {'schemaVersion': 1, 'authority': 'NON_REUSABLE_CORE_OBSERVATION',
+        'status': 'MATERIALIZED_NPM_INSTANCE_OBLIGATIONS_OBSERVED',
+        'sourceOriginObservationDigest': source_origin_digest, 'resolvedStateKey': resolved_state_key,
+        'approvedLockSha256': plan['approvedLockSha256'], 'obligationPlanDigest': plan['obligationPlanDigest'],
+        'materializedTreeObservationDigest': _canonical_hash({'instances': rows, 'edges': edges}),
+        'instanceCount': len(rows), 'heldInstanceCount': sum(row['held'] for row in rows),
+        'protectedEdgeCount': len(edges), 'changedInstanceCount': plan['changedInstanceCount'],
+        'unknownCount': 0, 'violations': [], 'payloadAuthenticity': 'NOT_ATTESTED',
+        'scope': 'PHYSICAL_INSTANCE_MANIFESTS_AND_SUPPORTED_NODE_EDGES_AT_BOUNDARIES', 'fullAcceptance': False}

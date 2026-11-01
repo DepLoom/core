@@ -189,6 +189,8 @@ class BaselineVerifyConfig:
     lifecycle_scripts: bool = True
     # Code-only opt-in observation; never execution/goal admission authority.
     observe_materialized_source_origin: bool = False
+    observe_materialized_dependency_obligations: bool = False
+    dependency_obligation_plan: Mapping[str, object] = dataclasses.field(default_factory=dict)
     registry: str = ""
     telemetry_path: str = ""
     proof_cache_dir: str = ""
@@ -382,6 +384,7 @@ class BaselineVerifyResult:
     verified_source_snapshot_key: str = ""
     verified_assignment_fingerprint: str = ""
     materialized_source_origin: Mapping[str, object] = dataclasses.field(default_factory=dict)
+    materialized_dependency_obligations: Mapping[str, object] = dataclasses.field(default_factory=dict)
 
     @property
     def hard_failure(self) -> bool:
@@ -2860,8 +2863,12 @@ def verify_assignment(
     assignment_hash = assignment_fingerprint(assignment)
     materialized_source_origin = {}
     source_origin_observation_digest = ""
+    materialized_dependency_obligations = {}
+    dependency_boundary_guards = []
     inline_execution_unproven = False
 
+    if config.observe_materialized_dependency_obligations and not config.observe_materialized_source_origin:
+        return BaselineVerifyResult(False,"unknown","DEPENDENCY_OBLIGATION_SOURCE_ORIGIN_REQUIRED")
     try:
         _validate_assignment_materialization(
             preflight_project,
@@ -4325,6 +4332,15 @@ def verify_assignment(
                 event("verify.source-origin.observed",sourceOriginObservationDigest=source_origin_observation_digest,
                     preparedSourceContentKey=snapshot.source_closure_content_key)
 
+            if config.observe_materialized_dependency_obligations:
+                from resolved_dependency_state import observe_npm_dependency_obligations
+                try:
+                    materialized_dependency_obligations = observe_npm_dependency_obligations(
+                        snapshot.workspace_root/snapshot.project_relative, dict(config.dependency_obligation_plan),
+                        source_origin_digest=source_origin_observation_digest, resolved_state_key=resolved_state.key, deadline=config.budget_phase_deadline or None)
+                except Exception as exc:
+                    return BaselineVerifyResult(False,"unknown",f"DEPENDENCY_OBLIGATION_UNPROVEN: {exc}")
+
             project_failures: List[BaselineProjectFailure] = []
             project_publication_allowed = not config.observe_materialized_source_origin
             reusable_private_root: Optional[Path] = None
@@ -4404,6 +4420,7 @@ def verify_assignment(
                     try:
                         command_fastpath_allowed = (
                             _allow_prepared_fastpath
+                            and not config.observe_materialized_dependency_obligations
                             and bool(snapshot.dependency_roots)
                             and _prepared_command_fastpath_allowed(
                                 project_dir, command
@@ -4508,6 +4525,8 @@ def verify_assignment(
                 command_pass_verified = False
                 inline_node = None
                 inline_node_tool_unchanged = True
+                dependency_pre = None
+                dependency_post = None
                 try:
                     removed_caches = clean_ephemeral_verification_caches(command_root, snapshot.dependency_roots)
                     if removed_caches:
@@ -4635,6 +4654,15 @@ def verify_assignment(
                         try:inline_node = pinned_inline_node_invocation(command,base_env)
                         except (ValueError,OSError) as exc:
                             return BaselineVerifyResult(False,"unknown",str(exc),workspace=str(command_project))
+                    if config.observe_materialized_dependency_obligations:
+                        try:
+                            dependency_pre = observe_npm_dependency_obligations(command_project,
+                                dict(config.dependency_obligation_plan), source_origin_digest=source_origin_observation_digest,
+                                resolved_state_key=resolved_state.key, deadline=config.budget_phase_deadline or None)
+                            if dependency_pre != materialized_dependency_obligations:
+                                raise ValueError("DEPENDENCY_OBLIGATION_PRE_BOUNDARY_DRIFT")
+                        except Exception as exc:
+                            return BaselineVerifyResult(False,"unknown",f"DEPENDENCY_OBLIGATION_UNPROVEN: {exc}")
                     shell_argv = inline_node["argv"] if inline_node else project_check_command_argv(command)
                     try:
                         check_result = _run(
@@ -4693,6 +4721,18 @@ def verify_assignment(
                             )
                         return BaselineVerifyResult(False, "infrastructure", f"project check launch failed: {exc}", command=command)
 
+                    if config.observe_materialized_dependency_obligations:
+                        try:
+                            dependency_post = observe_npm_dependency_obligations(command_project,
+                                dict(config.dependency_obligation_plan), source_origin_digest=source_origin_observation_digest,
+                                resolved_state_key=resolved_state.key, deadline=config.budget_phase_deadline or None)
+                            if dependency_post != dependency_pre:
+                                raise ValueError("DEPENDENCY_OBLIGATION_POST_BOUNDARY_DRIFT")
+                            dependency_boundary_guards.append({"commandIndex":command_index,
+                                "status":"PRE_POST_OBSERVED", "obligationPlanDigest":dependency_pre["obligationPlanDigest"],
+                                "materializedTreeObservationDigest":dependency_pre["materializedTreeObservationDigest"]})
+                        except Exception as exc:
+                            return BaselineVerifyResult(False,"unknown",f"DEPENDENCY_OBLIGATION_UNPROVEN: {exc}")
                     if clone_isolation == "ntfs-junction-guarded" and command_index < len(config.commands):
                         from prepared_workspace_fastpath import peek_guarded_clone
                         guard_result = peek_guarded_clone(command_root)
@@ -4895,6 +4935,9 @@ def verify_assignment(
                                 "resolvedLockfileHash": resolved_state.lockfile_hash if resolved_state is not None else "",
                                 "preparedSourceContentKey": snapshot.source_closure_content_key if materialized_source_origin else "",
                                 "sourceOriginObservationDigest": source_origin_observation_digest,
+                                "dependencyObligationPlanDigest": dependency_pre["obligationPlanDigest"] if dependency_pre else "",
+                                "materializedTreeObservationDigest": dependency_pre["materializedTreeObservationDigest"] if dependency_pre else "",
+                                "dependencyPrePostGuardStatus": "PRE_POST_OBSERVED" if dependency_pre and dependency_post==dependency_pre else "UNPROVEN",
                                 "inlineNodeBodySha256": inline_node["bodySha256"] if inline_node else "",
                                 "inlineNodeExecutionMode": inline_node["executionMode"] if inline_node and inline_node_tool_unchanged else "",
                                 "nodeExecutableSha256": inline_node["nodeExecutableSha256"] if inline_node else ""},
@@ -4999,6 +5042,18 @@ def verify_assignment(
                     reason="non-reusable-source-origin-mode" if config.observe_materialized_source_origin else "process-tree-supervision-not-guaranteed",
                 )
 
+        if config.observe_materialized_dependency_obligations:
+            try:
+                final_dependency_observation = observe_npm_dependency_obligations(
+                    snapshot.workspace_root/snapshot.project_relative, dict(config.dependency_obligation_plan),
+                    source_origin_digest=source_origin_observation_digest, resolved_state_key=resolved_state.key, deadline=config.budget_phase_deadline or None)
+                if (final_dependency_observation != materialized_dependency_obligations
+                        or len(dependency_boundary_guards)!=len(config.commands)):
+                    raise ValueError("DEPENDENCY_OBLIGATION_FINAL_BOUNDARY_UNPROVEN")
+                materialized_dependency_obligations={**final_dependency_observation,
+                    "commandBoundaryGuards":dependency_boundary_guards,"finalBoundaryObserved":True}
+            except Exception as exc:
+                return BaselineVerifyResult(False,"unknown",f"DEPENDENCY_OBLIGATION_UNPROVEN: {exc}")
         _emit_progress(progress, f"{progress_label}: completed; elapsed={int(time.monotonic() - attempt_started)}s")
         return BaselineVerifyResult(
             True, "passed", f"resolver preflight passed for {len(changed)} changed direct package(s)",
@@ -5014,6 +5069,7 @@ def verify_assignment(
             verified_source_snapshot_key=source_snapshot.key,
             verified_assignment_fingerprint=assignment_hash,
             materialized_source_origin=materialized_source_origin,
+            materialized_dependency_obligations=materialized_dependency_obligations,
         )
     finally:
         # Early return may retain a trial provisionally. Release every owned
