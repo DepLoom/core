@@ -98,7 +98,7 @@ def _archive(path,row,canonical):
   if key in row and row[key]!=manifest.get(key):_fail('ARTIFACT_PLATFORM_MISMATCH')
  return manifest,{'archiveSha256':_sha(raw),'packageManifestDigest':_digest(manifest),'integrity':sri},len(raw)
 
-def _v2_view_record(lock,location,record):
+def _v2_view_record(lock,location,record,*,allow_bundled=False):
  """Platform evidence must agree with npm-v2's compatible tree view."""
  parts=location.split('/node_modules/');parts[0]=parts[0].removeprefix('node_modules/')
  tree=lock.get('dependencies');other=None
@@ -108,14 +108,38 @@ def _v2_view_record(lock,location,record):
   other=tree[name];tree=other.get('dependencies',{})
  for key in ('version','resolved','integrity','optional','dev','devOptional'):
   if other.get(key)!=record.get(key):_fail('V2_VIEW_MISMATCH')
- if record.get('inBundle') or other.get('bundled') or record.get('link') or other.get('link'):_fail('V2_CONDITIONAL_OWNER_UNSUPPORTED')
+ if record.get('link') or other.get('link'):_fail('V2_CONDITIONAL_OWNER_UNSUPPORTED')
+ if not allow_bundled and (record.get('inBundle') or other.get('bundled')):_fail('V2_CONDITIONAL_OWNER_UNSUPPORTED')
+ for row,flags in ((record,('optional','dev','devOptional','inBundle','link')),(other,('optional','dev','devOptional','bundled','link'))):
+  if any(key in row and type(row[key]) is not bool for key in flags):_fail('V2_VIEW_FLAG_TYPE')
+ if record.get('inBundle',False)!=other.get('bundled',False):_fail('V2_VIEW_MISMATCH')
+ if any(not isinstance(record.get(key,{}),dict) for key in ('dependencies','optionalDependencies')):_fail('V2_VIEW_REQUIREMENTS_MISMATCH')
  if {**record.get('dependencies',{}),**record.get('optionalDependencies',{})}!=other.get('requires',{}):_fail('V2_VIEW_REQUIREMENTS_MISMATCH')
+
+def _v2_consistent_graph(lock):
+ graph=lock.get('packages');tree=lock.get('dependencies');seen=set();pending=[('',tree)]
+ if not isinstance(graph,dict) or '' not in graph:_fail('V2_VIEW_MISSING')
+ while pending:
+  base,children=pending.pop()
+  if not isinstance(children,dict):_fail('V2_VIEW_MISMATCH')
+  for name,row in children.items():
+   if not isinstance(name,str) or re.fullmatch(r'(?:@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*',name) is None or not isinstance(row,dict):_fail('V2_VIEW_MISMATCH')
+   path=(base+'/' if base else '')+'node_modules/'+name
+   if path in seen or len(seen)>=10000:_fail('V2_VIEW_MISMATCH')
+   seen.add(path);pending.append((path,row.get('dependencies',{})))
+ expected=set(graph)-{''}
+ if expected-seen:_fail('V2_VIEW_MISSING')
+ if seen-expected:_fail('V2_VIEW_MISMATCH')
+ for path in seen:
+  if not isinstance(graph[path],dict):_fail('V2_VIEW_MISMATCH')
+  _v2_view_record(lock,path,graph[path],allow_bundled=True)
 
 def verify_platform_absence(lock,rules):
  validate_rules_shape(rules)
  version=lock.get('lockfileVersion')
  if (type(version) is not int or version not in (2,3) or rules['kind']!='NPM_V'+str(version)+'_SRI_PLATFORM_ABSENCE_V1'
    or version==3 and 'dependencies' in lock or version==2 and not isinstance(lock.get('dependencies'),dict)):_fail('LOCK_UNSUPPORTED')
+ if version==2:_v2_consistent_graph(lock)
  host=observe_node_host()
  if host!=rules['host']:_fail('HOST_CHANGED')
  graph=lock.get('packages');proof={};total=0

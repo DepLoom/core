@@ -29,4 +29,13 @@ class PlatformV2AbsenceTests(unittest.TestCase):
   del self.f.lock['dependencies']['foreign']
   with self.assertRaisesRegex(MaterializedDependencyObligationError,'V2_VIEW_MISSING'):self.f.compile()
 
+ def test_legacy_only_required_consumer_is_not_ignored(self):
+  self.f.lock['dependencies']['legacy-required']={'version':'1.0.0','requires':{'foreign':'^1.0.0'}}
+  with self.assertRaises(MaterializedDependencyObligationError):self.f.compile()
+
+ def test_required_consumer_in_both_views_blocks_optional_absence(self):
+  self.f.lock['packages']['node_modules/required']={'version':'1.0.0','dependencies':{'foreign':'^1.0.0'}}
+  self.f.lock['dependencies']['required']={'version':'1.0.0','requires':{'foreign':'^1.0.0'}}
+  with self.assertRaises(MaterializedDependencyObligationError):self.f.compile()
+
 if __name__=='__main__':unittest.main()
