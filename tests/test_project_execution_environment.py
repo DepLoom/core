@@ -103,4 +103,32 @@ class ActualWorkspaceEnvironmentBoundaryTests(unittest.TestCase):
     with self.subTest(name=name):self.assertNotEqual(baseline,substrate_identity.tool_build_id())
    clear()
 
+@unittest.skipUnless(os.name=='nt','native v2 launch proof is local Windows only')
+class NativeLaunchBoundaryTests(unittest.TestCase):
+ def test_actual_immutable_popen_mapping_and_real_node_are_joined(self):
+  from unittest.mock import patch
+  import verification_process_supervisor as supervisor
+  env=project_execution_environment({**os.environ,'CODEX_TOOL_CALL_ID':'transport'},contract=V2);digest=project_environment_fingerprint(env,contract=V2);original=supervisor.subprocess.Popen;captured=[]
+  def launch(*args,**kwargs):
+   actual=kwargs['env'];self.assertNotIn('CODEX_TOOL_CALL_ID',actual);self.assertEqual(dict(actual),dict(env))
+   with self.assertRaises(TypeError):actual['UNSAFE_MUTATION']='x'
+   captured.append(kwargs['cwd']);return original(*args,**kwargs)
+  with tempfile.TemporaryDirectory() as d,patch.object(supervisor.subprocess,'Popen',side_effect=launch):
+   r=supervisor.run_supervised([shutil.which('node'),'-e',"if(process.env.CODEX_TOOL_CALL_ID!==undefined)process.exit(41)"],Path(d),base_env=env,timeout_seconds=10,expected_project_environment_digest=digest)
+   self.assertEqual(r.returncode,0,r.stdout);self.assertEqual(r.project_execution_environment['environmentDigest'],digest);self.assertEqual(r.project_execution_environment['origin'],'NATIVE_POPEN_CHILD_MAPPING');self.assertEqual(captured,[str(Path(d))]);self.assertEqual(r.supervision.descendants_remaining,0)
+ def test_actual_env_mismatch_and_inherited_transport_refuse_before_popen(self):
+  from unittest.mock import patch
+  import verification_process_supervisor as supervisor
+  env=project_execution_environment(os.environ,contract=V2);digest=project_environment_fingerprint(env,contract=V2)
+  for extra in [{'DEPLOOM_UNEXPECTED_SEMANTIC':'changed'},{'CODEX_TOOL_CALL_ID':'leaked'}]:
+   with tempfile.TemporaryDirectory() as d,patch.object(supervisor.subprocess,'Popen') as launch:
+    with self.subTest(extra=extra),self.assertRaises(supervisor.ProcessSupervisionError):supervisor.run_supervised([shutil.which('node'),'-e','process.exit(0)'],Path(d),base_env={**env,**extra},timeout_seconds=10,expected_project_environment_digest=digest)
+    launch.assert_not_called()
+ def test_owned_timeout_retains_native_environment_observation(self):
+  from verification_process_supervisor import run_supervised
+  env=project_execution_environment(os.environ,contract=V2);digest=project_environment_fingerprint(env,contract=V2)
+  with tempfile.TemporaryDirectory() as d:
+   with self.assertRaises(subprocess.TimeoutExpired) as caught:run_supervised([shutil.which('node'),'-e','setInterval(()=>{},1000)'],Path(d),base_env=env,timeout_seconds=1,expected_project_environment_digest=digest)
+  self.assertEqual(caught.exception.project_execution_environment['environmentDigest'],digest);self.assertEqual(caught.exception.supervision.descendants_remaining,0)
+
 if __name__=='__main__':unittest.main()

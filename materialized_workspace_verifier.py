@@ -106,14 +106,23 @@ def verify_current_workspace(project_dir, *, expected_source_key, dependency_pla
     if _sha(lock)!=dependency_plan['approvedLockSha256']:fail('CURRENT_WORKSPACE_APPROVED_LOCK_MISMATCH')
     def run(argv,label,command_index=None):
         started=time.monotonic()
+        launch_options={}
+        if environment_contract=='HOST_OWNED_PROJECT_EXECUTION_ENV_V1':
+            launch_options['expected_project_environment_digest']=project_environment_fingerprint(env,contract=environment_contract)
         x=run_supervised(argv,project,timeout_seconds=remaining(),base_env=env,
-            progress_label=label,max_output_bytes=65536)
+            progress_label=label,max_output_bytes=65536,**launch_options)
         s=getattr(x,'supervision',None)
         operations.append({'operation':'strict-frozen-install' if command_index is None else 'project-command',
             'commandIndex':command_index,'argvDigest':_digest(argv),'elapsedStartMs':int((started-operation_started)*1000),
             'durationMs':int((time.monotonic()-started)*1000),'returnCode':x.returncode,
             'supervision':getattr(s,'quality',None),'descendantsRemaining':getattr(s,'descendants_remaining',None),
             'timedOut':bool(getattr(x,'timed_out',False)),'cancelled':bool(getattr(x,'cancelled',False))})
+        if launch_options:
+            from project_execution_environment import native_launch_observation_matches
+            launch=getattr(x,'project_execution_environment',None)
+            if not native_launch_observation_matches(launch,launch_options['expected_project_environment_digest'],_digest(str(project))):
+                fail('CURRENT_WORKSPACE_ACTUAL_ENVIRONMENT_UNPROVEN')
+            operations[-1]['projectExecutionEnvironment']=dict(launch)
         remaining()
         if (getattr(s,'quality',None)!='guaranteed-tree'
                 or getattr(s,'descendants_remaining',None)!=0

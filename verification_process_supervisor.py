@@ -479,6 +479,7 @@ def run_supervised(
     progress_interval_seconds: int = 15,
     output_observer: Optional[OutputObserver] = None,
     max_output_bytes: int = 1024 * 1024,
+    expected_project_environment_digest: Optional[str] = None,
 ) -> subprocess.CompletedProcess[str]:
     merged_env = dict(base_env) if base_env is not None else os.environ.copy()
     if env:
@@ -514,6 +515,14 @@ def run_supervised(
     launch_args: str | list[str] = list(argv)
     if os.name == "nt" and len(argv) >= 3 and Path(argv[0]).name.lower() in {"cmd", "cmd.exe"} and str(argv[-2]).lower() == "/c":
         launch_args = subprocess.list2cmdline(list(argv[:-1])) + ' "' + str(argv[-1]) + '"'
+    launch_environment=None
+    if expected_project_environment_digest is not None:
+        from types import MappingProxyType
+        from project_execution_environment import (native_launch_environment_observation,ProjectExecutionEnvironmentError)
+        # This exact immutable mapping is passed to Popen, after UNC/token adaptation.
+        popen_kwargs['env']=MappingProxyType(dict(popen_kwargs['env']))
+        try:launch_environment=native_launch_environment_observation(popen_kwargs['env'],launch_cwd,expected_project_environment_digest)
+        except ProjectExecutionEnvironmentError as exc:raise ProcessSupervisionError(str(exc)) from exc
     process: subprocess.Popen[str] = subprocess.Popen(launch_args, **popen_kwargs)
     # A handful of historical unit tests use minimal Popen doubles. Keep that
     # seam without weakening production: real subprocess.Popen always exposes
@@ -664,11 +673,13 @@ def run_supervised(
         if timed_out:
             exc = subprocess.TimeoutExpired(list(argv), timeout_seconds, output=output)
             setattr(exc, "supervision", metadata)
+            if launch_environment is not None:setattr(exc, 'project_execution_environment', launch_environment)
             raise exc
         completed = subprocess.CompletedProcess(
             list(argv), return_code, stdout=output, stderr=None
         )
         setattr(completed, "supervision", metadata)
+        if launch_environment is not None:setattr(completed, 'project_execution_environment', launch_environment)
         setattr(completed, "captured_bytes", captured_bytes)
         setattr(completed, "dropped_bytes", dropped_bytes)
         setattr(completed, "output_truncated", truncated)

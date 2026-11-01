@@ -67,3 +67,23 @@ def project_environment_observation(actual_environment,*,contract=LEGACY):
         'environmentDigest':project_environment_fingerprint(actual_environment,contract=contract),
         'removedTransportNames':[TRANSPORT_KEY],'transportValueForwarded':False,
         'arbitraryDescendantEnvironmentClosureVerified':False}
+
+
+def native_launch_environment_observation(actual_environment,cwd,expected_digest):
+    """Called on immutable actual Popen kwargs after native launch adaptation."""
+    import re
+    from pathlib import Path
+    if not isinstance(expected_digest,str) or re.fullmatch('[0-9a-f]{32}',expected_digest) is None:
+        raise ProjectExecutionEnvironmentError('PROJECT_EXPECTED_ENVIRONMENT_INVALID')
+    observed=project_environment_fingerprint(actual_environment,contract=V2)
+    if observed!=expected_digest:raise ProjectExecutionEnvironmentError('PROJECT_ACTUAL_LAUNCH_ENVIRONMENT_MISMATCH')
+    cwd_digest=hashlib.sha256(json.dumps(str(Path(cwd).resolve()),ensure_ascii=False,separators=(',',':')).encode()).hexdigest()
+    return {'schemaVersion':2,'contract':V2,'origin':'NATIVE_POPEN_CHILD_MAPPING',
+        'environmentDigest':observed,'cwdDigest':cwd_digest,'transportValueForwarded':False}
+
+
+def native_launch_observation_matches(row,environment_digest,cwd_digest):
+    return (isinstance(row,dict) and set(row)=={'schemaVersion','contract','origin','environmentDigest','cwdDigest','transportValueForwarded'}
+        and type(row['schemaVersion']) is int and row['schemaVersion']==2 and row['contract']==V2
+        and row['origin']=='NATIVE_POPEN_CHILD_MAPPING' and row['environmentDigest']==environment_digest
+        and row['cwdDigest']==cwd_digest and row['transportValueForwarded'] is False)
