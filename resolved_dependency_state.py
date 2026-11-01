@@ -329,6 +329,15 @@ def _obligation_json(raw, limit=8*1024*1024):
         raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_JSON_UNPROVEN') from exc
 
 
+def _ordinary_npm_obligation_mode(record):
+    for key in ('link', 'inBundle'):
+        if key in record and (type(record[key]) is not bool or record[key]):
+            raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_BUNDLE_OR_LINK_UNSUPPORTED')
+    for key in ('bundleDependencies', 'bundledDependencies'):
+        if key in record and not (record[key] is False or type(record[key]) is list and not record[key]):
+            raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_BUNDLED_UNSUPPORTED')
+
+
 def _npm_obligation_name(location, record):
     import re
     segment = r'(?:@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*'
@@ -375,6 +384,7 @@ def compile_npm_dependency_obligations(baseline_lock_bytes, candidate_lock_bytes
                 or len({name.casefold() for name in graph}) != len(graph)):
             raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_GRAPH_UNPROVEN')
         for location, row in graph.items():
+            _ordinary_npm_obligation_mode(row)
             if location:
                 _npm_obligation_name(location, row)
         graphs.append(graph)
@@ -441,6 +451,7 @@ def observe_npm_dependency_obligations(project_dir, plan, *, source_origin_diges
     if not lock.is_file() or _sha256_bytes(lock.read_bytes()) != plan['approvedLockSha256']:
         raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_LOCK_DRIFT')
     manifest = _obligation_json((project / 'package.json').read_bytes(), 1024*1024)
+    _ordinary_npm_obligation_mode(manifest)
     if {key: manifest.get(key, {}) for key in plan['rootDeclarations']} != plan['rootDeclarations']:
         raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_MANIFEST_DRIFT')
     expected = {row['path']: row for row in plan['instances']}
@@ -482,6 +493,7 @@ def observe_npm_dependency_obligations(project_dir, plan, *, source_origin_diges
                 if manifest_bytes_read > 64*1024*1024:
                     raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_MANIFEST_BUDGET_LIMIT')
                 value = _obligation_json(raw, 1024*1024)
+                _ordinary_npm_obligation_mode(value)
                 actual[relative] = (value, _sha256_bytes(raw))
                 scan_modules(package / 'node_modules', relative, depth+1)
     scan_modules(project / 'node_modules')
@@ -517,7 +529,10 @@ def observe_npm_dependency_obligations(project_dir, plan, *, source_origin_diges
             matched = NpmSpec(spec).match(Version(actual[destination][0]['version']))
         except (ValueError, KeyError) as exc:
             raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_EDGE_UNPROVEN') from exc
-        if not matched or (wanted_name and actual[destination][0].get('name') != wanted_name):
+        expected_name = wanted_name if wanted_name is not None else name
+        if actual[destination][0].get('name') != expected_name:
+            raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_EDGE_IDENTITY_MISMATCH')
+        if not matched:
             raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_EDGE_MISMATCH')
         edges.append({'source': source, 'name': name, 'destination': destination, 'peer': peer, 'specifier': spec})
     for location, wanted in expected.items():

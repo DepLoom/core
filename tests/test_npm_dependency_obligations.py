@@ -49,6 +49,25 @@ class NpmDependencyObligationTests(unittest.TestCase):
         for lock in (self.before,self.after):
             lock['packages']['']['dependencies']['alias']='npm:leaf@^1.0.0';lock['packages']['node_modules/alias']={'name':'leaf','version':'1.0.0'}
         self.prepare();self.assertEqual(self.observe()['instanceCount'],4)
+    def test_ordinary_edge_cannot_borrow_implicit_alias_identity(self):
+        for lock in (self.before,self.after):lock['packages']['node_modules/held']['name']='unrelated'
+        self.prepare()
+        with self.assertRaisesRegex(MaterializedDependencyObligationError,'EDGE_IDENTITY_MISMATCH'):self.observe()
+    def test_bundled_lock_mode_is_not_an_ordinary_physical_obligation(self):
+        for value in [True,1,'true']:
+            old=copy.deepcopy(self.before);new=copy.deepcopy(self.after)
+            for lock in (old,new):lock['packages']['node_modules/held']['inBundle']=value
+            with self.subTest(value=value),self.assertRaisesRegex(MaterializedDependencyObligationError,'BUNDLE_OR_LINK_UNSUPPORTED'):
+                compile_npm_dependency_obligations(json.dumps(old).encode(),json.dumps(new).encode(),exact_targets={'target':'2.0.0'},changed_instances=['node_modules/target'],delta_digest='a'*64,scope_digest='b'*64)
+    def test_bundle_and_invalid_link_metadata_are_rejected_in_lock_or_physical_manifest(self):
+        for key,value in [('link',1),('bundleDependencies',['leaf']),('bundledDependencies',True)]:
+            old=copy.deepcopy(self.before);new=copy.deepcopy(self.after)
+            for lock in (old,new):lock['packages']['node_modules/held'][key]=value
+            with self.subTest(key=key),self.assertRaises(MaterializedDependencyObligationError):
+                compile_npm_dependency_obligations(json.dumps(old).encode(),json.dumps(new).encode(),exact_targets={'target':'2.0.0'},changed_instances=['node_modules/target'],delta_digest='a'*64,scope_digest='b'*64)
+        self.prepare();p=self.root/'node_modules/held/package.json';value=json.loads(p.read_text());value['bundledDependencies']=['leaf'];p.write_text(json.dumps(value))
+        with self.assertRaisesRegex(MaterializedDependencyObligationError,'BUNDLED_UNSUPPORTED'):self.observe()
+
     def test_metadata_and_lock_drift_fail_closed(self):
         self.prepare();p=self.root/'node_modules/target/package.json';old=p.read_text();x=json.loads(old);x['dependencies']['leaf']='^2.0.0';p.write_text(json.dumps(x))
         with self.assertRaisesRegex(MaterializedDependencyObligationError,'METADATA_UNPROVEN'):self.observe()
