@@ -432,6 +432,33 @@ def compile_npm_dependency_obligations(baseline_lock_bytes, candidate_lock_bytes
     return {**plan, 'obligationPlanDigest': _canonical_hash(plan)}
 
 
+def npm_root_assignment_from_obligations(plan):
+    """Declared roots only; hoisted transitive instances stay in physical scope."""
+    if (not isinstance(plan,dict) or plan.get('obligationPlanDigest')!=_canonical_hash(
+            {k:v for k,v in plan.items() if k!='obligationPlanDigest'})):
+        raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_PLAN_UNPROVEN')
+    declarations=plan.get('rootDeclarations');instances=plan.get('instances')
+    if not isinstance(declarations,dict) or not isinstance(instances,list):
+        raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_ROOT_UNPROVEN')
+    names=set()
+    for section in ('dependencies','devDependencies','optionalDependencies','peerDependencies'):
+        rows=declarations.get(section,{})
+        if not isinstance(rows,dict):
+            raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_ROOT_UNPROVEN')
+        for name in rows:
+            if not isinstance(name,str) or _npm_obligation_name('node_modules/'+name,{'version':'0.0.0'})[0]!=name:
+                raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_ROOT_UNPROVEN')
+            names.add(name)
+    by_path={row['path']:row for row in instances}
+    result={}
+    for name in sorted(names):
+        row=by_path.get('node_modules/'+name)
+        if not row or row.get('installName')!=name:
+            raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_DECLARED_ROOT_INSTANCE_UNPROVEN')
+        result[name]=row['version']
+    return result
+
+
 def observe_npm_dependency_obligations(project_dir, plan, *, source_origin_digest, resolved_state_key, deadline=None):
     """Observe actual physical instance manifests and supported Node edge paths.
 

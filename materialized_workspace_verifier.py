@@ -21,7 +21,7 @@ import uuid
 from source_snapshot import (verification_source_snapshot_scope,
     validate_source_snapshot, source_snapshot_live_source_continuity)
 from resolved_dependency_state import (capture_resolved_dependency_state,
-    observe_npm_dependency_obligations)
+    observe_npm_dependency_obligations,npm_root_assignment_from_obligations)
 from verification_process_supervisor import run_supervised
 from verification_stage_checkpoint import pinned_inline_node_invocation
 from verification_proof import environment_snapshot_fingerprint
@@ -127,8 +127,7 @@ def verify_current_workspace(project_dir, *, expected_source_key, dependency_pla
             if install.returncode!=0:fail('CURRENT_WORKSPACE_INSTALL_NOT_VERIFIED')
             installation={'status':'FRESH_COLD_FROZEN_INSTALL_OBSERVED','scriptsEnabled':False,
                 'supervision':'guaranteed-tree','stdoutDigest':_sha((install.stdout or '').encode())}
-        roots={row['installName']:row['version'] for row in dependency_plan['instances']
-            if row['path']=='node_modules/'+row['installName']}
+        roots=npm_root_assignment_from_obligations(dependency_plan)
         observed=observed_resolved_assignment(project,roots)
         state=capture_resolved_dependency_state(project,manager='npm',
             resolver_input_key=_digest({'sourceKey':snapshot.key,'plan':dependency_plan['obligationPlanDigest'],
