@@ -1880,8 +1880,8 @@ def source_snapshot_fingerprint(project_dir: Path, *, remaining_budget: Optional
     if remaining_budget is not None:
         if not callable(remaining_budget):raise SourceCaptureError("SOURCE_MATERIALIZATION_TIMEOUT_INVALID")
         remaining_budget()
-    snapshot = active_source_snapshot(project_dir)
-    if snapshot is not None and remaining_budget is None:
+    snapshot = active_source_snapshot(project_dir) if remaining_budget is None else None
+    if snapshot is not None:
         return validate_source_snapshot(snapshot).key
     root, relative, _head = _subject_layout(project_dir)
     from scoped_source_policy import policy_for_project

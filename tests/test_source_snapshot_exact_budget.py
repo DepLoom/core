@@ -58,7 +58,7 @@ class ExactSourceBudgetTests(unittest.TestCase):
         self.assertLessEqual(manifest.call_args.kwargs['timeout_seconds'],5)
 
     def test_budgeted_live_fingerprint_never_borrows_active_sealed_snapshot(self):
-        with patch.object(core,'active_source_snapshot',return_value=object()), \
+        with patch.object(core,'active_source_snapshot',side_effect=AssertionError('no sealed fast-path lookup in live proof')), \
              patch.object(core,'validate_source_snapshot',side_effect=AssertionError('must read live bytes')):
             key=core.source_snapshot_fingerprint(self.root,remaining_budget=lambda:5.)
         self.assertEqual(len(key),32)
