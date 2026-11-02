@@ -1569,11 +1569,41 @@ def source_snapshot_live_source_continuity(
             and _drain_watcher(watcher, live_root)
         )
         if not delivery_and_identity_ok:
+            # Diagnostic facts only: never rescan/re-arm to recover this lost
+            # interval. Invalidation must keep the existing fail-closed verdict.
+            error_kinds = sorted({
+                "OVERFLOW" if "overflow" in error.lower()
+                else "ARM" if "arm failed" in error.lower()
+                else "DELIVERY" if "GetOverlappedResult" in error
+                else "WATCHER_ERROR" for error in watcher.errors
+            })
+            root_matches = (sealed_root_identity is not None
+                and _tree_object_identity(live_root) == sealed_root_identity)
+            project_matches = (sealed_project_identity is not None
+                and _tree_object_identity(live_project) == sealed_project_identity)
+            thread_alive = bool(thread is not None and thread.is_alive())
+            reason = ("OVERFLOW" if "OVERFLOW" in error_kinds
+                else "IDENTITY" if not root_matches or not project_matches
+                else "THREAD" if not thread_alive
+                else "DELIVERY" if error_kinds else "DRAIN")
+            delivered = list(watcher.events)
             emit_observability_event(
                 "source.snapshot.live-continuity",
                 snapshotKey=snapshot.key,
                 outcome="watcher-invalidated",
                 authority="SOURCE_TRUTH_GUARD",
+                phase="LIVE_SOURCE_CONTINUITY_BOUNDARY",
+                generation=str(snapshot.created_at),
+                watchedRootsCount=1,
+                deliveredEventCount=len(delivered),
+                relevantEventCount=len(_content_relevant_events(delivered)),
+                failureReason=reason,
+                watcherErrorKinds=error_kinds,
+                rootIdentityMatches=root_matches,
+                projectIdentityMatches=project_matches,
+                watcherThreadAlive=thread_alive,
+                finalManifestComparison="NOT_RUN_INTERVAL_UNPROVEN",
+                continuityRestored=False,
             )
             _retire_live_source_watcher(snapshot)
             return False
