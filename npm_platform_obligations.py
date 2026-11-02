@@ -22,10 +22,22 @@ def _object(raw):
  if not isinstance(value,dict):_fail('JSON_UNPROVEN')
  return value
 
+def total_archive_budget(rules):
+ limits=rules.get('resourceLimits')
+ if limits is None:
+  if 'resourceLimits' in rules:_fail('RESOURCE_LIMIT_SCHEMA')
+  return 128*1024*1024
+ if (not isinstance(limits,dict) or set(limits)!={'maxTotalArchiveBytes'}
+   or type(limits['maxTotalArchiveBytes']) is not int
+   or not 128*1024*1024<=limits['maxTotalArchiveBytes']<=256*1024*1024):_fail('RESOURCE_LIMIT_SCHEMA')
+ return limits['maxTotalArchiveBytes']
+
+
 def validate_rules_shape(rules):
- if (not isinstance(rules,dict) or set(rules)!={'schemaVersion','kind','host','artifacts'}
+ if (not isinstance(rules,dict) or set(rules) not in ({'schemaVersion','kind','host','artifacts'},{'schemaVersion','kind','host','artifacts','resourceLimits'})
    or type(rules['schemaVersion']) is not int or rules['schemaVersion']!=1
    or rules['kind'] not in {'NPM_V3_SRI_PLATFORM_ABSENCE_V1','NPM_V2_SRI_PLATFORM_ABSENCE_V1'}):_fail('RULE_SCHEMA')
+ total_archive_budget(rules)
  host=rules['host']
  if (not isinstance(host,dict) or set(host)!={'platform','arch','nodeSha256'}
    or host['platform']!='win32' or host['arch'] not in ('x64','ia32','arm64')
@@ -157,7 +169,7 @@ def verify_platform_absence(lock,rules):
   if url.scheme!='https' or not url.hostname or url.username or url.password or url.query or url.fragment:_fail('RESOLVED_UNPROVEN')
   if version==2:_v2_view_record(lock,location,row)
   manifest,artifact,size=_archive(evidence['archivePath'],row,canonical);total+=size
-  if total>134217728:_fail('TOTAL_ARCHIVE_LIMIT')
+  if total>total_archive_budget(rules):_fail('TOTAL_ARCHIVE_LIMIT')
   os_ok=_selectors(manifest.get('os'),host['platform']);cpu_ok=_selectors(manifest.get('cpu'),host['arch'])
   _selectors(manifest.get('libc'),'windows-libc-not-applicable')
   if os_ok and cpu_ok:_fail('HOST_APPLICABLE')

@@ -1,4 +1,4 @@
-﻿import unittest,tempfile,json,hashlib,tarfile,io,base64,copy
+import unittest,tempfile,json,hashlib,tarfile,io,base64,copy
 from pathlib import Path
 from npm_platform_obligations import observe_node_host,verify_platform_absence,NpmPlatformEvidenceError
 from resolved_dependency_state import compile_npm_dependency_obligations,observe_npm_dependency_obligations,MaterializedDependencyObligationError
@@ -70,4 +70,22 @@ class PlatformAbsenceTests(unittest.TestCase):
   plan=self.compile();self.physical();self.assertEqual(self.observe(plan)['instanceCount'],2)
  def test_negative_platform_selectors(self):
   self.manifest.update(os=['!win32'],cpu=[self.host['arch']]);self.make_archive();self.lock['packages']['node_modules/foreign'].update(os=['!win32'],cpu=[self.host['arch']],integrity=self.sri);self.compile()
+ def test_explicit_total_archive_budget_is_bounded_and_bound_in_plan(self):
+  from npm_platform_obligations import total_archive_budget
+  self.assertEqual(total_archive_budget(self.rules),128*1024*1024)
+  self.rules['resourceLimits']={'maxTotalArchiveBytes':256*1024*1024}
+  self.assertEqual(total_archive_budget(self.rules),256*1024*1024)
+  self.assertEqual(self.compile()['optionalAbsenceRules']['resourceLimits'],self.rules['resourceLimits'])
+ def test_resource_limit_boolean_null_unknown_or_excessive_rejected(self):
+  from npm_platform_obligations import validate_rules_shape
+  for limit in [None,{},True,{'maxTotalArchiveBytes':True},{'maxTotalArchiveBytes':128*1024*1024-1},{'maxTotalArchiveBytes':256*1024*1024+1},{'maxTotalArchiveBytes':256*1024*1024,'skipSRI':True}]:
+   self.rules['resourceLimits']=limit
+   with self.subTest(limit=limit),self.assertRaisesRegex(NpmPlatformEvidenceError,'RESOURCE_LIMIT_SCHEMA'):validate_rules_shape(self.rules)
+ def test_aggregate_archive_budget_boundary_remains_fail_closed(self):
+  from unittest.mock import patch
+  size=self.archive.stat().st_size
+  # Reduce the budget only at this unit cutpoint; actual archive/SRI are real.
+  with patch('npm_platform_obligations.total_archive_budget',return_value=size-1):
+   with self.assertRaisesRegex(MaterializedDependencyObligationError,'TOTAL_ARCHIVE_LIMIT'):self.compile()
+  with patch('npm_platform_obligations.total_archive_budget',return_value=size):self.compile()
 if __name__=='__main__':unittest.main()
