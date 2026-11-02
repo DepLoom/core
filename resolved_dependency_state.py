@@ -340,7 +340,9 @@ def _ordinary_npm_obligation_mode(record, *, bundle_verified=False):
 
 def _npm_obligation_name(location, record):
     import re
-    segment = r'(?:@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*'
+    # Historical npm records can contain ASCII capitals. Preserve exact case;
+    # graph/physical casefold collision checks remain independently mandatory.
+    segment = r'(?:@[A-Za-z0-9][A-Za-z0-9._-]*/)?[A-Za-z0-9][A-Za-z0-9._-]*'
     if (not isinstance(location, str)
             or re.fullmatch(r'node_modules/'+segment+r'(?:/node_modules/'+segment+r')*', location) is None):
         raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_PATH_UNPROVEN')
@@ -401,6 +403,13 @@ def compile_npm_dependency_obligations(baseline_lock_bytes, candidate_lock_bytes
                 _npm_obligation_name(location, row)
         graphs.append(graph)
     old, new = graphs
+    # Lexical historical compatibility is not permission for a new or changed
+    # mixed-case instance. Only exact original records retain that identity.
+    for location, row in new.items():
+        if not location:continue
+        alias, name = _npm_obligation_name(location, row)
+        if any(c.isupper() for c in alias + name) and old.get(location) != row:
+            raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_HISTORICAL_INSTANCE_CHANGED')
     changed = {name for name in set(old) | set(new) if name and old.get(name) != new.get(name)}
     if (not isinstance(changed_instances, (list, tuple))
             or any(not isinstance(name, str) for name in changed_instances)

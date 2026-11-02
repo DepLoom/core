@@ -78,7 +78,7 @@ def _selectors(raw,actual):
 
 def _parent(location):return location.rpartition('/node_modules/')[0] if '/node_modules/' in location else ''
 def _resolve(graph,location,name,peer=False):
- if re.fullmatch(r'(?:@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*',name) is None:_fail('EDGE_NAME')
+ if re.fullmatch(r'(?:@[A-Za-z0-9][A-Za-z0-9._-]*/)?[A-Za-z0-9][A-Za-z0-9._-]*',name) is None:_fail('EDGE_NAME')
  base=_parent(location) if peer else location
  while True:
   target=(base+'/' if base else '')+'node_modules/'+name
@@ -115,7 +115,7 @@ def _v2_view_record(lock,location,record,*,allow_bundled=False):
  parts=location.split('/node_modules/');parts[0]=parts[0].removeprefix('node_modules/')
  tree=lock.get('dependencies');other=None
  for name in parts:
-  if re.fullmatch(r'(?:@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*',name) is None:_fail('V2_INSTANCE_PATH')
+  if re.fullmatch(r'(?:@[A-Za-z0-9][A-Za-z0-9._-]*/)?[A-Za-z0-9][A-Za-z0-9._-]*',name) is None:_fail('V2_INSTANCE_PATH')
   if not isinstance(tree,dict) or not isinstance(tree.get(name),dict):_fail('V2_VIEW_MISSING')
   other=tree[name];tree=other.get('dependencies',{})
  for key in ('version','resolved','integrity','optional','dev','devOptional'):
@@ -129,16 +129,17 @@ def _v2_view_record(lock,location,record,*,allow_bundled=False):
  if {**record.get('dependencies',{}),**record.get('optionalDependencies',{})}!=other.get('requires',{}):_fail('V2_VIEW_REQUIREMENTS_MISMATCH')
 
 def _v2_consistent_graph(lock):
- graph=lock.get('packages');tree=lock.get('dependencies');seen=set();pending=[('',tree)]
+ graph=lock.get('packages');tree=lock.get('dependencies');seen=set();folded=set();pending=[('',tree)]
  if not isinstance(graph,dict) or '' not in graph:_fail('V2_VIEW_MISSING')
+ if len({n.casefold() for n in graph if isinstance(n,str)})!=len(graph):_fail('V2_VIEW_MISMATCH')
  while pending:
   base,children=pending.pop()
   if not isinstance(children,dict):_fail('V2_VIEW_MISMATCH')
   for name,row in children.items():
-   if not isinstance(name,str) or re.fullmatch(r'(?:@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*',name) is None or not isinstance(row,dict):_fail('V2_VIEW_MISMATCH')
+   if not isinstance(name,str) or re.fullmatch(r'(?:@[A-Za-z0-9][A-Za-z0-9._-]*/)?[A-Za-z0-9][A-Za-z0-9._-]*',name) is None or not isinstance(row,dict):_fail('V2_VIEW_MISMATCH')
    path=(base+'/' if base else '')+'node_modules/'+name
-   if path in seen or len(seen)>=10000:_fail('V2_VIEW_MISMATCH')
-   seen.add(path);pending.append((path,row.get('dependencies',{})))
+   if path in seen or path.casefold() in folded or len(seen)>=10000:_fail('V2_VIEW_MISMATCH')
+   seen.add(path);folded.add(path.casefold());pending.append((path,row.get('dependencies',{})))
  expected=set(graph)-{''}
  if expected-seen:_fail('V2_VIEW_MISSING')
  if seen-expected:_fail('V2_VIEW_MISMATCH')
