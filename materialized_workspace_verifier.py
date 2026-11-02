@@ -42,7 +42,7 @@ def _sha(raw):
 
 def verify_current_workspace(project_dir, *, expected_source_key, dependency_plan,
         commands, cache_dir, deadline, final_profile_digest, environment=None, materialize=False,
-        environment_contract='LEGACY_INHERITED_ENV_V1', trusted_pre_popen_guard=None):
+        environment_contract='LEGACY_INHERITED_ENV_V1', trusted_pre_popen_guard=None, command_cache_directories=None):
     """Freshly check THIS authorized workspace; optional cold-only npm-ci.
 
     No caller-provided evidence, reusable command PASS or previous prepared tree
@@ -98,6 +98,9 @@ def verify_current_workspace(project_dir, *, expected_source_key, dependency_pla
         fail('CURRENT_WORKSPACE_ENVIRONMENT_BOUNDARY_UNSUPPORTED')
     env=workspace_execution_environment(os.environ if environment is None else environment,cache,
         contract=environment_contract)
+    from project_execution_environment import command_cache_environments
+    command_envs=command_cache_environments(env,command_cache_directories,len(commands),
+        contract=environment_contract,guarded=trusted_pre_popen_guard is not None)
     if any(str(env.get(k,'')).strip() for k in ('NODE_OPTIONS','NODE_PATH')):
         fail('CURRENT_WORKSPACE_EXTERNAL_NODE_LOADER_UNPROVEN')
     node=shutil.which('node',path=env.get('PATH'));npm=Path(node).parent/'node_modules/npm/bin/npm-cli.js' if node else None
@@ -108,16 +111,16 @@ def verify_current_workspace(project_dir, *, expected_source_key, dependency_pla
     def run(argv,label,command_index=None):
         nonlocal failed_command_diagnostic
         failed_command_diagnostic=None
-        started=time.monotonic()
+        started=time.monotonic();actual_env=command_envs.get(command_index,env)
         launch_options={}
         if environment_contract=='HOST_OWNED_PROJECT_EXECUTION_ENV_V1':
-            launch_options['expected_project_environment_digest']=project_environment_fingerprint(env,contract=environment_contract)
+            launch_options['expected_project_environment_digest']=project_environment_fingerprint(actual_env,contract=environment_contract)
         if trusted_pre_popen_guard is not None:
             launch_options.update(trusted_pre_popen_guard=trusted_pre_popen_guard,
                 trusted_pre_popen_context={'invocationId':invocation_id,'operation':'strict-frozen-install' if command_index is None else 'project-command',
                     'commandIndex':command_index,'sealedCommandHash':None if command_index is None else _sha(commands[command_index-1].encode()),
                     'profileDigest':final_profile_digest,'argvDigest':_digest(argv)})
-        x=run_supervised(argv,project,timeout_seconds=remaining(),base_env=env,
+        x=run_supervised(argv,project,timeout_seconds=remaining(),base_env=actual_env,
             progress_label=label,max_output_bytes=65536,**launch_options)
         if command_index is not None and x.returncode!=0:
             failed_command_diagnostic={'commandIndex':command_index,'returnCode':x.returncode,
@@ -221,6 +224,7 @@ def verify_current_workspace(project_dir, *, expected_source_key, dependency_pla
     result['ownedCleanupConfirmed']=True
     result['auxiliaryDirectoryObservations']=auxiliary_observations
     result['arbitraryFilesystemSemanticsVerified']=False
+    if command_envs:result['commandEnvironmentDigests']={str(i):project_environment_fingerprint(e,contract=environment_contract) for i,e in command_envs.items()}
     result['ownerOperationObservations']=operations
     result['ownerElapsedMs']=int((time.monotonic()-operation_started)*1000)
     return result

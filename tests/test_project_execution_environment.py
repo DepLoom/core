@@ -131,4 +131,18 @@ class NativeLaunchBoundaryTests(unittest.TestCase):
    with self.assertRaises(subprocess.TimeoutExpired) as caught:run_supervised([shutil.which('node'),'-e','setInterval(()=>{},1000)'],Path(d),base_env=env,timeout_seconds=1,expected_project_environment_digest=digest)
   self.assertEqual(caught.exception.project_execution_environment['environmentDigest'],digest);self.assertEqual(caught.exception.supervision.descendants_remaining,0)
 
+class CommandCacheScopeTests(unittest.TestCase):
+ def test_mapping_is_narrow_immutable_and_does_not_change_base(self):
+  from project_execution_environment import command_cache_environments
+  base=project_execution_environment({'PATH':'x'},contract=V2);path=str(Path.cwd()/'owned-cache')
+  selected=command_cache_environments(base,{2:path},3,contract=V2,guarded=True)
+  self.assertNotIn('CACHE_DIR',base);self.assertEqual(set(selected),{2});self.assertEqual(selected[2]['CACHE_DIR'],path)
+  with self.assertRaises(TypeError):selected[2]['CACHE_DIR']='bad'
+  self.assertEqual(command_cache_environments(base,None,3,contract=V2,guarded=False),{})
+ def test_json_scope_ambient_and_invalid_index_fail_closed(self):
+  from project_execution_environment import command_cache_environments,ProjectExecutionEnvironmentError
+  base=project_execution_environment({},contract=V2);path=str(Path.cwd()/'owned-cache')
+  for mapping,contract,guarded,env in [({True:path},V2,True,base),({0:path},V2,True,base),({4:path},V2,True,base),({1:'true'},V2,True,base),({},V2,True,base),({1:path},LEGACY,True,base),({1:path},V2,False,base),({1:path},V2,True,{'CACHE_DIR':'ambient'})]:
+   with self.subTest(mapping=mapping,contract=contract,guarded=guarded),self.assertRaises(ProjectExecutionEnvironmentError):command_cache_environments(env,mapping,3,contract=contract,guarded=guarded)
+
 if __name__=='__main__':unittest.main()

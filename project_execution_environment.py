@@ -47,6 +47,22 @@ def workspace_execution_environment(host_environment,cache_dir,*,contract=LEGACY
     return project_execution_environment(host_environment,contract=contract,overrides=overrides)
 
 
+def command_cache_environments(base, directories, command_count, *, contract, guarded):
+    """Narrow code-owned per-command cache mapping; no ambient mutation."""
+    if directories is None:return {}
+    from pathlib import Path
+    if (contract!=V2 or guarded is not True or not isinstance(directories,dict) or not directories
+            or 'CACHE_DIR' in base):
+        raise ProjectExecutionEnvironmentError('PROJECT_COMMAND_CACHE_SCOPE_UNPROVEN')
+    result={}
+    for index,path in directories.items():
+        if (type(index) is not int or not 1<=index<=command_count or not isinstance(path,str)
+                or not Path(path).is_absolute() or str(Path(path).absolute())!=path):
+            raise ProjectExecutionEnvironmentError('PROJECT_COMMAND_CACHE_SCOPE_UNPROVEN')
+        result[index]=project_execution_environment(base,contract=V2,overrides={'CACHE_DIR':path})
+    return result
+
+
 def project_environment_fingerprint(actual_environment,*,contract=LEGACY):
     if contract==LEGACY:
         from verification_proof import environment_snapshot_fingerprint
