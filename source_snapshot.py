@@ -95,14 +95,16 @@ class SourceInputPolicy:
     excluded_relative_paths: tuple[str, ...] = ()
     frontend_build_output_paths: tuple[str, ...] = ()
     frontend_profile: bool = False
+    generated_output_profile: str = ""
 
     @functools.cached_property
     def excluded_path_set(self):
-        return frozenset((*self.excluded_relative_paths, *self.frontend_build_output_paths))
+        return frozenset((*self.excluded_relative_paths, *self.frontend_build_output_paths,
+            *(("dist", ".tap") if self.generated_output_profile else ())))
 
     @property
     def key(self) -> str:
-        if self.scope_roots or self.excluded_relative_paths or self.frontend_build_output_paths or self.frontend_profile:
+        if self.scope_roots or self.excluded_relative_paths or self.frontend_build_output_paths or self.frontend_profile or self.generated_output_profile:
             from scoped_source_policy import policy_payload
             return _canonical_hash({"schema": SOURCE_INPUT_POLICY_SCHEMA, "scope": policy_payload(self),
                                     "legacyPolicy": SourceInputPolicy(self.excluded_dir_names, self.excluded_file_names).key}, length=64)
@@ -762,7 +764,7 @@ def _remove_ephemeral_git_admin_files(root: Path) -> int:
 def _excluded(relative: Path, policy: SourceInputPolicy) -> bool:
     if _is_ephemeral_git_admin_path(relative):
         return True
-    if policy.excluded_relative_paths or policy.frontend_build_output_paths:
+    if policy.excluded_relative_paths or policy.frontend_build_output_paths or policy.generated_output_profile:
         names = {relative.as_posix(), *(p.as_posix() for p in relative.parents)}
         if names.intersection(policy.excluded_path_set):
             return True

@@ -11,6 +11,8 @@ SOURCE_CLOSURE_SCHEMA = "verification-source-closure-v1"
 
 def require_complete_source_policy(policy):
     from source_snapshot import SourceCaptureError, DEFAULT_EXCLUDED_DIR_NAMES, DEFAULT_EXCLUDED_FILE_NAMES
+    if policy.generated_output_profile:
+        raise SourceCaptureError("VERIFICATION_GENERATED_OUTPUT_RECEIPT_REQUIRED: use the explicit current-workspace output verifier")
     from frontend_source_policy import validate_build_output_paths, AGENT_STATE_DIRS, KNOWN_FRONTEND_CACHE_PATHS
     validate_build_output_paths(list(policy.frontend_build_output_paths))
     roots = tuple(policy.scope_roots)

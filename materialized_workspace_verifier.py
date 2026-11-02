@@ -42,7 +42,7 @@ def _sha(raw):
 
 def verify_current_workspace(project_dir, *, expected_source_key, dependency_plan,
         commands, cache_dir, deadline, final_profile_digest, environment=None, materialize=False,
-        environment_contract='LEGACY_INHERITED_ENV_V1', trusted_pre_popen_guard=None, command_cache_directories=None):
+        environment_contract='LEGACY_INHERITED_ENV_V1', trusted_pre_popen_guard=None, command_cache_directories=None, generated_output_spec=None):
     """Freshly check THIS authorized workspace; optional cold-only npm-ci.
 
     No caller-provided evidence, reusable command PASS or previous prepared tree
@@ -147,6 +147,20 @@ def verify_current_workspace(project_dir, *, expected_source_key, dependency_pla
         return x
     with verification_source_snapshot_scope(project,timeout_seconds=remaining(),strict_cleanup=True) as snapshot:
         if snapshot.key!=expected_source_key:fail('CURRENT_WORKSPACE_SOURCE_MISMATCH')
+        from standalone_build_outputs import (PROFILE, validate_spec, require_absent, capture_receipt, receipt_current)
+        typed_output = bool(snapshot.input_policy and snapshot.input_policy.generated_output_profile)
+        if typed_output != (generated_output_spec is not None):fail('CURRENT_WORKSPACE_OUTPUT_CONTRACT_REQUIRED')
+        output_receipt=None
+        if typed_output:
+            if snapshot.input_policy.generated_output_profile!=PROFILE:fail('CURRENT_WORKSPACE_OUTPUT_PROFILE_UNSUPPORTED')
+            validate_spec(generated_output_spec,project,commands)
+            require_absent(project,deadline=deadline)
+        output_binding=None
+        if typed_output:
+            output_binding={'sourceSnapshotKey':snapshot.key,'profileDigest':final_profile_digest,'invocationId':invocation_id,
+                'dependencyPlanDigest':dependency_plan['obligationPlanDigest'],'approvedLockSha256':dependency_plan['approvedLockSha256'],
+                'environmentDigest':project_environment_fingerprint(env,contract=environment_contract),
+                'toolchain':tools,'buildCommandDigest':_sha(commands[0].encode())}
         def source_guard():
             remaining();validate_source_snapshot(snapshot,timeout_seconds=remaining())
             if (not source_snapshot_live_source_continuity(snapshot,timeout_seconds=remaining())
@@ -163,6 +177,7 @@ def verify_current_workspace(project_dir, *, expected_source_key, dependency_pla
             if install.returncode!=0:fail('CURRENT_WORKSPACE_INSTALL_NOT_VERIFIED')
             installation={'status':'FRESH_COLD_FROZEN_INSTALL_OBSERVED','scriptsEnabled':False,
                 'supervision':'guaranteed-tree','stdoutDigest':_sha((install.stdout or '').encode())}
+        if typed_output:require_absent(project,deadline=deadline)
         roots=npm_root_assignment_from_obligations(dependency_plan)
         observed=observed_resolved_assignment(project,roots)
         state=capture_resolved_dependency_state(project,manager='npm',
@@ -186,6 +201,10 @@ def verify_current_workspace(project_dir, *, expected_source_key, dependency_pla
         initial=tree('initial');rows=[]
         if not materialize:installation['status']='EXISTING_TREE_PHYSICALLY_OBSERVED'
         for index,command in enumerate(commands,1):
+            if typed_output:
+                if index==1:require_absent(project,deadline=deadline)
+                elif not receipt_current(project,generated_output_spec,output_receipt,deadline=deadline,binding=output_binding):
+                    fail('CURRENT_WORKSPACE_OUTPUT_CHANGED')
             source_guard();before=tree('before-command-'+str(index))
             if before!=initial:fail('CURRENT_WORKSPACE_TREE_CHANGED')
             inline=pinned_inline_node_invocation(command,env)
@@ -194,6 +213,10 @@ def verify_current_workspace(project_dir, *, expected_source_key, dependency_pla
             source_guard();after=tree('after-command-'+str(index))
             if after!=initial:fail('CURRENT_WORKSPACE_TREE_CHANGED')
             if result.returncode!=0:fail('CURRENT_WORKSPACE_COMMAND_FAILED')
+            if typed_output:
+                if index==1:output_receipt=capture_receipt(project,generated_output_spec,deadline=deadline,binding=output_binding)
+                elif not receipt_current(project,generated_output_spec,output_receipt,deadline=deadline,binding=output_binding):
+                    fail('CURRENT_WORKSPACE_OUTPUT_CHANGED')
             rows.append({'commandIndex':index,'commandDigest':_sha(command.encode()),
                 'freshCommandInvocationId':invocation_id,'finalVerificationProfileDigest':final_profile_digest,
                 'commandBoundaryGuard':'PRE_POST_OBSERVED',
@@ -218,6 +241,10 @@ def verify_current_workspace(project_dir, *, expected_source_key, dependency_pla
             'installation':installation,
             'currentWorkspaceVerified':False,'checkpointPublished':False,'fullAcceptance':False}
     remaining()
+    if typed_output:
+        if not receipt_current(project,generated_output_spec,output_receipt,deadline=deadline,binding=output_binding):
+            fail('CURRENT_WORKSPACE_OUTPUT_CHANGED')
+        result['generatedOutputObservation']=output_receipt
     result['sourceSnapshotCleanupClosed']=True
     execution_environment=project_environment_observation(env,contract=environment_contract)
     if execution_environment is not None:result['projectExecutionEnvironment']=execution_environment
