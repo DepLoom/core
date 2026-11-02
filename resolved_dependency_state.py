@@ -403,6 +403,17 @@ def compile_npm_dependency_obligations(baseline_lock_bytes, candidate_lock_bytes
                 _npm_obligation_name(location, row)
         graphs.append(graph)
     old, new = graphs
+    v2_aliases={}
+    if before['lockfileVersion']==2 and any(
+            _npm_obligation_name(path,row)[0]!=_npm_obligation_name(path,row)[1]
+            for graph in graphs for path,row in graph.items() if path):
+        from npm_platform_obligations import v2_alias_bindings,NpmPlatformEvidenceError
+        try:
+            old_aliases,new_aliases=v2_alias_bindings(before),v2_alias_bindings(after)
+            if old_aliases!=new_aliases:raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_V2_ALIAS_CHANGED')
+            v2_aliases=new_aliases
+        except NpmPlatformEvidenceError as exc:
+            raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_V2_ALIAS_UNPROVEN') from exc
     # Lexical historical compatibility is not permission for a new or changed
     # mixed-case instance. Only exact original records retain that identity.
     for location, row in new.items():
@@ -446,6 +457,7 @@ def compile_npm_dependency_obligations(baseline_lock_bytes, candidate_lock_bytes
         'optionalAbsenceRules': optional_absence_rules if omission_proof else []}
     if omission_proof:plan['platformAbsenceProof']=omission_proof
     if bundle_proofs:plan.update(bundledOwnerRules=bundled_owner_rules,unchangedBundledOwners=bundle_proofs)
+    if v2_aliases:plan['unchangedNpmV2Aliases']=v2_aliases
     return {**plan, 'obligationPlanDigest': _canonical_hash(plan)}
 
 

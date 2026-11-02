@@ -118,7 +118,12 @@ def _v2_view_record(lock,location,record,*,allow_bundled=False):
   if re.fullmatch(r'(?:@[A-Za-z0-9][A-Za-z0-9._-]*/)?[A-Za-z0-9][A-Za-z0-9._-]*',name) is None:_fail('V2_INSTANCE_PATH')
   if not isinstance(tree,dict) or not isinstance(tree.get(name),dict):_fail('V2_VIEW_MISSING')
   other=tree[name];tree=other.get('dependencies',{})
- for key in ('version','resolved','integrity','optional','dev','devOptional'):
+ install=parts[-1];canonical=record.get('name',install)
+ if not isinstance(canonical,str) or re.fullmatch(r'(?:@[A-Za-z0-9][A-Za-z0-9._-]*/)?[A-Za-z0-9][A-Za-z0-9._-]*',canonical) is None:_fail('V2_ALIAS_IDENTITY')
+ expected_version=('npm:'+canonical+'@'+str(record.get('version'))) if canonical!=install else record.get('version')
+ if other.get('version')!=expected_version:_fail('V2_VIEW_MISMATCH')
+ if 'name' in other and other['name']!=canonical:_fail('V2_ALIAS_IDENTITY')
+ for key in ('resolved','integrity','optional','dev','devOptional'):
   if other.get(key)!=record.get(key):_fail('V2_VIEW_MISMATCH')
  if record.get('link') or other.get('link'):_fail('V2_CONDITIONAL_OWNER_UNSUPPORTED')
  if not allow_bundled and (record.get('inBundle') or other.get('bundled')):_fail('V2_CONDITIONAL_OWNER_UNSUPPORTED')
@@ -127,6 +132,7 @@ def _v2_view_record(lock,location,record,*,allow_bundled=False):
  if record.get('inBundle',False)!=other.get('bundled',False):_fail('V2_VIEW_MISMATCH')
  if any(not isinstance(record.get(key,{}),dict) for key in ('dependencies','optionalDependencies')):_fail('V2_VIEW_REQUIREMENTS_MISMATCH')
  if {**record.get('dependencies',{}),**record.get('optionalDependencies',{})}!=other.get('requires',{}):_fail('V2_VIEW_REQUIREMENTS_MISMATCH')
+ return other
 
 def _v2_consistent_graph(lock):
  graph=lock.get('packages');tree=lock.get('dependencies');seen=set();folded=set();pending=[('',tree)]
@@ -146,6 +152,33 @@ def _v2_consistent_graph(lock):
  for path in seen:
   if not isinstance(graph[path],dict):_fail('V2_VIEW_MISMATCH')
   _v2_view_record(lock,path,graph[path],allow_bundled=True)
+
+def v2_alias_bindings(lock):
+ """Complete unchanged-alias identity/edge join; raw lock remains untouched."""
+ _v2_consistent_graph(lock);graph=lock['packages'];aliases={}
+ for path,row in graph.items():
+  if not path:continue
+  install=path.rsplit('/node_modules/',1)[-1].removeprefix('node_modules/')
+  if row.get('name',install)!=install:
+   aliases[path]={'recordDigest':_digest(row),'legacyRecordDigest':_digest(_v2_view_record(lock,path,row,allow_bundled=True)),'canonical':row['name'],'incoming':[]}
+ for owner,row in graph.items():
+  for section in ('dependencies','devDependencies','optionalDependencies','peerDependencies'):
+   edges=row.get(section,{})
+   if not isinstance(edges,dict):_fail('V2_ALIAS_EDGES')
+   for name,spec in edges.items():
+    destination=_resolve(graph,owner,name,peer=section=='peerDependencies')
+    if destination not in aliases:continue
+    canonical=aliases[destination]['canonical'];prefix='npm:'+canonical+'@'
+    if not isinstance(spec,str) or not spec.startswith(prefix):_fail('V2_ALIAS_IDENTITY')
+    try:valid=NpmSpec(normalize_npm_range(spec[len(prefix):])).match(Version(graph[destination]['version']))
+    except (ValueError,TypeError,KeyError):_fail('V2_ALIAS_RANGE')
+    if not valid:_fail('V2_ALIAS_RANGE')
+    aliases[destination]['incoming'].append((owner,section,name,spec,destination))
+ for row in aliases.values():
+  if not row['incoming']:_fail('V2_ALIAS_ORPHAN')
+  row['incoming'].sort()
+ return aliases
+
 
 def verify_platform_absence(lock,rules):
  validate_rules_shape(rules)
