@@ -16,6 +16,7 @@ import contextvars
 import functools
 import dataclasses
 import hashlib
+import math
 import json
 import os
 import shutil
@@ -892,6 +893,7 @@ def _build_source_tree_manifest_impl(
     progress_interval_seconds: int = 15,
     suppress_worker_observability: bool = False,
     require_exclusive_links: bool = False,
+    exact_timeout: bool = False,
 ) -> SourceTreeManifest:
     """Build a deterministic manifest with bounded parallel file hashing.
 
@@ -900,8 +902,12 @@ def _build_source_tree_manifest_impl(
     are rechecked after hashing so add/remove/rename races fail closed.
     """
     root = root.resolve()
-    deadline = (float("inf") if timeout_seconds == 0
-                else time.monotonic() + max(1, int(timeout_seconds)))
+    # Opt-in exact remaining budget; legacy integer/fraction/zero semantics
+    # remain unchanged unless the supervising owner explicitly selects it.
+    if exact_timeout and (type(timeout_seconds) not in (int,float) or not math.isfinite(timeout_seconds) or timeout_seconds <= 0):
+        raise SourceCaptureError("SOURCE_MATERIALIZATION_TIMEOUT_INVALID")
+    duration = timeout_seconds if exact_timeout else max(1, int(timeout_seconds))
+    deadline = float("inf") if timeout_seconds == 0 else time.monotonic() + duration
     next_progress = time.monotonic() + max(1, int(progress_interval_seconds))
     entries: list[dict[str, object]] = []
     files = 0
@@ -1870,16 +1876,22 @@ def proof_subject_project_dir(project_dir: Path) -> Path:
     return validate_source_snapshot(snapshot).project_path if snapshot is not None else project_dir.expanduser().resolve()
 
 
-def source_snapshot_fingerprint(project_dir: Path) -> str:
+def source_snapshot_fingerprint(project_dir: Path, *, remaining_budget: Optional[Callable[[], float]] = None) -> str:
+    if remaining_budget is not None:
+        if not callable(remaining_budget):raise SourceCaptureError("SOURCE_MATERIALIZATION_TIMEOUT_INVALID")
+        remaining_budget()
     snapshot = active_source_snapshot(project_dir)
-    if snapshot is not None:
+    if snapshot is not None and remaining_budget is None:
         return validate_source_snapshot(snapshot).key
     root, relative, _head = _subject_layout(project_dir)
     from scoped_source_policy import policy_for_project
     policy = policy_for_project(project_dir, root)
     for attempt in range(1, SOURCE_CAPTURE_RETRIES + 1):
         try:
-            manifest = build_source_tree_manifest(root, policy=policy, timeout_seconds=0)
+            args = {} if remaining_budget is None else {"exact_timeout": True}
+            manifest = build_source_tree_manifest(root, policy=policy,
+                timeout_seconds=0 if remaining_budget is None else remaining_budget(), **args)
+            if remaining_budget is not None:remaining_budget()
             break
         except SourceCaptureError as exc:
             if "SOURCE_CAPTURE_UNSTABLE" not in str(exc) or attempt >= SOURCE_CAPTURE_RETRIES:
@@ -2125,6 +2137,7 @@ def build_source_tree_manifest(
     progress_label: str = "source manifest",
     progress_interval_seconds: int = 15,
     pass_role: str = "",
+    exact_timeout: bool = False,
 ) -> SourceTreeManifest:
     exclusive_links = str(pass_role) in _EXCLUSIVE_LINK_PASS_ROLES
     if not _observability_sink_is_source_safe(root, policy):
@@ -2138,6 +2151,7 @@ def build_source_tree_manifest(
                 progress_interval_seconds=progress_interval_seconds,
                 suppress_worker_observability=True,
                 require_exclusive_links=exclusive_links,
+                exact_timeout=exact_timeout,
             )
 
     operation_id = new_observability_id("source-manifest")
@@ -2161,6 +2175,7 @@ def build_source_tree_manifest(
             progress_label=progress_label,
             progress_interval_seconds=progress_interval_seconds,
             require_exclusive_links=exclusive_links,
+            exact_timeout=exact_timeout,
         )
     except BaseException as exc:
         after = process_resource_snapshot()
