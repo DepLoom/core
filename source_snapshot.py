@@ -1999,6 +1999,23 @@ SOURCE_SNAPSHOT_CONTAINER_PREFIX = "dependency-flow-source-snapshot-"
 _REAP_MAX_AGE_SECONDS = 6 * 3600
 _REAP_MAX_CONTAINERS = 8
 _REAP_DONE = threading.Event()
+_ORPHAN_REAP_DEFERRED = contextvars.ContextVar("source_snapshot_orphan_reap_deferred", default=False)
+
+
+@contextlib.contextmanager
+def defer_orphan_snapshot_maintenance():
+    """Defer unrelated orphan reclamation, never source proof or owned cleanup.
+
+    Critical publication may use this scope to avoid spending its execution
+    allowance on an older run's storage backlog. A later ordinary capture still
+    gets its normal first-reap opportunity. State is context-local and nested
+    scopes cannot re-enable reaping accidentally.
+    """
+    token = _ORPHAN_REAP_DEFERRED.set(True)
+    try:
+        yield
+    finally:
+        _ORPHAN_REAP_DEFERRED.reset(token)
 
 
 def reap_orphaned_source_snapshots(
@@ -2018,6 +2035,8 @@ def reap_orphaned_source_snapshots(
     or linked trees before retirement. Unknown legacy containers and live
     owners are retained. Failing to reap leaves the tree for a later run.
     """
+    if _ORPHAN_REAP_DEFERRED.get():
+        return {"reaped": 0, "skipped": 0, "failed": 0}
     from verification_storage_maintenance import dead_trial_owner, _plain_directory, _has_links
     reaped = skipped = failed = 0
     from source_snapshot_storage import candidate_snapshot_parents
@@ -2078,7 +2097,7 @@ def reap_orphaned_source_snapshots(
 
 def _reap_once() -> None:
     """Bounded, best-effort, at most once per process."""
-    if _REAP_DONE.is_set():
+    if _ORPHAN_REAP_DEFERRED.get() or _REAP_DONE.is_set():
         return
     _REAP_DONE.set()
     try:
