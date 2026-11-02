@@ -7666,6 +7666,7 @@ def _project_environment_constraint_issue(
     row: DependencyRow,
     version: str,
     client: LiveDataClient,
+    *, check_current: bool = False,
 ) -> str:
     """Reject a candidate that cannot run on an exact project Node runtime.
 
@@ -7674,7 +7675,7 @@ def _project_environment_constraint_issue(
     excludes a pinned/current project runtime is a plan-level contradiction and
     should never reach a work branch.
     """
-    if version == row.current_version:
+    if version == row.current_version and not check_current:
         return ""
     metadata = _package_version_metadata(row, version, client)
     if not isinstance(metadata, dict):
@@ -8410,6 +8411,8 @@ def _build_peer_optimization_model(
     mode: str,
     learned_nogoods: Optional[List[Dict[str, str]]] = None,
     stability_targets: Optional[Dict[str, str]] = None,
+    *, intent_policies: Optional[Dict[str, str]] = None,
+    strict_current: bool = False,
 ) -> PeerOptimizationModel:
     """Extract one peer component into a solver-neutral finite-domain IR.
 
@@ -8489,12 +8492,15 @@ def _build_peer_optimization_model(
         seen_requirements.add(key)
         requirements.append(requirement)
 
-    exact_contract = _baseline_intent_payload()["decisionContract"]
+    if intent_policies is not None and (set(intent_policies) != component_set
+            or any(value not in BASELINE_INTENT_POLICIES for value in intent_policies.values())):
+        raise ValueError("INVALID_EXPLICIT_PEER_INTENT")
+    exact_contract = _baseline_intent_payload()["decisionContract"] if intent_policies is None else {}
     exact_assignments = (exact_contract.get("exactTargets") or {}
-                         if exact_contract["objective"] == EXPLICIT_VERSIONS else {})
+                         if exact_contract.get("objective") == EXPLICIT_VERSIONS else {})
     for intent_name in sorted(component):
         intent_row = rows_by_name[intent_name]
-        intent_policy = _baseline_intent_policy(intent_name)
+        intent_policy = _baseline_intent_policy(intent_name) if intent_policies is None else intent_policies[intent_name]
         chosen_exact = exact_assignments.get(intent_name)
         if chosen_exact and chosen_exact in domains.get(intent_name, []):
             # Enforce the exact selected version *inside* Z3 / finite-domain
@@ -8543,9 +8549,9 @@ def _build_peer_optimization_model(
     for source_name in sorted(component):
         source = rows_by_name[source_name]
         for source_version in domains[source_name]:
-            source_moved = source_version != source.current_version
+            source_moved = strict_current or source_version != source.current_version
             if source_moved:
-                environment_issue = _project_environment_constraint_issue(source, source_version, client)
+                environment_issue = _project_environment_constraint_issue(source, source_version, client, check_current=strict_current)
                 if environment_issue:
                     add_constraint(
                         [(source_name, source_version)],
