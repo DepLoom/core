@@ -1925,7 +1925,9 @@ def materialize_source_for_verification(
     progress: Optional[ProgressCallback] = None,
     progress_label: str = "source snapshot materialization",
     progress_interval_seconds: int = 15,
+    generated_output_materialization: Optional[dict] = None,
 ) -> tuple[Path, SourceSnapshot, str]:
+    generated_output_deadline = time.time()+max(1,timeout_seconds) if generated_output_materialization is not None else None
     snapshot = active_source_snapshot(project_dir)
     if snapshot is None:
         snapshot = capture_source_snapshot(
@@ -1935,7 +1937,12 @@ def materialize_source_for_verification(
             progress_interval_seconds=progress_interval_seconds,
         )
     from verification_source_closure import require_complete_source_policy
-    require_complete_source_policy(snapshot.input_policy or SourceInputPolicy())
+    if generated_output_materialization is None:
+        require_complete_source_policy(snapshot.input_policy or SourceInputPolicy())
+    else:
+        from standalone_build_outputs import validate_input_only_materialization
+        validate_input_only_materialization(snapshot, project_dir, generated_output_materialization,
+            deadline=generated_output_deadline)
     budget = source_copy_budget()
     if budget is not None and snapshot.byte_count > budget:
         raise SourceCaptureError("SOURCE_MATERIALIZATION_BUDGET_EXCEEDED: "
@@ -1978,6 +1985,10 @@ def materialize_source_for_verification(
         raise SourceCaptureError(
             f"SOURCE_MATERIALIZED_PROJECT_MISSING: {snapshot.project_relative.as_posix()}"
         )
+    if generated_output_materialization is not None:
+        from standalone_build_outputs import validate_input_only_materialization
+        validate_input_only_materialization(snapshot, project_dir, generated_output_materialization,
+            deadline=generated_output_deadline, delivered_project=project)
     return project, snapshot, method
 
 

@@ -141,3 +141,27 @@ def receipt_current(project,spec,receipt,*,deadline,binding):
                 or not isinstance(binding,dict) or receipt['binding']!=binding):return False
         return output_inventory(project,spec,deadline=deadline)==receipt['inventory']
     except (GeneratedOutputError,OSError,KeyError,TypeError,ValueError):return False
+
+
+def validate_input_only_materialization(snapshot, original_project, contract, *, deadline, delivered_project=None):
+    """Authorize source transport only, never a source/output verification proof.
+
+    Both live/sealed inputs and the delivered copy must have absent output roots.
+    Generic verification still rejects this policy; only the explicit current
+    workspace verifier can execute and bind fresh generated output receipts.
+    """
+    from source_snapshot import SourceInputPolicy,SourceCaptureError
+    policy=snapshot.input_policy
+    if (not isinstance(contract,dict) or set(contract)!={'spec','commands'}
+            or policy!=SourceInputPolicy(generated_output_profile=PROFILE)
+            or snapshot.project_relative!=Path('.')
+            or Path(original_project).resolve()!=snapshot.original_project_path.resolve()
+            or snapshot.capture_root.resolve()!=snapshot.original_project_path.resolve()):
+        raise SourceCaptureError('SOURCE_GENERATED_OUTPUT_TRANSPORT_CONTRACT_INVALID')
+    recipe=None
+    for project in (Path(original_project),snapshot.project_path,*(() if delivered_project is None else (Path(delivered_project),))):
+        require_absent(project,deadline=deadline)
+        current=validate_spec(contract['spec'],project,contract['commands'])
+        if recipe is not None and current!=recipe:_fail('TRANSPORT_RECIPE_CHANGED')
+        recipe=current
+    return {'scope':'SOURCE_INPUT_TRANSPORT_ONLY','verification':'NOT_VERIFIED','recipeDigest':recipe}

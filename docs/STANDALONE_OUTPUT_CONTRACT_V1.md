@@ -51,3 +51,14 @@ current/checkpoint/resume owners before exposing accepted route semantics.
 Focused tests: `python -m unittest discover -s tests -p test_standalone_build_outputs.py -v`.
 The fixture native commands validate source/output scope and supervision only;
 their artificial TAP files are not evidence of any real project's correctness.
+
+
+Input-only materialization is a separate opt-in transport contract. The copy
+owner must pass the exact output spec and original command recipe explicitly.
+It requires the standalone policy without additional exclusions, the original
+root subject, and absent dist/.tap roots in live inputs, the sealed source and
+the delivered copy. Recipe hashes and authored bytes remain checked. This
+contract grants no verification receipt: generic source-completeness proofs
+still reject the output-excluding policy. Only the typed current-workspace
+verifier can accept freshly executed outputs. Focused transport regressions:
+`python -m unittest discover -s tests -p test_standalone_source_transport.py -v`.
