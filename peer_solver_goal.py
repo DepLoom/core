@@ -18,6 +18,11 @@ _VERSION = re.compile(r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\Z')
 class GoalChoiceUnsupported(ValueError):
     pass
 
+def _exact_source_semver(value):
+    if not isinstance(value,str):return False
+    try:return str(Version(value))==value
+    except ValueError:return False
+
 def build_goal_choice_model(current, domains, records, *, node_version, project_dir,
                             primary_package, max_major_changes, constraint_limit=4096):
     """Inputs must contain every declared root; held roots have singleton domains."""
@@ -31,9 +36,10 @@ def build_goal_choice_model(current, domains, records, *, node_version, project_
     rows, cache, normalized = {}, {}, {}
     for name in sorted(current):
         values=domains[name]
-        if (not isinstance(current[name],str) or not _VERSION.fullmatch(current[name])
+        if (not _exact_source_semver(current[name])
                 or not isinstance(values,list) or not 1<=len(values)<=32
-                or any(not isinstance(v,str) or not _VERSION.fullmatch(v) for v in values)
+                or any(not _exact_source_semver(v) for v in values)
+                or (any(not _VERSION.fullmatch(v) for v in values) and values!=[current[name]])
                 or len(set(values))!=len(values) or not isinstance(records[name],dict)):
             raise GoalChoiceUnsupported('INVALID_CHOICE_DOMAIN')
         normalized[name]=sorted(values,key=Version)

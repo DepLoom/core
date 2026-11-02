@@ -56,4 +56,18 @@ class GoalChoiceTests(unittest.TestCase):
         with patch('peer_solver_z3.solve_z3_exact',return_value=ExactSolveResult('z3','optimal',assignment={'engine':'7.0.0'},score=(1,))):
             with self.assertRaisesRegex(GoalChoiceUnsupported,'INVALID_CHOICE_SOLVER_RESULT'):solve_goal_choice(self.model())
 
+    def test_held_prerelease_is_exact_and_does_not_expand_target_domain(self):
+        old=self.records['held'].pop('1.0.0');old['version']='1.0.0-alpha.23'
+        self.current['held']='1.0.0-alpha.23';self.domains['held']=['1.0.0-alpha.23'];self.records['held']['1.0.0-alpha.23']=old
+        result=solve_goal_choice(self.model())
+        self.assertEqual(result.status,'optimal');self.assertEqual(result.assignment['held'],'1.0.0-alpha.23')
+        self.assertEqual(result.assignment['engine'],'7.0.0')
+        self.domains['held'].append('1.0.0')
+        with self.assertRaises(GoalChoiceUnsupported):self.model()
+    def test_malformed_or_ranged_source_versions_are_not_exact_held_versions(self):
+        for version in ['^1.0.0','1.0','v1.0.0','1.0.0-alpha..1','1.0.0 || 2.0.0']:
+            with self.subTest(version=version):
+                self.current['held']=version;self.domains['held']=[version]
+                with self.assertRaises(GoalChoiceUnsupported):self.model()
+
 if __name__=='__main__':unittest.main()
