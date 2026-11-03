@@ -23,6 +23,7 @@ jobs:
     outputs:
       commit: ${{ steps.identity.outputs.commit }}
       tag: ${{ steps.identity.outputs.tag }}
+      tagObject: ${{ steps.identity.outputs.tagObject }}
       version: ${{ steps.identity.outputs.version }}
       ciRuns: ${{ steps.identity.outputs.ciRuns }}
     steps:
@@ -68,12 +69,14 @@ jobs:
         env:
           RELEASE_TAG: ${{ needs.qualify.outputs.tag }}
           REQUIRED_MAIN_CI_JSON: ${{ needs.qualify.outputs.ciRuns }}
+          EXPECTED_TAG_OBJECT: ${{ needs.qualify.outputs.tagObject }}
         run: python scripts/release_ci.py build --tag $env:RELEASE_TAG
       - uses: actions/upload-artifact@v4
         id: bundle
         with:
           name: component-release-${{ needs.qualify.outputs.commit }}
           path: .component-release/ci-artifacts/*
+          include-hidden-files: true
           if-no-files-found: error
           retention-days: 14
   publish:
@@ -104,4 +107,5 @@ jobs:
           RELEASE_ARTIFACT_ID: ${{ needs.package.outputs.artifact-id }}
           RELEASE_ARTIFACT_DIGEST: ${{ needs.package.outputs.artifact-digest }}
           EXPECTED_MANIFEST_SHA256: ${{ needs.package.outputs.manifest-sha }}
+          EXPECTED_TAG_OBJECT: ${{ needs.qualify.outputs.tagObject }}
         run: python scripts/release_ci.py publish --tag "$RELEASE_TAG" --artifacts release-artifacts

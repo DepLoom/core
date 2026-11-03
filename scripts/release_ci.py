@@ -39,7 +39,9 @@ def identity(tag):
     if git(ROOT,'rev-parse','refs/tags/'+tag+'^{commit}')!=head:raise ReleaseError('RELEASE_TAG_HEAD_MISMATCH')
     if git(ROOT,'merge-base','--is-ancestor',head,'origin/main',check=False).returncode:
         raise ReleaseError('RELEASE_NOT_IN_MAIN')
-    return {'package':name,'version':version,'tag':tag,'repository':repo,'commit':head}
+    tag_object=git(ROOT,'rev-parse','refs/tags/'+tag)
+    if os.environ.get('EXPECTED_TAG_OBJECT',tag_object)!=tag_object:raise ReleaseError('TAG_OBJECT_CHANGED_DURING_RELEASE')
+    return {'package':name,'version':version,'tag':tag,'repository':repo,'commit':head,'tagObject':tag_object}
 
 def wait_main(tag):
     value=identity(tag);workflows=['ci.yml']+(['audit.yml'] if value['package']=='deploom-mcp' else [])
@@ -58,7 +60,7 @@ def wait_main(tag):
         if len(completed)==len(workflows):
             out=Path(os.environ['GITHUB_OUTPUT'])
             with out.open('a',encoding='utf8') as stream:
-                for k in ('commit','tag','version'):stream.write(k+'='+value[k]+'\n')
+                for k in ('commit','tag','version','tagObject'):stream.write(k+'='+value[k]+'\n')
                 stream.write('ciRuns='+json.dumps(completed,sort_keys=True)+'\n')
             print(json.dumps({'status':'EXACT_MAIN_CI_GREEN','commit':value['commit'],'runs':completed}));return
         time.sleep(min(20,max(0,deadline-time.monotonic())))
@@ -111,7 +113,7 @@ def expected_assets(folder,value):
     if {p.name for p in folder.iterdir()}!=names or any(p.is_symlink() or not p.is_file() for p in folder.iterdir()):
         raise ReleaseError('RELEASE_ASSET_SET_MISMATCH')
     evidence=json.loads((folder/'RELEASE-EVIDENCE.json').read_bytes())
-    if any(evidence.get(k)!=value[k] for k in ('repository','package','version','tag','commit')):
+    if any(evidence.get(k)!=value[k] for k in ('repository','package','version','tag','commit','tagObject')):
         raise ReleaseError('RELEASE_ASSET_SOURCE_MISMATCH')
     manifest={}
     for line in (folder/'SHA256SUMS.txt').read_text().splitlines():
@@ -133,6 +135,14 @@ def reconcile_assets(existing,expected):
             raise ReleaseError('IMMUTABLE_RELEASE_ASSET_CONFLICT: '+name)
     return sorted(set(expected)-set(found))
 
+def remote_tag_matches(value):
+    ref=api('repos/'+value['repository']+'/git/ref/tags/'+value['tag'])
+    if ref.get('object',{}).get('type')!='tag' or ref['object'].get('sha')!=value['tagObject']:
+        raise ReleaseError('REMOTE_ANNOTATED_TAG_CHANGED')
+    tag=api('repos/'+value['repository']+'/git/tags/'+value['tagObject'])
+    if tag.get('object',{}).get('type')!='commit' or tag['object'].get('sha')!=value['commit'] or tag.get('tag')!=value['tag']:
+        raise ReleaseError('REMOTE_TAG_TARGET_CHANGED')
+
 def publish(tag,folder):
     value=identity(tag);folder=Path(folder).resolve()
     manifest_sha=os.environ.get('EXPECTED_MANIFEST_SHA256','');artifact_id=os.environ.get('RELEASE_ARTIFACT_ID','');bundle_sha=os.environ.get('RELEASE_ARTIFACT_DIGEST','')
@@ -144,6 +154,7 @@ def publish(tag,folder):
             or str(bundle.get('workflow_run',{}).get('id'))!=os.environ['GITHUB_RUN_ID']
             or bundle.get('workflow_run',{}).get('head_sha')!=value['commit']):raise ReleaseError('QUALIFIED_ARTIFACT_BUNDLE_MISMATCH')
     expected=expected_assets(folder,value)
+    remote_tag_matches(value)
     repo=value['repository'];endpoint='repos/'+repo+'/releases/tags/'+tag
     # A missing release is the only tolerated read error. Never interpret an API denial as absence.
     query=subprocess.run(['gh','api','--include',endpoint],capture_output=True,text=True,timeout=90)
@@ -161,6 +172,7 @@ def publish(tag,folder):
     if release['draft']:run(['gh','release','edit',tag,'--repo',repo,'--draft=false','--latest'])
     final=api(endpoint)
     if final['draft'] or reconcile_assets(final['assets'],expected):raise ReleaseError('PUBLICATION_NOT_CONFIRMED')
+    remote_tag_matches(value)
     print(json.dumps({'status':'PUBLISHED','tag':tag,'commit':value['commit'],'url':final['html_url']}))
 
 def main():

@@ -15,6 +15,7 @@ import time
 import tomllib
 import urllib.error
 import urllib.request
+import uuid
 
 REPOSITORIES={'deploom-core':'DepLoom/core','deploom-mcp':'DepLoom/mcp'}
 VERSION=re.compile(r'^[0-9]+\.[0-9]+\.[0-9]+$')
@@ -35,8 +36,9 @@ def plain(root,path):
         if parent.is_symlink():raise ReleaseError('UNSAFE_RELEASE_PARENT')
     return p
 
-def atomic(path,raw):
-    temp=path.with_name(path.name+'.component-release-tmp')
+def atomic(path,raw,*,staging=None):
+    if path.is_symlink():raise ReleaseError('UNSAFE_RELEASE_DESTINATION')
+    temp=(staging or path.parent)/(path.name+'.component-release-'+uuid.uuid4().hex+'.tmp')
     if temp.exists() or temp.is_symlink():raise ReleaseError('RELEASE_TEMP_EXISTS')
     temp.write_bytes(raw);os.replace(temp,path)
 
@@ -116,7 +118,7 @@ def save_state(root,state):
     atomic(folder/'active.json',raw)
 
 def prepare(root,tag=None,new_release=False):
-    info=inspect(root);folder=state_directory(root);active=folder/'active.json'
+    info=inspect(root);folder=state_directory(root);active=plain(root,'.component-release/active.json')
     state=json.loads(active.read_bytes()) if active.exists() else None
     if state is not None:
         if (state.get('schemaVersion')!=1 or state.get('repository')!=info['repository']
@@ -153,7 +155,7 @@ def commit_version(root,state):
             if raw not in (before,after):raise ReleaseError('VERSION_FILE_CHANGED_BY_OTHER_WORK')
         for path,(before,after) in edits.items():
             p=plain(root,path)
-            if p.read_bytes()==before:atomic(p,after)
+            if p.read_bytes()==before:atomic(p,after,staging=state_directory(root))
         if state['package']=='deploom-mcp':
             r=subprocess.run([sys.executable,'scripts/update_release_manifest.py','--check'],cwd=root,timeout=60)
             if r.returncode:raise ReleaseError('MCP_CORE_SKILL_OR_MANIFEST_UNPROVEN')
@@ -208,8 +210,16 @@ def wait_release(root,state,minutes):
         try:
             req=urllib.request.Request(url,headers={'Accept':'application/vnd.github+json','User-Agent':'DepLoom-component-release'})
             with urllib.request.urlopen(req,timeout=10) as response:data=json.load(response)
-            if (not data.get('draft') and len(data.get('assets',[]))==4 and all(a.get('state')=='uploaded' and re.fullmatch(r'sha256:[0-9a-f]{64}',a.get('digest','')) for a in data['assets'])):
-                state['phase']='PUBLISHED';save_state(root,state);return {'status':'PUBLISHED','tag':state['tag'],'url':data['html_url']}
+            expected={state['package'].replace('-','_')+'-'+state['version']+'-py3-none-any.whl',state['package'].replace('-','_')+'-'+state['version']+'.tar.gz','RELEASE-EVIDENCE.json','SHA256SUMS.txt'}
+            if (data.get('tag_name')==state['tag'] and not data.get('draft') and len(data.get('assets',[]))==4 and {a.get('name') for a in data['assets']}==expected
+                    and all(a.get('state')=='uploaded' and re.fullmatch(r'sha256:[0-9a-f]{64}',a.get('digest','')) for a in data['assets'])):
+                request=urllib.request.Request('https://api.github.com/repos/'+state['repository']+'/actions/workflows/release.yml/runs?head_sha='+state['commit']+'&per_page=10',headers={'Accept':'application/vnd.github+json','User-Agent':'DepLoom-component-release'})
+                with urllib.request.urlopen(request,timeout=10) as response:runs=json.load(response)['workflow_runs']
+                runs=[r for r in runs if r['head_sha']==state['commit']]
+                latest=max(runs,key=lambda r:r['id']) if runs else None
+                if latest and latest['status']=='completed':
+                    if latest['conclusion']!='success':raise ReleaseError('RELEASE_WORKFLOW_NOT_GREEN')
+                    state['phase']='PUBLISHED';save_state(root,state);return {'status':'PUBLISHED','tag':state['tag'],'url':data['html_url']}
         except urllib.error.HTTPError as exc:
             if exc.code!=404:raise ReleaseError('PUBLIC_STATUS_UNAVAILABLE_USE_ACTIONS_URL') from None
         except (OSError,ValueError):raise ReleaseError('PUBLIC_STATUS_UNAVAILABLE_USE_ACTIONS_URL') from None

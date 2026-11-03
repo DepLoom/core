@@ -41,6 +41,14 @@ class ReleaseStateTests(unittest.TestCase):
         with self.assertRaisesRegex(release.ReleaseError,'UNRELATED_CHANGES'):release.commit_version(self.root,state)
         self.assertEqual((self.root/'pyproject.toml').read_bytes(),self.original)
         self.assertEqual(self.call('diff','--cached','--name-only'),'')
+    def test_interrupted_atomic_file_replace_resumes_without_another_version(self):
+        state=release.prepare(self.root)
+        with patch.object(release.os,'replace',side_effect=OSError('simulated interruption')):
+            with self.assertRaisesRegex(OSError,'simulated interruption'):release.commit_version(self.root,state)
+        self.assertEqual(release.dirty_paths(self.root),set())
+        resumed=release.prepare(self.root);release.commit_version(self.root,resumed)
+        self.assertEqual(release.package(self.root),('deploom-core','0.1.2'))
+        self.assertEqual(self.call('rev-list','--count','HEAD'),'2')
     def test_changed_version_file_is_preserved(self):
         state=release.prepare(self.root);changed=self.original+b'# concurrent edit\r\n';(self.root/'pyproject.toml').write_bytes(changed)
         with self.assertRaisesRegex(release.ReleaseError,'VERSION_FILE_CHANGED'):release.commit_version(self.root,state)
@@ -95,7 +103,7 @@ class ExactWorkflowIdentityTests(unittest.TestCase):
         with patch.object(ci,'package',return_value=('deploom-core','0.1.2')),patch.object(ci,'git',return_value='a'*40),patch.dict(os.environ,{'GITHUB_REPOSITORY':'DepLoom/core','GITHUB_SHA':'b'*40}):
             with self.assertRaisesRegex(release.ReleaseError,'DEFINITION_NOT_FROM_TAG'):ci.identity('v0.1.2')
     def test_publisher_refuses_missing_qualified_bundle_before_any_api(self):
-        value={'repository':'DepLoom/core','package':'deploom-core','version':'0.1.2','tag':'v0.1.2','commit':'a'*40}
+        value={'repository':'DepLoom/core','package':'deploom-core','version':'0.1.2','tag':'v0.1.2','commit':'a'*40,'tagObject':'c'*40}
         with patch.object(ci,'identity',return_value=value),patch.object(ci,'api') as api,patch.dict(os.environ,{'EXPECTED_MANIFEST_SHA256':'','RELEASE_ARTIFACT_ID':'','RELEASE_ARTIFACT_DIGEST':''}):
             with self.assertRaisesRegex(release.ReleaseError,'BUNDLE_IDENTITY_MISSING'):ci.publish('v0.1.2',ROOT)
         api.assert_not_called()
@@ -109,7 +117,7 @@ class ImmutableAssetTests(unittest.TestCase):
             with self.subTest(rows=rows),self.assertRaises(release.ReleaseError):ci.reconcile_assets(rows,expected)
     def test_source_identity_and_checksum_tamper_rejected(self):
         with tempfile.TemporaryDirectory() as raw:
-            folder=Path(raw);value={'repository':'DepLoom/core','package':'deploom-core','version':'0.1.2','tag':'v0.1.2','commit':'a'*40}
+            folder=Path(raw);value={'repository':'DepLoom/core','package':'deploom-core','version':'0.1.2','tag':'v0.1.2','commit':'a'*40,'tagObject':'c'*40}
             for name in ['deploom_core-0.1.2-py3-none-any.whl','deploom_core-0.1.2.tar.gz']:(folder/name).write_bytes(b'fixture bytes, not a built distribution')
             (folder/'RELEASE-EVIDENCE.json').write_text(json.dumps(value))
             (folder/'SHA256SUMS.txt').write_text(''.join(hashlib.sha256(p.read_bytes()).hexdigest()+'  '+p.name+'\n' for p in sorted(folder.iterdir())))
