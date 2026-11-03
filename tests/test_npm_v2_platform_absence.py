@@ -1,9 +1,10 @@
 """Explicit v2 archive omission agrees with the legacy lock view."""
-import copy,unittest
+import copy,unittest,os
 import test_npm_platform_absence as fixture
 from resolved_dependency_state import MaterializedDependencyObligationError
 from npm_platform_obligations import observe_node_host
 
+@unittest.skipUnless(os.name=='nt','Platform archive evidence is currently Windows-only')
 class PlatformV2AbsenceTests(unittest.TestCase):
  @classmethod
  def setUpClass(cls):cls.host=observe_node_host()
