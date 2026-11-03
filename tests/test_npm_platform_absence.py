@@ -1,7 +1,9 @@
 ﻿import unittest,tempfile,json,hashlib,tarfile,io,base64,copy
+import os
 from pathlib import Path
 from npm_platform_obligations import observe_node_host,verify_platform_absence,NpmPlatformEvidenceError
 from resolved_dependency_state import compile_npm_dependency_obligations,observe_npm_dependency_obligations,MaterializedDependencyObligationError
+@unittest.skipUnless(os.name=='nt','Platform archive evidence is currently Windows-only')
 class PlatformAbsenceTests(unittest.TestCase):
  @classmethod
  def setUpClass(cls):cls.host=observe_node_host()
