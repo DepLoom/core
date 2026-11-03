@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -27,6 +28,7 @@ class ConstraintCacheTests(unittest.TestCase):
             root = Path(temp)
             (root / "package.json").write_text('{"name":"demo","dependencies":{"a":"1"}}\n', encoding="utf-8")
             (root / "yarn.lock").write_text("a@1:\n  version 1.0.0\n", encoding="utf-8")
+            subprocess.run(["git", "init", "-q", str(root)], check=True, capture_output=True)
             first = resolver_environment_fingerprint(root, registry="https://nexus/a")
             self.assertEqual(first, resolver_environment_fingerprint(root, registry="https://nexus/a"))
             self.assertNotEqual(first, resolver_environment_fingerprint(root, registry="https://nexus/b"))
@@ -38,6 +40,7 @@ class ConstraintCacheTests(unittest.TestCase):
             root = Path(temp)
             (root / "package.json").write_text('{"name":"demo","packageManager":"yarn@1.22.22"}\n', encoding="utf-8")
             (root / "yarn.lock").write_text("", encoding="utf-8")
+            subprocess.run(["git", "init", "-q", str(root)], check=True, capture_output=True)
             with mock.patch("verification_proof._version_identity", return_value="manager-v1"), \
                     mock.patch("verification_proof._node_identity", return_value="node-v1"):
                 first = resolver_environment_fingerprint(root, registry="https://nexus/a")
@@ -155,6 +158,9 @@ class ConstraintCacheTests(unittest.TestCase):
                 '{"name":"demo","devDependencies":{"a":"1.0.0","b":"1.0.0"}}\n',
                 encoding="utf-8",
             )
+            subprocess.run(["git", "init", "-q", str(project)], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(project), "add", "--", "package.json"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(project), "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgSign=false", "commit", "-q", "-m", "fixture"], check=True, capture_output=True)
             cache = root / "constraint-cache.json"
             env = resolver_environment_fingerprint(project, registry="https://nexus.example/repository/npm-group")
             persist_verified_nogood(

@@ -8,6 +8,9 @@ class StrictSnapshotCleanupTests(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
         self.project=Path(self.temp.name)/'fixture';self.project.mkdir()
+        self.storage=Path(self.temp.name)/'verification'
+        environment=patch.dict(os.environ,{'DEPLOOM_VERIFICATION_ROOT':str(self.storage),'DEPLOOM_VEX_AUTO_REFS':'0'})
+        environment.start();self.addCleanup(environment.stop)
         (self.project/'package.json').write_text('{"name":"engineering-source","version":"1.0.0"}\n')
         for args in [['init','-q'],['add','--','package.json'],['-c','user.name=DepLoom Engineering Fixture','-c','user.email=fixture@example.invalid','-c','commit.gpgSign=false','commit','-q','-m','engineering fixture']]:
             subprocess.run([shutil.which('git'),'-C',str(self.project),*args],capture_output=True,check=True,timeout=5)

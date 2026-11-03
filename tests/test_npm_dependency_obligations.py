@@ -13,6 +13,20 @@ class NpmDependencyObligationTests(unittest.TestCase):
             'node_modules/leaf':{'version':'1.0.0'}}}
         self.after=copy.deepcopy(self.before);self.after['packages']['']['dependencies']['target']='2.0.0';self.after['packages']['node_modules/target']['version']='2.0.0'
     def prepare(self):
+        for lock in (self.before,self.after):
+            if lock['lockfileVersion']!=2:continue
+            legacy={}
+            for location,row in sorted(lock['packages'].items(),key=lambda item:(item[0].count('node_modules/'),item[0])):
+                if not location:continue
+                segments=location.split('node_modules/')[1:];tree=legacy
+                for parent in segments[:-1]:tree=tree[parent.rstrip('/')].setdefault('dependencies',{})
+                install=segments[-1];canonical=row.get('name',install)
+                value={k:v for k,v in row.items()if k in ('resolved','integrity','optional','dev','devOptional')}
+                value['version']='npm:'+canonical+'@'+row['version']if canonical!=install else row['version']
+                requirements={**row.get('dependencies',{}),**row.get('optionalDependencies',{})}
+                if requirements:value['requires']=requirements
+                tree[install]=value
+            lock['dependencies']=legacy
         old=json.dumps(self.before).encode();new=json.dumps(self.after).encode()
         self.plan=compile_npm_dependency_obligations(old,new,exact_targets={'target':'2.0.0'},changed_instances=['node_modules/target'],immutable_packages=['held'],delta_digest='a'*64,scope_digest='b'*64)
         (self.root/'package-lock.json').write_bytes(new);(self.root/'package.json').write_text(json.dumps(self.after['packages']['']))
@@ -97,8 +111,7 @@ class NpmDependencyObligationTests(unittest.TestCase):
         self.prepare();self.assertEqual(self.observe()['instanceCount'],4)
     def test_ordinary_edge_cannot_borrow_implicit_alias_identity(self):
         for lock in (self.before,self.after):lock['packages']['node_modules/held']['name']='unrelated'
-        self.prepare()
-        with self.assertRaisesRegex(MaterializedDependencyObligationError,'EDGE_IDENTITY_MISMATCH'):self.observe()
+        with self.assertRaisesRegex(MaterializedDependencyObligationError,'DEPENDENCY_OBLIGATION_V2_ALIAS_UNPROVEN'):self.prepare()
     def test_bundled_lock_mode_is_not_an_ordinary_physical_obligation(self):
         for value in [True,1,'true']:
             old=copy.deepcopy(self.before);new=copy.deepcopy(self.after)
