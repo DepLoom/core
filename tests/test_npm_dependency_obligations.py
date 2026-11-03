@@ -111,7 +111,11 @@ class NpmDependencyObligationTests(unittest.TestCase):
         self.prepare();self.assertEqual(self.observe()['instanceCount'],4)
     def test_ordinary_edge_cannot_borrow_implicit_alias_identity(self):
         for lock in (self.before,self.after):lock['packages']['node_modules/held']['name']='unrelated'
-        with self.assertRaisesRegex(MaterializedDependencyObligationError,'DEPENDENCY_OBLIGATION_V2_ALIAS_UNPROVEN'):self.prepare()
+        if self.before['lockfileVersion']==2:
+            with self.assertRaisesRegex(MaterializedDependencyObligationError,'DEPENDENCY_OBLIGATION_V2_ALIAS_UNPROVEN'):self.prepare()
+        else:
+            self.prepare()
+            with self.assertRaisesRegex(MaterializedDependencyObligationError,'EDGE_IDENTITY_MISMATCH'):self.observe()
     def test_bundled_lock_mode_is_not_an_ordinary_physical_obligation(self):
         for value in [True,1,'true']:
             old=copy.deepcopy(self.before);new=copy.deepcopy(self.after)
