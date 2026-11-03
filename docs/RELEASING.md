@@ -53,6 +53,9 @@ source, builds wheel and sdist, installs the wheel outside the checkout, rebuild
 from sdist and checks the rebuilt wheel. MCP also requires its packaged P1/D1
 correctness and proxy gates at the same source revision.
 
+Draft releases are discovered through the authenticated release list and then
+addressed by release ID; the public tag lookup cannot discover a draft.
+
 Only after these gates pass does it create a draft release, upload the wheel,
 sdist, `RELEASE-EVIDENCE.json` and `SHA256SUMS.txt`, verify every server-side
 SHA-256/size, and publish. No PyPI upload or new credentials are configured.

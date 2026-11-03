@@ -108,6 +108,19 @@ class ExactWorkflowIdentityTests(unittest.TestCase):
             with self.assertRaisesRegex(release.ReleaseError,'BUNDLE_IDENTITY_MISSING'):ci.publish('v0.1.2',ROOT)
         api.assert_not_called()
 
+class DraftReleaseLookupTests(unittest.TestCase):
+    def test_existing_draft_is_found_without_tag_endpoint(self):
+        draft={'id':432459869,'tag_name':'v0.1.2','draft':True,'assets':[]}
+        with patch.object(ci,'api',return_value=[draft]) as request:
+            self.assertEqual(ci.find_release('DepLoom/core','v0.1.2'),draft)
+        request.assert_called_once_with('repos/DepLoom/core/releases?per_page=100&page=1')
+    def test_pagination_absence_duplicate_and_api_failure_fail_closed(self):
+        first=[{'tag_name':'other'}]*100;draft={'id':1,'tag_name':'v0.1.2','draft':True}
+        with patch.object(ci,'api',side_effect=[first,[draft]]):self.assertEqual(ci.find_release('DepLoom/core','v0.1.2'),draft)
+        with patch.object(ci,'api',return_value=[]):self.assertIsNone(ci.find_release('DepLoom/core','v0.1.2'))
+        with patch.object(ci,'api',return_value=[draft,draft]),self.assertRaisesRegex(release.ReleaseError,'DUPLICATE'):ci.find_release('DepLoom/core','v0.1.2')
+        with patch.object(ci,'api',side_effect=release.ReleaseError('denied')),self.assertRaisesRegex(release.ReleaseError,'denied'):ci.find_release('DepLoom/core','v0.1.2')
+
 class ImmutableAssetTests(unittest.TestCase):
     def test_missing_assets_can_resume_but_different_or_unknown_assets_cannot(self):
         expected={'package.whl':{'size':5,'digest':'sha256:'+'a'*64},'SHA256SUMS.txt':{'size':7,'digest':'sha256:'+'b'*64}}

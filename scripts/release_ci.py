@@ -143,6 +143,17 @@ def remote_tag_matches(value):
     if tag.get('object',{}).get('type')!='commit' or tag['object'].get('sha')!=value['commit'] or tag.get('tag')!=value['tag']:
         raise ReleaseError('REMOTE_TAG_TARGET_CHANGED')
 
+def find_release(repo,tag):
+    # The tag endpoint excludes drafts. Authenticated list includes drafts.
+    # Exhaust pagination before proving absence; an API failure must propagate.
+    matches=[]
+    for page in range(1,101):
+        rows=api('repos/'+repo+'/releases?per_page=100&page='+str(page))
+        matches.extend(row for row in rows if row.get('tag_name')==tag)
+        if len(matches)>1:raise ReleaseError('DUPLICATE_RELEASE_TAG')
+        if len(rows)<100:return matches[0] if matches else None
+    raise ReleaseError('RELEASE_LOOKUP_PAGINATION_LIMIT')
+
 def publish(tag,folder):
     value=identity(tag);folder=Path(folder).resolve()
     manifest_sha=os.environ.get('EXPECTED_MANIFEST_SHA256','');artifact_id=os.environ.get('RELEASE_ARTIFACT_ID','');bundle_sha=os.environ.get('RELEASE_ARTIFACT_DIGEST','')
@@ -155,21 +166,21 @@ def publish(tag,folder):
             or bundle.get('workflow_run',{}).get('head_sha')!=value['commit']):raise ReleaseError('QUALIFIED_ARTIFACT_BUNDLE_MISMATCH')
     expected=expected_assets(folder,value)
     remote_tag_matches(value)
-    repo=value['repository'];endpoint='repos/'+repo+'/releases/tags/'+tag
-    # A missing release is the only tolerated read error. Never interpret an API denial as absence.
-    query=subprocess.run(['gh','api','--include',endpoint],capture_output=True,text=True,timeout=90)
-    if query.returncode:
-        if not re.search(r'(?m)^HTTP/[^\s]+ 404\b',query.stdout):raise ReleaseError('RELEASE_LOOKUP_NOT_PROVEN_ABSENT')
-        notes=ROOT/'.component-release'/'release-notes.md';notes.parent.mkdir(exist_ok=True)
-        notes.write_text('Release '+tag+' of '+value['package']+'.\n\nExact source: '+value['commit']+'. Existing exact-main CI, packaging and required component correctness gates passed. See RELEASE-EVIDENCE.json and SHA256SUMS.txt for artifact provenance.\n\nNative goal execution remains bounded to Windows standalone npm profiles; a release is not universal application acceptance or an agent-speedup claim.\n',encoding='utf8')
-        run(['gh','release','create',tag,'--repo',repo,'--draft','--verify-tag','--title',value['package']+' '+value['version'],'--notes-file',str(notes)])
+    repo=value['repository'];release=find_release(repo,tag)
+    if release is None:
+        release=api('repos/'+repo+'/releases',method='POST',payload={
+            'tag_name':tag,'target_commitish':value['commit'],'draft':True,
+            'name':value['package']+' '+value['version'],
+            'body':'Exact source: '+value['commit']+'. See RELEASE-EVIDENCE.json and SHA256SUMS.txt. Component qualification does not replace real-project acceptance.'})
+    if release.get('tag_name')!=tag or not isinstance(release.get('id'),int):raise ReleaseError('RELEASE_IDENTITY_MISMATCH')
+    endpoint='repos/'+repo+'/releases/'+str(release['id'])
     release=api(endpoint)
     missing=reconcile_assets(release['assets'],expected)
     if missing and not release['draft']:raise ReleaseError('PUBLISHED_RELEASE_INCOMPLETE_NO_SILENT_MODIFICATION')
-    for name in missing:run(['gh','release','upload',tag,str(folder/name),'--repo',repo])
+    for name in missing:run(['gh','api','--method','POST','https://uploads.github.com/repos/'+repo+'/releases/'+str(release['id'])+'/assets?name='+name,'-H','Content-Type: application/octet-stream','--input',str(folder/name)],capture=True)
     release=api(endpoint)
     if reconcile_assets(release['assets'],expected):raise ReleaseError('UPLOADED_ASSET_SET_INCOMPLETE')
-    if release['draft']:run(['gh','release','edit',tag,'--repo',repo,'--draft=false','--latest'])
+    if release['draft']:api(endpoint,method='PATCH',payload={'draft':False,'make_latest':'true'})
     final=api(endpoint)
     if final['draft'] or reconcile_assets(final['assets'],expected):raise ReleaseError('PUBLICATION_NOT_CONFIRMED')
     remote_tag_matches(value)
