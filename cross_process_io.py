@@ -123,7 +123,13 @@ def coordinated_io(kind, *, error_type=None):
                         raise error_type(str(exc)) from exc
                     raise
                 if kwargs.get("timeout_seconds", 0):
-                    kwargs["timeout_seconds"] = max(1, kwargs["timeout_seconds"] - waited_ms / 1000)
+                    remaining = kwargs["timeout_seconds"] - waited_ms / 1000
+                    if kwargs.get("exact_timeout") is True:
+                        if remaining <= 0:
+                            raise (error_type or TimeoutError)("SOURCE_MATERIALIZATION_TIMEOUT")
+                        kwargs["timeout_seconds"] = remaining
+                    else:
+                        kwargs["timeout_seconds"] = max(1, remaining)
                 return function(*args, **kwargs)
         return run
     return decorate

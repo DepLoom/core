@@ -66,7 +66,7 @@ import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from enum import Enum
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin, quote
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
@@ -89,11 +89,18 @@ from baseline_repair_handoff import (
 )
 from baseline_cohort_inference import infer_baseline_cohort
 from draft_decision_contract import (
-    LATEST_APPROVED, contract_from_snapshot, decision_contract_prompt,
+    LATEST_APPROVED, EXPLICIT_VERSIONS, contract_from_snapshot, decision_contract_prompt,
     normalize_decision_contract, package_is_mutable, version_line_allowed,
 )
 from draft_input_identity import capture_draft_semantic_inputs, aggregate_semantic_inputs
+from draft_publication_guard import guard_draft_publication
+import draft_npm_preflight
 from storybook_release_policy import is_storybook_release_package
+from registry_candidate_diagnostics import (
+    summarize_structural_candidates, with_observed_physical_probes,
+    no_target_diagnostic_code, safe_registry_artifact_url, valid_registry_packument_shape,
+    _identity as safe_registry_identity,
+)
 
 from deploom_failure import build_failure, write_diagnostic_artifact
 from cli_io import configure_utf8_stdio
@@ -1059,6 +1066,7 @@ class DependencyRow:
     planning_min_lag_3m: str = ""
     lag_planning_source: str = "live"
     registry_artifacts: Dict[str, Dict[str, Any]] = dataclasses.field(default_factory=dict)
+    registry_candidate_diagnostics: Dict[str, Any] = dataclasses.field(default_factory=dict)
     compatibility_cohort: str = ""
     compatibility_note: str = ""
     constraint_preflight: Dict[str, Any] = dataclasses.field(default_factory=dict)
@@ -1091,6 +1099,8 @@ class DependencyRow:
     # (registry request raised) / "osv-unavailable" (metadata OK, OSV failed).
     # Pending/interrupted rows are derived from draft_scan_state instead.
     draft_unknown: str = ""
+    # Publication-only uncertainty; registry/OSV observations stay unchanged.
+    draft_planning_unknown: str = ""
     # R12: an explicitly bounded candidate search (draft-max-candidates / max-candidates)
     # left versions outside the covered evidence network. Such a row is never a
     # proven "no target" -- the honest status is `candidate-search-truncated`.
@@ -2689,27 +2699,14 @@ class LiveDataClient:
         return scheme, host, port
 
     def registry_artifact_url_allowed(self, url: str) -> bool:
-        """Allow package artifacts only from the configured registry path.
+        """Fail-closed same-origin/path admission for registry artifacts.
 
-        Release notes may still come from GitHub, but package-manager metadata,
-        tarballs and lockfile `resolved` URLs must stay inside the configured
-        registry.  This prevents a Nexus-backed roadmap from silently selecting
-        a public npm/yarn artifact.
+        Match the lockfile validator and never permit credentials, redirects,
+        ambiguous dot-segments, signed queries or malformed authority to
+        create a candidate. This only tightens unsafe URL admission; it does
+        not alter solver constraints or the diagnostic reason taxonomy.
         """
-        value = str(url or "").strip()
-        if not value:
-            return False
-        registry_parsed = urlparse(self.registry)
-        artifact_parsed = urlparse(value)
-        if self._origin_tuple(self.registry) != self._origin_tuple(value):
-            return False
-        registry_path = registry_parsed.path.rstrip("/")
-        artifact_path = artifact_parsed.path or ""
-        if registry_path and not (
-            artifact_path == registry_path or artifact_path.startswith(registry_path + "/")
-        ):
-            return False
-        return artifact_parsed.scheme in {"http", "https"} and bool(artifact_parsed.hostname)
+        return safe_registry_artifact_url(self.registry, url)
 
     def registry_tarball_url(self, meta: Dict[str, Any], version: str) -> str:
         version_meta = (meta.get("versions") or {}).get(version)
@@ -2776,28 +2773,54 @@ class LiveDataClient:
 
         response = None
         try:
-            response = self._supervised(
-                lambda tarball_url=tarball_url: self.session.get(
-                    tarball_url,
-                    timeout=self._budgeted_timeout(),
-                    stream=True,
-                    headers={"Range": "bytes=0-0", "Accept": "application/octet-stream"},
-                    allow_redirects=True,
+            # requests follows redirects *before* its caller can validate the
+            # final URL. Never send a request to an unapproved destination.
+            # Also bound the number of allowed same-registry redirects.
+            next_url = tarball_url
+            for redirect_count in range(6):
+                response = self._supervised(
+                    lambda target=next_url: self.session.get(
+                        target,
+                        timeout=self._budgeted_timeout(),
+                        stream=True,
+                        headers={"Range": "bytes=0-0", "Accept": "application/octet-stream"},
+                        allow_redirects=False,
+                    )
                 )
-            )
-            evidence["httpStatus"] = int(response.status_code)
-            evidence["finalUrl"] = str(response.url or tarball_url)
-            if not self.registry_artifact_url_allowed(evidence["finalUrl"]):
-                evidence["status"] = "foreign-registry-redirect"
-                evidence["error"] = "tarball redirected outside the configured registry"
+                evidence["httpStatus"] = int(response.status_code)
+                if response.status_code not in {301, 302, 303, 307, 308}:
+                    break
+                location = response.headers.get("Location")
+                destination = urljoin(next_url, location) if location else ""
+                response.close()
+                response = None
+                if not destination or not self.registry_artifact_url_allowed(destination):
+                    evidence["status"] = "foreign-registry-redirect"
+                    evidence["error"] = "tarball redirected outside configured registry or to an invalid URL"
+                    # Never record a secret-bearing untrusted Location header.
+                    evidence["finalUrl"] = ""
+                    break
+                next_url = destination
             else:
-                response.raise_for_status()
-                first = next(response.iter_content(chunk_size=REGISTRY_ARTIFACT_PROBE_BYTES), b"")
-                if first:
-                    evidence["status"] = "available"
+                evidence["status"] = "redirect-limit-exceeded"
+                evidence["error"] = "tarball exceeded bounded same-registry redirect limit"
+
+            if evidence["status"] == "unknown":
+                if response is None:
+                    raise ValueError("artifact probe returned no final response")
+                # Avoid leaking URL query/credentials in downstream evidence.
+                evidence["finalUrl"] = response.url if self.registry_artifact_url_allowed(response.url) else ""
+                if not self.registry_artifact_url_allowed(response.url):
+                    evidence["status"] = "foreign-registry-redirect"
+                    evidence["error"] = "tarball response outside configured registry"
                 else:
-                    evidence["status"] = "empty-artifact"
-                    evidence["error"] = "registry returned an empty artifact response"
+                    response.raise_for_status()
+                    first = next(response.iter_content(chunk_size=REGISTRY_ARTIFACT_PROBE_BYTES), b"")
+                    if first:
+                        evidence["status"] = "available"
+                    else:
+                        evidence["status"] = "empty-artifact"
+                        evidence["error"] = "registry returned an empty artifact response"
         except DraftBudgetExceeded:
             raise
         except requests.HTTPError as exc:
@@ -2852,6 +2875,59 @@ class LiveDataClient:
                 continue
             accepted.append(version)
         return accepted, notes
+
+    def registry_exact_version_manifest(
+        self, pkg: str, version: str,
+    ) -> Tuple[Optional[Dict[str, Any]], str]:
+        """Fetch ONE explicitly authorized version from this registry.
+
+        A known packument snapshot may lack a still-published historical
+        version. Do not infer absence from an incomplete in-memory/cache
+        index; query the registry's exact-version manifest instead. This is
+        a metadata-only admission probe, NOT a tarball install/OSV proof.
+        No arbitrary URL or redirect is accepted from a response.
+        """
+        if (
+            not isinstance(pkg, str) or not pkg
+            or not isinstance(version, str)
+            or not re.fullmatch(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", version)
+        ):
+            return None, "INVALID_EXACT_VERSION_INPUT"
+        url = f"{self.registry}/{quote(pkg, safe='@')}/{quote(version, safe='')}"
+        response = None
+        try:
+            response = self._supervised(
+                lambda: self.session.get(
+                    url, timeout=self._budgeted_timeout(),
+                    stream=True, allow_redirects=False,
+                )
+            )
+            status = int(getattr(response, "status_code", 0) or 0)
+            if status in (404, 410):
+                return None, "EXACT_VERSION_NOT_PUBLISHED"
+            if status != 200:
+                # 3xx is not an invitation to follow an unknown Location.
+                return None, "EXACT_VERSION_METADATA_UNVERIFIED"
+            record = self._bounded_json(response)
+            if (
+                not isinstance(record, dict)
+                or record.get("name") != pkg
+                or record.get("version") != version
+                or not valid_registry_packument_shape({"versions": {version: record}})
+            ):
+                return None, "EXACT_VERSION_IDENTITY_OR_METADATA_INVALID"
+            dist = record.get("dist")
+            tarball = dist.get("tarball") if isinstance(dist, dict) else None
+            if not isinstance(tarball, str) or not self.registry_artifact_url_allowed(tarball):
+                return None, "EXACT_VERSION_TARBALL_ORIGIN_REJECTED"
+            return record, "EXACT_VERSION_METADATA_ADMITTED"
+        except DraftBudgetExceeded:
+            raise
+        except (requests.RequestException, ValueError, UnicodeError, OSError):
+            return None, "EXACT_VERSION_METADATA_UNVERIFIED"
+        finally:
+            if response is not None:
+                response.close()
 
     def first_installable_version(
         self,
@@ -2948,9 +3024,16 @@ class LiveDataClient:
             self.npm_cache.clear()
             self._metadata_request_context = context
         if pkg in self.npm_cache:
-            return self.npm_cache[pkg]
+            if self.npm_cache[pkg] is None or valid_registry_packument_shape(self.npm_cache[pkg]):
+                return self.npm_cache[pkg]
+            self.npm_cache.pop(pkg, None)
         data, executed, *_ = cached_query(["public-packument-v1", self.registry, context, pkg], fetch,
                                          ttl=self.metadata_cache_ttl, check=check)
+        if data is None:  # legitimate registry HTTP 404 package absence
+            self.npm_cache[pkg] = None
+            return None
+        if not valid_registry_packument_shape(data):
+            raise RegistryInfrastructureError("REGISTRY_METADATA_INVALID_SHAPE: cached metadata lacks valid versions/dist")
         if not executed and isinstance(data, dict):
             self._metadata_cache_disk_hits += 1
         self.npm_cache[pkg] = data
@@ -2962,7 +3045,9 @@ class LiveDataClient:
             self.npm_cache.clear()
             self._metadata_request_context = context
         if pkg in self.npm_cache:
-            return self.npm_cache[pkg]
+            if self.npm_cache[pkg] is None or valid_registry_packument_shape(self.npm_cache[pkg]):
+                return self.npm_cache[pkg]
+            self.npm_cache.pop(pkg, None)
         if durable and self.metadata_cache_dir is not None and self.metadata_cache_ttl > 0:
             # C2: planning packument cache -- merge latest/version/engines/
             # history metadata queries across CLI invocations. Only a fresh
@@ -2970,7 +3055,7 @@ class LiveDataClient:
             cached = load_packument(
                 self.metadata_cache_dir, self.registry, pkg, self.metadata_cache_ttl, context=context or ""
             )
-            if cached is not None:
+            if cached is not None and valid_registry_packument_shape(cached):
                 self.npm_cache[pkg] = cached
                 self._metadata_cache_disk_hits += 1
                 return cached
@@ -2996,6 +3081,8 @@ class LiveDataClient:
                 if status == 304 and stale is not None:
                     response.close()
                     data = stale["data"]
+                    if not valid_registry_packument_shape(data):
+                        raise ValueError("304 response has invalid cached registry packument")
                     store_packument(self.metadata_cache_dir, self.registry, pkg, data,
                                     self.metadata_cache_tool_version, context=context or "", validators=stale["validators"])
                     self.npm_cache[pkg] = data
@@ -3013,8 +3100,8 @@ class LiveDataClient:
                     return None
                 response.raise_for_status()
                 data = self._bounded_json(response)
-                if not isinstance(data, dict):
-                    raise ValueError("registry metadata response is not a JSON object")
+                if not valid_registry_packument_shape(data):
+                    raise ValueError("registry packument has invalid versions/dist-tags/time/dist shape")
                 self.npm_cache[pkg] = data
                 if durable and self.metadata_cache_dir is not None and self.metadata_cache_ttl > 0:
                     # Best-effort; a cache write failure never aborts the run.
@@ -3085,6 +3172,10 @@ class LiveDataClient:
                 )
                 r.raise_for_status()
                 data = self._bounded_json(r).get("results", [])
+                self._prefetch_osv_details([
+                    ref["id"] for item in data for ref in (item.get("vulns", []) or [])
+                    if ref.get("id")
+                ])
                 for v, item in zip(batch, data):
                     details: List[Dict[str, Any]] = []
                     for ref in item.get("vulns", []) or []:
@@ -3111,6 +3202,54 @@ class LiveDataClient:
                 )
             result[v] = self.osv_cache[key]
         return result
+
+    def _prefetch_osv_details(self, references: Sequence[str]) -> None:
+        """Fetch unique fresh advisory bodies with isolated, bounded workers.
+
+        The parent cache is updated only after the complete batch succeeds.
+        Deadline expiry or any missing evidence remains an error; a late worker
+        can mutate only its private client, never the published parent state.
+        """
+        ids = sorted(set(references) - self.vuln_detail_cache.keys())
+        if len(ids) < 2:
+            return
+
+        local = threading.local()
+        workers: List[LiveDataClient] = []
+        workers_lock = threading.Lock()
+
+        def fetch_one(vuln_id: str) -> Dict[str, Any]:
+            worker = getattr(local, "client", None)
+            if worker is None:
+                worker = LiveDataClient(
+                    self.registry, timeout=self.timeout, batch_size=self.batch_size,
+                    sleep_sec=self.sleep_sec, use_system_proxy=self.use_system_proxy,
+                )
+                worker.set_deadline(self.deadline)
+                worker.session.trust_env = self.session.trust_env
+                worker.session.max_redirects = self.session.max_redirects
+                worker.session.params = shallow_copy(self.session.params)
+                worker.session.headers.update(self.session.headers)
+                worker.session.auth = self.session.auth
+                worker.session.proxies.update(self.session.proxies)
+                worker.session.cookies.update(self.session.cookies)
+                worker.session.verify = self.session.verify
+                worker.session.cert = self.session.cert
+                local.client = worker
+                with workers_lock:
+                    workers.append(worker)
+            return worker.fetch_osv_vuln(vuln_id)
+
+        def collect() -> Dict[str, Dict[str, Any]]:
+            try:
+                with ThreadPoolExecutor(max_workers=min(4, len(ids))) as pool:
+                    return dict(zip(ids, pool.map(fetch_one, ids)))
+            finally:
+                for worker in workers:
+                    worker.session.close()
+
+        evidence = run_supervised("osv-details", self.deadline, collect)
+        self.vuln_detail_cache.update(evidence)
 
     def fetch_osv_vuln(self, vuln_id: str) -> Dict[str, Any]:
         if vuln_id in self.vuln_detail_cache:
@@ -4999,6 +5138,12 @@ def analyze_project(
         # "no installable target" for dependencies whose first N versions are
         # equally old (53/63 lag blockers on the production 77-package run).
         search_versions, _ = versions_from_current(meta, current, include_prerelease, 0)
+        # Explain structural rejection without changing the existing Core allowlist.
+        # This is not proof of physical tarball availability or solver feasibility.
+        registry_candidate_diagnostics = summarize_structural_candidates(
+            client.registry, meta, search_versions,
+            client.registry_artifact_url_allowed, current=current,
+        )
         structural_candidates, registry_candidate_notes = client.registry_structural_candidates(meta, search_versions)
         if registry_candidate_notes:
             notes.append(
@@ -5148,6 +5293,15 @@ def analyze_project(
                 registry_artifacts[candidate_target] = client.registry_version_artifact(
                     name, meta, candidate_target
                 )
+        # Physical evidence is read only from probes that Core already ran.
+        # A Draft planning-only row cannot claim an HTTP success or failure.
+        seen_versions = set(search_versions)
+        registry_candidate_diagnostics = with_observed_physical_probes(
+            registry_candidate_diagnostics,
+            {version: evidence for (pkg, version), evidence in client.registry_artifact_cache.items()
+             if pkg == name and version in seen_versions},
+            current=current,
+        )
         analysis = AnalysisInfo(
             metadata_available=True,
             non_registry=False,
@@ -5180,6 +5334,7 @@ def analyze_project(
             reason=reason,
             notes="; ".join(notes),
             registry_artifacts=registry_artifacts,
+            registry_candidate_diagnostics=registry_candidate_diagnostics,
             vuln_evidence_by_version={v: vuln_summary(entries) for v, entries in (vulns or {}).items()},
             draft_scan_state="done",
             draft_unknown="osv-unavailable" if vulns is None else "",
@@ -6653,6 +6808,77 @@ def apply_decision_contract_targets(rows_by_project: Dict[str, List[DependencyRo
     Candidate selection does not fill missing OSV evidence with a safe value.
     """
     contract = _baseline_intent_payload()["decisionContract"]
+    if contract["objective"] == EXPLICIT_VERSIONS:
+        # User-authorized *target declarations*, not source manifest ranges.
+        # The original manifest/lock remain frozen input evidence; the chosen
+        # upgrade may require a migration that changes those exact declarations.
+        # Source + install/build/runtime compatibility remain NOT_VERIFIED.
+        exact = contract["exactTargets"]
+        for rows in rows_by_project.values():
+            for row in rows:
+                if row.name not in exact:
+                    # The regular version-line scope pass still protects any
+                    # immutable package from the health-plan's unrelated goal.
+                    for mode in ("default", "yellow", "green"):
+                        target = getattr(row, f"target_{mode}")
+                        if target_is_action(target) and not version_line_allowed(
+                            row.name, row.current_version, target, contract
+                        ):
+                            _set_mode_target(row, mode, NO_ACTION,
+                                "EXACT_TARGET_SCOPE: package not authorized to move")
+                    continue
+                target = exact[row.name]
+                current = safe_version(row.current_version)
+                selected = safe_version(target)
+                reason = ""
+                if row.scope_excluded or row.planner_deferred or _baseline_intent_policy(row.name) == "keep-current":
+                    reason = "EXACT_TARGET_SCOPE_CONFLICT: package excluded, deferred or immutable"
+                elif current is None or selected is None or selected <= current:
+                    reason = "EXACT_TARGET_NOT_AN_UPGRADE: requested version must exceed installed baseline"
+                else:
+                    meta = client.npm_cache.get(row.name)
+                    versions = (meta.get("versions") or {}) if isinstance(meta, dict) else {}
+                    refresh_status = ""
+                    if not isinstance(versions.get(target), dict):
+                        # A prefetch/cache snapshot is not proof that the exact
+                        # published version does not exist. The second read is
+                        # version-specific, uses this registry only, validates
+                        # name/version and tarball origin, and never runs npm.
+                        record, refresh_status = client.registry_exact_version_manifest(
+                            row.name, target
+                        )
+                        if record is not None:
+                            enriched = dict(meta) if isinstance(meta, dict) else {}
+                            indexed = dict(enriched.get("versions") or {})
+                            indexed[target] = record
+                            enriched["versions"] = indexed
+                            client.npm_cache[row.name] = enriched
+                            meta = enriched
+                    if not isinstance(meta, dict) or target not in (meta.get("versions") or {}):
+                        reason = (
+                            "EXACT_TARGET_UNAVAILABLE: target absent from registry metadata; "
+                            + (refresh_status or "EXACT_VERSION_METADATA_UNVERIFIED")
+                        )
+                    else:
+                        eligible, rejection_notes = client.registry_structural_candidates(meta, [target])
+                        if target not in eligible:
+                            reason = "EXACT_TARGET_UNAVAILABLE: registry tarball origin or metadata rejected"
+                        elif client.registry_version_type_declarations_ok(row.name, meta, target):
+                            reason = "EXACT_TARGET_UNAVAILABLE: type declaration guard rejected target"
+                        elif client.registry_version_runtime_entrypoint_ok(row.name, meta, target):
+                            reason = "EXACT_TARGET_UNAVAILABLE: runtime entrypoint guard rejected target"
+                if reason:
+                    row.objective_note = reason
+                    row.compatibility_note = target_reason_join([row.compatibility_note, reason])
+                    for mode in ("default", "yellow", "green"):
+                        _set_mode_target(row, mode, NO_ACTION, reason)
+                else:
+                    row.objective_candidate = target
+                    row.objective_note = ("EXPLICIT_USER_TARGET: exact registry candidate; "
+                                          "peer/engine/OSV and runtime remain to be verified")
+                    for mode in ("default", "yellow", "green"):
+                        _set_mode_target(row, mode, target, row.objective_note)
+        return
     latest = contract["objective"] == LATEST_APPROVED
     for rows in rows_by_project.values():
         for row in rows:
@@ -7440,6 +7666,7 @@ def _project_environment_constraint_issue(
     row: DependencyRow,
     version: str,
     client: LiveDataClient,
+    *, check_current: bool = False,
 ) -> str:
     """Reject a candidate that cannot run on an exact project Node runtime.
 
@@ -7448,7 +7675,7 @@ def _project_environment_constraint_issue(
     excludes a pinned/current project runtime is a plan-level contradiction and
     should never reach a work branch.
     """
-    if version == row.current_version:
+    if version == row.current_version and not check_current:
         return ""
     metadata = _package_version_metadata(row, version, client)
     if not isinstance(metadata, dict):
@@ -7624,6 +7851,25 @@ def _candidate_domain(row: DependencyRow, mode: str, client: LiveDataClient) -> 
         return [row.current_version]
     if row.scope_excluded or row.planner_deferred:
         return [row.current_version]
+    contract = _baseline_intent_payload()["decisionContract"]
+    if contract["objective"] == EXPLICIT_VERSIONS:
+        requested = (contract.get("exactTargets") or {}).get(row.name)
+        # Non-target companions remain in the exact solver as immutable,
+        # constraint-bearing baseline packages: not excluded from health.
+        if not requested:
+            return [row.current_version]
+        desired = _desired_target_for_mode(row, mode)
+        meta = client.npm_cache.get(row.name)
+        # An unavailable / rejected target is not conjured into a model.
+        # Keep current as a blocked fallback for honest plan publication.
+        if desired != requested or not isinstance(meta, dict):
+            return [row.current_version]
+        structural, _ = client.registry_structural_candidates(meta, [requested])
+        if requested not in structural:
+            return [row.current_version]
+        if not version_line_allowed(row.name, row.current_version, requested, contract):
+            return [row.current_version]
+        return [requested, row.current_version]
     desired = _desired_target_for_mode(row, mode)
     meta = client.npm_cache.get(row.name)
     if not isinstance(meta, dict):
@@ -8165,6 +8411,8 @@ def _build_peer_optimization_model(
     mode: str,
     learned_nogoods: Optional[List[Dict[str, str]]] = None,
     stability_targets: Optional[Dict[str, str]] = None,
+    *, intent_policies: Optional[Dict[str, str]] = None,
+    strict_current: bool = False,
 ) -> PeerOptimizationModel:
     """Extract one peer component into a solver-neutral finite-domain IR.
 
@@ -8244,10 +8492,27 @@ def _build_peer_optimization_model(
         seen_requirements.add(key)
         requirements.append(requirement)
 
+    if intent_policies is not None and (set(intent_policies) != component_set
+            or any(value not in BASELINE_INTENT_POLICIES for value in intent_policies.values())):
+        raise ValueError("INVALID_EXPLICIT_PEER_INTENT")
+    exact_contract = _baseline_intent_payload()["decisionContract"] if intent_policies is None else {}
+    exact_assignments = (exact_contract.get("exactTargets") or {}
+                         if exact_contract.get("objective") == EXPLICIT_VERSIONS else {})
     for intent_name in sorted(component):
         intent_row = rows_by_name[intent_name]
-        intent_policy = _baseline_intent_policy(intent_name)
-        if intent_policy == "required" and intent_row.current_version in domains.get(intent_name, []):
+        intent_policy = _baseline_intent_policy(intent_name) if intent_policies is None else intent_policies[intent_name]
+        chosen_exact = exact_assignments.get(intent_name)
+        if chosen_exact and chosen_exact in domains.get(intent_name, []):
+            # Enforce the exact selected version *inside* Z3 / finite-domain
+            # constraints, never by rewriting the solver's published output.
+            for other in domains[intent_name]:
+                if other != chosen_exact:
+                    add_constraint(
+                        [(intent_name, other)],
+                        reason=f"USER_EXACT_TARGET: {intent_name} must be {chosen_exact}",
+                        provenance="user-exact-target",
+                    )
+        elif intent_policy == "required" and intent_row.current_version in domains.get(intent_name, []):
             add_constraint(
                 [(intent_name, intent_row.current_version)],
                 reason=f"USER_BASELINE_REQUIRED_UPDATE: {intent_name} must move away from current {intent_row.current_version}",
@@ -8284,9 +8549,9 @@ def _build_peer_optimization_model(
     for source_name in sorted(component):
         source = rows_by_name[source_name]
         for source_version in domains[source_name]:
-            source_moved = source_version != source.current_version
+            source_moved = strict_current or source_version != source.current_version
             if source_moved:
-                environment_issue = _project_environment_constraint_issue(source, source_version, client)
+                environment_issue = _project_environment_constraint_issue(source, source_version, client, check_current=strict_current)
                 if environment_issue:
                     add_constraint(
                         [(source_name, source_version)],
@@ -23997,7 +24262,7 @@ def _draft_target_for_major(row: DependencyRow) -> str:
     """
     if row.scope_excluded:
         return NO_ACTION
-    if row.planner_deferred:
+    if row.planner_deferred or row.draft_planning_unknown:
         return NO_ACTION
     # F5: the chosen level is the row's OWN project acceptance policy
     # (`targetLevel`), which for the CLI equals --target-level and for a
@@ -24153,9 +24418,17 @@ def _draft_row_status(row: DependencyRow, chosen_target: str) -> str:
         return "peer-compat-unresolved"
     if not _row_metadata_known(row):
         return "unknown-metadata"
+    if row.draft_planning_unknown:
+        return "planning-incomplete"
     current = str(row.current_version or "").strip()
     target = str(chosen_target or "").strip()
     if target == NO_ACTION or target == "":
+        exact_contract = _baseline_intent_payload()["decisionContract"]
+        if (exact_contract["objective"] == EXPLICIT_VERSIONS
+                and row.name in (exact_contract.get("exactTargets") or {})):
+            # User explicitly requested a concrete target. Keeping the healthy
+            # baseline is NOT success: missing target evidence is a blocker.
+            return "blocked"
         if not _row_security_known(row) or _row_has_unrated_vulns(row):
             return "unknown-security"
         if _draft_policy_satisfied(row):
@@ -24210,6 +24483,7 @@ def build_draft_plan(
     manifests: Dict[str, Any] = {}
     projects: List[str] = sorted(rows_by_project)
     totals = {"proposed": 0, "no-change": 0, "ok": 0, "blocked": 0, "deferred": 0, "excluded": 0, "unknown-metadata": 0, "unknown-security": 0, "no-target": 0, "candidate-search-truncated": 0, "peer-compat-unresolved": 0,
+              "no-installable-artifact": 0,
               "not-attempted": 0, "interrupted": 0, "registry-failed": 0, "osv-unavailable": 0, "unrated": 0, "total": 0}
     scan: Dict[str, Dict[str, int]] = {}
     for project in projects:
@@ -24243,11 +24517,18 @@ def build_draft_plan(
             target = _draft_target_for_major(row)
             status = _draft_row_status(row, target)
             totals[status] = totals.get(status, 0) + 1
+            registry_no_target_code = no_target_diagnostic_code(
+                status, row.registry_candidate_diagnostics,
+            )
+            if registry_no_target_code == "NO_INSTALLABLE_ARTIFACT":
+                totals["no-installable-artifact"] += 1
             totals["total"] += 1
             target_reason = row.reason if row.reason else (
                 row.target_default_reason if row.target_default_reason != NO_ACTION else None
             )
-            if status in ("no-target", "candidate-search-truncated", "blocked"):
+            if status == "planning-incomplete":
+                target_reason = row.draft_planning_unknown
+            elif status in ("no-target", "candidate-search-truncated", "blocked"):
                 # R12: no-target rows must state the REAL planner reason, never
                 # the display-group cause; a truncated search names the limit.
                 target_reason = (
@@ -24285,6 +24566,10 @@ def build_draft_plan(
                 "breakingChanges": list(row.breaking_changes or []),
                 "migrationNotes": list(row.migration_notes or []),
             }
+            if row.registry_candidate_diagnostics:
+                entry["registryCandidateDiagnostics"] = row.registry_candidate_diagnostics
+            if registry_no_target_code:
+                entry["noTargetDiagnosticCode"] = registry_no_target_code
             if row.compatibility_cohort or row.compatibility_note:
                 entry["conflict"] = row.compatibility_note or row.compatibility_cohort
                 conflicts.append({"package": row.name, "project": project, "note": row.compatibility_note or row.compatibility_cohort, "cohort": row.compatibility_cohort})
@@ -24316,7 +24601,7 @@ def build_draft_plan(
             # with a security uncertainty add here (no double counting).
             if (sec_unknown or sec_unrated) and status != "unknown-security":
                 totals["unknown-security"] = totals.get("unknown-security", 0) + 1
-            if meta_unknown or sec_unknown or sec_unrated or status in ("unknown-metadata", "unknown-security", "candidate-search-truncated", "blocked", "no-target", "peer-compat-unresolved"):
+            if meta_unknown or sec_unknown or sec_unrated or status in ("unknown-metadata", "unknown-security", "candidate-search-truncated", "blocked", "no-target", "peer-compat-unresolved", "planning-incomplete"):
                 # T3: metadata (registry availability) and security (OSV) are
                 # separate unknown classes; an unassessed OSV state must reach
                 # the plan/summary/prompt even when the registry metadata is
@@ -24333,6 +24618,8 @@ def build_draft_plan(
                 # flag, the candidateTruncated/candidateTruncatedTargetless/
                 # candidateTruncatedProposed counters and a prompt not�.
                 causes = []
+                if row.draft_planning_unknown:
+                    causes.append(row.draft_planning_unknown)
                 if meta_unknown:
                     causes.append(_draft_metadata_unknown_reason(row))
                 if sec_unknown:
@@ -24358,6 +24645,8 @@ def build_draft_plan(
                           else ("truncated" if tr_blocked and not (meta_unknown or sec_blocked or peer_blocked) \
                                 else ("peer-compat" if peer_blocked and not (meta_unknown or sec_blocked or tr_blocked) \
                                       else "both")))
+                if row.draft_planning_unknown and not (meta_unknown or sec_blocked or tr_blocked or peer_blocked):
+                    clarity = "planning"
                 unknowns.append({
                     "package": row.name,
                     "project": project,
@@ -24482,6 +24771,8 @@ def build_draft_plan(
             target_level=target_level, projected_moderate=sec_moderate, projected_low=sec_low,
             lag_unknown=lag_unprovable, project_name=project,
         )
+        if goal_verdict == "feasible" and any(r.draft_planning_unknown for r in active_rows):
+            goal_verdict = "unknown"
         truncated_proposed = sum(
             1 for er in plan_rows if er.get("status") == "proposed" and er.get("candidateSearchTruncated")
         )
@@ -24524,8 +24815,29 @@ def build_draft_plan(
             "rows": plan_rows,
             "health": post_health,
         })
+    # Aggregate only codes and counts (never raw package URL or credentials).
+    registry_rejections: Dict[str, int] = defaultdict(int)
+    registry_examined = 0
+    registry_rejected = 0
+    for project_rows in rows_by_project.values():
+        for row in project_rows:
+            evidence = row.registry_candidate_diagnostics
+            if not evidence:
+                continue
+            registry_examined += int(evidence.get("examined", 0))
+            registry_rejected += int(evidence.get("rejected", 0))
+            for code, count in evidence.get("rejectionCounts", {}).items():
+                registry_rejections[code] += int(count)
     return {
         "schemaVersion": 1,
+        "registryDiagnostics": {
+            "schemaVersion": 1,
+            "examinedVersions": registry_examined,
+            "rejectedVersions": registry_rejected,
+            "rejectionCounts": dict(sorted(registry_rejections.items())),
+            "noInstallableArtifactRows": totals["no-installable-artifact"],
+            "authority": "STRUCTURAL_REGISTRY_EVIDENCE_ONLY",
+        },
         "projects": projects,
         "proposals": proposals,
         "unknowns": unknowns,
@@ -24538,17 +24850,18 @@ def build_draft_plan(
 
 
 def _sanitize_registry_url(url: str) -> str:
-    """Strip userinfo (credentials) from a registry URL for prompt output."""
-    text = str(url or "").strip()
-    if not text:
+    """Never print registry userinfo, query, token path or URL fragments.
+
+    Registry secrets may live in *any* path segment, not just a parameter
+    named token. Render the safe identity, not a truncated raw URL.
+    """
+    if not url:
         return ""
-    if "://" in text:
-        scheme, rest = text.split("://", 1)
-        if "@" in rest.split("/", 1)[0]:
-            authority = rest.split("/", 1)[0]
-            rest = rest.replace(authority, authority.rsplit("@", 1)[-1], 1)
-        return f"{scheme}://{rest}"
-    return text
+    identity = safe_registry_identity(url)
+    origin, prefix = identity.get("origin"), identity.get("pathPrefix")
+    if not origin:
+        return "[invalid-registry-url]"
+    return origin + (prefix if prefix and prefix != "/" else "")
 
 
 def _power_shell_quote(value: str) -> str:
@@ -25749,6 +26062,8 @@ def publish_draft_result(
     input_files_by_project: Optional[Dict[str, List[str]]] = None,
     solver_component_reports: Optional[List[Dict[str, Any]]] = None,
     execution_context: Optional[Dict[str, Any]] = None,
+    planning_complete: bool = True,
+    npm_preflight: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Publish the Draft result set atomically and return its manifest.
 
@@ -25761,9 +26076,22 @@ def publish_draft_result(
     raw_cap = str(cap_value).strip() if cap_value is not None else ""
     effective_cap = int(raw_cap) if raw_cap.isdecimal() else None
     generated_at = dt.datetime.now(dt.timezone.utc).isoformat()
+    rows_by_project, publication_guard = guard_draft_publication(
+        rows_by_project, snapshot, planning_complete=planning_complete,
+        no_action=NO_ACTION, is_action=target_is_action,
+    )
+    if publication_guard["changedProjects"]:
+        health_by_project = dict(health_by_project)
+        for project in publication_guard["changedProjects"]:
+            health_by_project[project] = compute_project_health(rows_by_project[project], project, None)
+    if publication_guard["issues"] and status == "DRAFT_READY":
+        status = "DRAFT_PARTIAL"
+        partial_reason = "Owner contract publication guard withheld unplanned or disallowed recommendations"
     plan = build_draft_plan(rows_by_project, projects_by_name, health_by_project)
     contract = contract_from_snapshot(snapshot)
     plan["decisionContract"] = contract
+    plan["publicationGuard"] = publication_guard
+    plan["constraintModel"] = draft_npm_preflight.root_model_coverage()
     semantic_inputs = aggregate_semantic_inputs({
         name: (spec.draft_semantic_inputs or capture_draft_semantic_inputs(
             spec.path, topology=spec.lockfile_state.get("projectTopology"),
@@ -25789,11 +26117,23 @@ def publish_draft_result(
     exec_ctx.setdefault("inputHashes", input_hashes or {})
     exec_ctx.setdefault("policy", dict(snapshot or {}))
     exec_ctx.setdefault("artifactsDir", str(draft_dir))
+    pm_validation = {"status": "NOT_RUN", "learningAllowed": False}
+    if npm_preflight is not None:
+        pm_validation = draft_npm_preflight.validate_draft_plan(
+            plan, {name: spec.path for name, spec in projects_by_name.items()},
+            artifacts_dir=draft_dir, registry=str(npm_preflight.get("registry") or ""),
+            options=npm_preflight, remaining=lambda: deadline.remaining,
+        )
+        if pm_validation["status"] != "RESOLUTION_PASSED":
+            status = "DRAFT_PARTIAL"
+            partial_reason = "Package-manager preflight: " + pm_validation["status"] + "; diagnosis/replanning required"
+    plan["packageManagerValidation"] = pm_validation
     prompt_md = build_draft_prompt(
         run_id, workspace_id, project_id, mode, policy_hash, plan, projects_by_name,
         language=language, snapshot=snapshot,
         execution_context=exec_ctx, artifacts_dir=str(draft_dir),
     )
+    prompt_md += draft_npm_preflight.validation_notice(pm_validation, language)
     counts = plan["counts"]
     proposed = counts.get("proposed", 0)
     # R12: `unknown`/`unknownPackages` list packages whose plan genuinely needs
@@ -25803,7 +26143,7 @@ def publish_draft_result(
     # their per-row evidence carries a truncation caveat; they must not be
     # reported as "needs clarification" (previously the whole unknowns list was
     # used and 61 actionable truncated rows inflated the counter).
-    clarification_statuses = {"unknown-metadata", "unknown-security", "candidate-search-truncated", "blocked", "no-target", "peer-compat-unresolved"}
+    clarification_statuses = {"unknown-metadata", "unknown-security", "candidate-search-truncated", "blocked", "no-target", "peer-compat-unresolved", "planning-incomplete"}
     clarification_names: List[str] = []
     truncated_rows = 0
     for project_rows in rows_by_project.values():
@@ -26049,6 +26389,8 @@ def publish_draft_result(
         "deadline": deadline.as_dict(),
         "policyHash": policy_hash,
         "decisionContract": contract,
+        "constraintModel": plan["constraintModel"],
+        "packageManagerValidation": pm_validation,
         "planningOptions": {
             "draftMaxCandidates": effective_cap,
             "candidateCapScope": "SECURITY_EVIDENCE_SEARCH",
@@ -26114,6 +26456,7 @@ def publish_draft_result(
             "candidateTruncatedProposed": truncated_proposed,
             "blocked": counts.get("blocked", 0),
             "peerCompatUnresolved": peer_unresolved,
+            "planningUnknown": counts.get("planning-incomplete", 0),
             "ok": counts.get("ok", 0),
             "postPlanLagOk": post_plan_ok,
             "postPlanLagOkPct": post_plan_pct,
@@ -26410,6 +26753,7 @@ def _publish_draft_and_exit(
     input_hashes: Optional[Dict[str, str]] = None,
     input_files_by_project: Optional[Dict[str, List[str]]] = None,
     solver_component_reports: Optional[List[Dict[str, Any]]] = None,
+    planning_complete: bool = False,
 ) -> None:
     """Publish whatever Draft data was gathered before an abort and exit 0.
 
@@ -26439,6 +26783,7 @@ def _publish_draft_and_exit(
         input_hashes=input_hashes,
         input_files_by_project=input_files_by_project,
         solver_component_reports=solver_component_reports,
+        planning_complete=planning_complete,
         execution_context=_build_draft_execution_context(
             projects_by_name,
             registry=registry,
@@ -26546,7 +26891,15 @@ def main() -> None:
         type=int,
         help="Minimum share (0..100) of lag-policy-compliant libraries for the goal to count as met (default 80). Part of the versioned policy hash.",
     )
+    ap.add_argument("--draft-npm-preflight", action="store_true", help="Opt-in strict full npm resolution in an isolated fresh-lock workspace; never grants installation/runtime authority.")
+    ap.add_argument("--draft-npm-preflight-cache", help="CLI npm cache root for the optional resolver preflight.")
+    ap.add_argument("--draft-npm-preflight-offline", action="store_true", help="Use only saved npm cache metadata; a cache miss remains UNKNOWN.")
+    ap.add_argument("--draft-npm-preflight-seconds", type=int, default=60, help="Preflight cap1..60s, also bounded by remaining Draft deadline.")
     args = ap.parse_args()
+    if args.draft_npm_preflight and not args.draft_baseline:
+        ap.error("--draft-npm-preflight requires --draft-baseline")
+    if not 1 <= args.draft_npm_preflight_seconds <= 60:
+        ap.error("--draft-npm-preflight-seconds must be1..60")
     if args.capture_baseline and args.draft_baseline:
         ap.error("--capture-baseline and --draft-baseline are mutually exclusive")
     source_baseline_mode = bool(args.capture_baseline or args.draft_baseline)
@@ -27290,6 +27643,7 @@ def main() -> None:
                         f"this is not a proven conflict and not a proven solution. {unresolved_groups}"
                     ),
                     solver_component_reports=draft_incomplete_components,
+                    planning_complete=True,
                     input_hashes=draft_input_hashes,
                     input_files_by_project=draft_input_files_by_project,
                 )
@@ -27424,6 +27778,12 @@ def main() -> None:
                 health_by_project=health_by_project,
                 status="DRAFT_READY",
                 partial_reason=None,
+                npm_preflight=({
+                    "registry": str(getattr(client, "registry", "") or ""),
+                    "cache": args.draft_npm_preflight_cache,
+                    "offline": args.draft_npm_preflight_offline,
+                    "timeoutSeconds": args.draft_npm_preflight_seconds,
+                } if args.draft_npm_preflight else None),
                 deadline=deadline_clock,
                 input_hashes=draft_input_hashes,
                 input_files_by_project=draft_input_files_by_project,
@@ -27447,6 +27807,7 @@ def main() -> None:
                 deadline_clock=deadline_clock,
                 status="DRAFT_PARTIAL",
                 partial_reason=f"Draft deadline ({deadline_clock.deadline_seconds}s) exceeded at {budget_exc.phase}; plan is partial.",
+                planning_complete=True,
                 input_hashes=draft_input_hashes,
                 input_files_by_project=draft_input_files_by_project,
             )

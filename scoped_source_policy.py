@@ -22,6 +22,13 @@ def in_scope(name, roots):
 
 
 def policy_payload(policy):
+    if policy.generated_output_profile:
+        from standalone_build_outputs import PROFILE
+        from source_snapshot import SourceCaptureError
+        if (policy.generated_output_profile != PROFILE or policy.frontend_profile or policy.frontend_build_output_paths
+                or policy.scope_roots or policy.excluded_relative_paths):
+            raise SourceCaptureError("SOURCE_GENERATED_OUTPUT_POLICY_INVALID")
+        return {"mode": PROFILE}
     if (not policy.frontend_profile and not policy.frontend_build_output_paths
             and not policy.scope_roots and policy.excluded_relative_paths
             and set(policy.excluded_relative_paths).issubset(REGENERABLE_CACHE_PATHS)):
@@ -41,6 +48,11 @@ def policy_from_payload(raw):
     from source_snapshot import SourceInputPolicy, SourceCaptureError
     if not raw:
         return SourceInputPolicy()
+    from standalone_build_outputs import PROFILE
+    if isinstance(raw, dict) and raw.get("mode") == PROFILE:
+        if set(raw) != {"mode"}:
+            raise SourceCaptureError("SOURCE_GENERATED_OUTPUT_POLICY_INVALID")
+        return SourceInputPolicy(generated_output_profile=PROFILE)
     if isinstance(raw, dict) and raw.get("mode") == "regenerable-caches-v1":
         caches = raw.get("excludedCachePaths")
         if not isinstance(caches, list) or any(name not in REGENERABLE_CACHE_PATHS for name in caches):
@@ -87,6 +99,9 @@ def policy_for_project(project, root):
     except ValueError as exc:
         raise SourceCaptureError("SOURCE_SCOPE_PROJECT_OUTSIDE_ROOT") from exc
     import os
+    from standalone_build_outputs import PROFILE
+    if os.environ.get(MODE_ENV) == PROFILE:
+        return SourceInputPolicy(generated_output_profile=PROFILE)
     if os.environ.get(MODE_ENV) == "frontend":
         from frontend_source_policy import discover_backend_build_outputs, AGENT_STATE_DIRS, KNOWN_FRONTEND_CACHE_PATHS
         from source_snapshot import DEFAULT_EXCLUDED_DIR_NAMES

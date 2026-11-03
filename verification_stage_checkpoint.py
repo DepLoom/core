@@ -334,3 +334,34 @@ def capture_recovery_source(project, directory, *, preferred_destination=None, t
         raise SourceCaptureError('SOURCE_CAPTURE_UNSTABLE: live inputs changed during durable publication')
     journal.write('source-sealed', 'PASS', {'container': str(snapshot.container), 'key': snapshot.key})
     return snapshot, False
+
+
+def pinned_inline_node_invocation(command, environment):
+    """Recognize one exact inline wrapper and construct direct Node argv.
+
+    No shell interpretation or external oracle-file read occurs. This binds
+    body/argv/tool identity, not arbitrary external inputs or applicability.
+    """
+    import base64
+    prefix="eval(Buffer.from('"
+    suffix="','base64').toString('utf8'))"
+    if not command.startswith('node -e "'+prefix):return None
+    if len(command)>4096:raise ValueError("INLINE_NODE_BODY_OR_WRAPPER_UNPROVEN")
+    try:
+        code=json.loads(command[len("node -e "):])
+        if not isinstance(code,str) or not code.startswith(prefix) or not code.endswith(suffix):raise ValueError()
+        encoded=code[len(prefix):-len(suffix)]
+        body=base64.b64decode(encoded,validate=True)
+        body.decode("utf-8",errors="strict")
+        if (not 1<=len(body)<=2048 or base64.b64encode(body).decode("ascii")!=encoded
+                or command!="node -e "+json.dumps(code,ensure_ascii=True)):
+            raise ValueError()
+    except (ValueError,UnicodeError,TypeError) as exc:
+        raise ValueError("INLINE_NODE_BODY_OR_WRAPPER_UNPROVEN") from exc
+    if any(str(environment.get(k,"")).strip() for k in ("NODE_OPTIONS","NODE_PATH")):
+        raise ValueError("INLINE_NODE_EXTERNAL_LOADER_UNPROVEN")
+    executable=shutil.which("node",path=environment.get("PATH",os.environ.get("PATH")))
+    if not executable or not Path(executable).is_file():raise ValueError("INLINE_NODE_EXECUTABLE_UNAVAILABLE")
+    executable=str(Path(executable).resolve())
+    return {"argv":[executable,"-e",code],"bodySha256":hashlib.sha256(body).hexdigest(),
+        "nodeExecutableSha256":file_digest(executable),"executionMode":"DIRECT_NODE_ARGV_V1"}

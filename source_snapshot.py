@@ -16,10 +16,12 @@ import contextvars
 import functools
 import dataclasses
 import hashlib
+import math
 import json
 import os
 import shutil
 import stat
+import sys
 import subprocess
 import tempfile
 import threading
@@ -93,14 +95,16 @@ class SourceInputPolicy:
     excluded_relative_paths: tuple[str, ...] = ()
     frontend_build_output_paths: tuple[str, ...] = ()
     frontend_profile: bool = False
+    generated_output_profile: str = ""
 
     @functools.cached_property
     def excluded_path_set(self):
-        return frozenset((*self.excluded_relative_paths, *self.frontend_build_output_paths))
+        return frozenset((*self.excluded_relative_paths, *self.frontend_build_output_paths,
+            *(("dist", ".tap") if self.generated_output_profile else ())))
 
     @property
     def key(self) -> str:
-        if self.scope_roots or self.excluded_relative_paths or self.frontend_build_output_paths or self.frontend_profile:
+        if self.scope_roots or self.excluded_relative_paths or self.frontend_build_output_paths or self.frontend_profile or self.generated_output_profile:
             from scoped_source_policy import policy_payload
             return _canonical_hash({"schema": SOURCE_INPUT_POLICY_SCHEMA, "scope": policy_payload(self),
                                     "legacyPolicy": SourceInputPolicy(self.excluded_dir_names, self.excluded_file_names).key}, length=64)
@@ -760,7 +764,7 @@ def _remove_ephemeral_git_admin_files(root: Path) -> int:
 def _excluded(relative: Path, policy: SourceInputPolicy) -> bool:
     if _is_ephemeral_git_admin_path(relative):
         return True
-    if policy.excluded_relative_paths or policy.frontend_build_output_paths:
+    if policy.excluded_relative_paths or policy.frontend_build_output_paths or policy.generated_output_profile:
         names = {relative.as_posix(), *(p.as_posix() for p in relative.parents)}
         if names.intersection(policy.excluded_path_set):
             return True
@@ -891,6 +895,7 @@ def _build_source_tree_manifest_impl(
     progress_interval_seconds: int = 15,
     suppress_worker_observability: bool = False,
     require_exclusive_links: bool = False,
+    exact_timeout: bool = False,
 ) -> SourceTreeManifest:
     """Build a deterministic manifest with bounded parallel file hashing.
 
@@ -899,8 +904,12 @@ def _build_source_tree_manifest_impl(
     are rechecked after hashing so add/remove/rename races fail closed.
     """
     root = root.resolve()
-    deadline = (float("inf") if timeout_seconds == 0
-                else time.monotonic() + max(1, int(timeout_seconds)))
+    # Opt-in exact remaining budget; legacy integer/fraction/zero semantics
+    # remain unchanged unless the supervising owner explicitly selects it.
+    if exact_timeout and (type(timeout_seconds) not in (int,float) or not math.isfinite(timeout_seconds) or timeout_seconds <= 0):
+        raise SourceCaptureError("SOURCE_MATERIALIZATION_TIMEOUT_INVALID")
+    duration = timeout_seconds if exact_timeout else max(1, int(timeout_seconds))
+    deadline = float("inf") if timeout_seconds == 0 else time.monotonic() + duration
     next_progress = time.monotonic() + max(1, int(progress_interval_seconds))
     entries: list[dict[str, object]] = []
     files = 0
@@ -1402,6 +1411,7 @@ def verification_source_snapshot_scope(
     progress_interval_seconds: int = 15,
     reuse_completed: bool = False,
     recovery_directory: Optional[Path] = None,
+    strict_cleanup: bool = False,
 ):
     """Pin one source subject for identity, cache lookup and all attempt retries.
 
@@ -1409,8 +1419,12 @@ def verification_source_snapshot_scope(
     by existing sealed and live-source continuity guards, never the cache key.
     Context-local registration prevents concurrent requests or later cohorts
     from consuming a stale epoch belonging to another verification.
+    strict_cleanup requires an owned non-reused scope and confirms physical
+    container retirement; legacy scopes retain their best-effort cleanup.
     """
     existing = active_source_snapshot(project_dir)
+    if strict_cleanup and (existing is not None or reuse_completed):
+        raise SourceCaptureError("SOURCE_SNAPSHOT_STRICT_SCOPE_OWNERSHIP_REQUIRED")
     if existing is not None:
         yield existing
         return
@@ -1446,9 +1460,16 @@ def verification_source_snapshot_scope(
     emit_observability_event("source.request.reuse", reused=reused,
                             snapshotKey=snapshot.key, authority="SOURCE_TRUTH_GUARD")
     completed = False
+    strict_owned_watchers = ()
     try:
         with bind_source_snapshot(snapshot, retain_watchers=reuse_completed):
-            yield snapshot
+            try:
+                yield snapshot
+            finally:
+                # bind_source_snapshot retires sealed watchers on exit. Keep
+                # their owned references before it removes the registry entries.
+                if strict_cleanup:
+                    strict_owned_watchers = _owned_source_snapshot_watchers(snapshot)
         completed = True
     finally:
         # This cache contains candidates, not verification authority. The next
@@ -1468,7 +1489,32 @@ def verification_source_snapshot_scope(
             for candidate in retired:
                 _retire_completed_request(candidate)
         else:
-            _retire_completed_request(snapshot)
+            owned_watchers = strict_owned_watchers + _owned_source_snapshot_watchers(snapshot) if strict_cleanup else ()
+            retirement_primary = sys.exc_info()[1]
+            try:
+                _retire_completed_request(snapshot)
+            except BaseException as retirement_error:
+                if not strict_cleanup or retirement_primary is None:
+                    raise
+                retirement_primary.add_note("SOURCE_SNAPSHOT_RETIREMENT_FAILED: " + type(retirement_error).__name__)
+            retirement_failed = any(getattr(watcher, "errors", ()) or
+                (getattr(watcher, "_thread", None) is not None and watcher._thread.is_alive())
+                for watcher in owned_watchers)
+            if strict_cleanup and (snapshot.container.exists() or retirement_failed):
+                primary = sys.exc_info()[1]
+                if primary is not None:
+                    primary.add_note("SOURCE_SNAPSHOT_CLEANUP_INCOMPLETE")
+                else:
+                    raise SourceCaptureError("SOURCE_SNAPSHOT_CLEANUP_INCOMPLETE")
+
+
+def _owned_source_snapshot_watchers(snapshot):
+    with _LOCK:
+        watchers = [entry[1] for entry in _ACTIVE_WATCHERS.values() if entry[0] is snapshot]
+        live = _LIVE_SOURCE_WATCHERS.get(_active_key(snapshot.original_project_path))
+        if live is not None and live[0] is snapshot:
+            watchers.append(live[1])
+        return tuple(watchers)
 
 
 def _retire_completed_request(snapshot):
@@ -1531,11 +1577,41 @@ def source_snapshot_live_source_continuity(
             and _drain_watcher(watcher, live_root)
         )
         if not delivery_and_identity_ok:
+            # Diagnostic facts only: never rescan/re-arm to recover this lost
+            # interval. Invalidation must keep the existing fail-closed verdict.
+            error_kinds = sorted({
+                "OVERFLOW" if "overflow" in error.lower()
+                else "ARM" if "arm failed" in error.lower()
+                else "DELIVERY" if "GetOverlappedResult" in error
+                else "WATCHER_ERROR" for error in watcher.errors
+            })
+            root_matches = (sealed_root_identity is not None
+                and _tree_object_identity(live_root) == sealed_root_identity)
+            project_matches = (sealed_project_identity is not None
+                and _tree_object_identity(live_project) == sealed_project_identity)
+            thread_alive = bool(thread is not None and thread.is_alive())
+            reason = ("OVERFLOW" if "OVERFLOW" in error_kinds
+                else "IDENTITY" if not root_matches or not project_matches
+                else "THREAD" if not thread_alive
+                else "DELIVERY" if error_kinds else "DRAIN")
+            delivered = list(watcher.events)
             emit_observability_event(
                 "source.snapshot.live-continuity",
                 snapshotKey=snapshot.key,
                 outcome="watcher-invalidated",
                 authority="SOURCE_TRUTH_GUARD",
+                phase="LIVE_SOURCE_CONTINUITY_BOUNDARY",
+                generation=str(snapshot.created_at),
+                watchedRootsCount=1,
+                deliveredEventCount=len(delivered),
+                relevantEventCount=len(_content_relevant_events(delivered)),
+                failureReason=reason,
+                watcherErrorKinds=error_kinds,
+                rootIdentityMatches=root_matches,
+                projectIdentityMatches=project_matches,
+                watcherThreadAlive=thread_alive,
+                finalManifestComparison="NOT_RUN_INTERVAL_UNPROVEN",
+                continuityRestored=False,
             )
             _retire_live_source_watcher(snapshot)
             return False
@@ -1802,8 +1878,11 @@ def proof_subject_project_dir(project_dir: Path) -> Path:
     return validate_source_snapshot(snapshot).project_path if snapshot is not None else project_dir.expanduser().resolve()
 
 
-def source_snapshot_fingerprint(project_dir: Path) -> str:
-    snapshot = active_source_snapshot(project_dir)
+def source_snapshot_fingerprint(project_dir: Path, *, remaining_budget: Optional[Callable[[], float]] = None) -> str:
+    if remaining_budget is not None:
+        if not callable(remaining_budget):raise SourceCaptureError("SOURCE_MATERIALIZATION_TIMEOUT_INVALID")
+        remaining_budget()
+    snapshot = active_source_snapshot(project_dir) if remaining_budget is None else None
     if snapshot is not None:
         return validate_source_snapshot(snapshot).key
     root, relative, _head = _subject_layout(project_dir)
@@ -1811,7 +1890,10 @@ def source_snapshot_fingerprint(project_dir: Path) -> str:
     policy = policy_for_project(project_dir, root)
     for attempt in range(1, SOURCE_CAPTURE_RETRIES + 1):
         try:
-            manifest = build_source_tree_manifest(root, policy=policy, timeout_seconds=0)
+            args = {} if remaining_budget is None else {"exact_timeout": True}
+            manifest = build_source_tree_manifest(root, policy=policy,
+                timeout_seconds=0 if remaining_budget is None else remaining_budget(), **args)
+            if remaining_budget is not None:remaining_budget()
             break
         except SourceCaptureError as exc:
             if "SOURCE_CAPTURE_UNSTABLE" not in str(exc) or attempt >= SOURCE_CAPTURE_RETRIES:
@@ -1843,7 +1925,9 @@ def materialize_source_for_verification(
     progress: Optional[ProgressCallback] = None,
     progress_label: str = "source snapshot materialization",
     progress_interval_seconds: int = 15,
+    generated_output_materialization: Optional[dict] = None,
 ) -> tuple[Path, SourceSnapshot, str]:
+    generated_output_deadline = time.time()+max(1,timeout_seconds) if generated_output_materialization is not None else None
     snapshot = active_source_snapshot(project_dir)
     if snapshot is None:
         snapshot = capture_source_snapshot(
@@ -1853,7 +1937,12 @@ def materialize_source_for_verification(
             progress_interval_seconds=progress_interval_seconds,
         )
     from verification_source_closure import require_complete_source_policy
-    require_complete_source_policy(snapshot.input_policy or SourceInputPolicy())
+    if generated_output_materialization is None:
+        require_complete_source_policy(snapshot.input_policy or SourceInputPolicy())
+    else:
+        from standalone_build_outputs import validate_input_only_materialization
+        validate_input_only_materialization(snapshot, project_dir, generated_output_materialization,
+            deadline=generated_output_deadline)
     budget = source_copy_budget()
     if budget is not None and snapshot.byte_count > budget:
         raise SourceCaptureError("SOURCE_MATERIALIZATION_BUDGET_EXCEEDED: "
@@ -1896,6 +1985,10 @@ def materialize_source_for_verification(
         raise SourceCaptureError(
             f"SOURCE_MATERIALIZED_PROJECT_MISSING: {snapshot.project_relative.as_posix()}"
         )
+    if generated_output_materialization is not None:
+        from standalone_build_outputs import validate_input_only_materialization
+        validate_input_only_materialization(snapshot, project_dir, generated_output_materialization,
+            deadline=generated_output_deadline, delivered_project=project)
     return project, snapshot, method
 
 
@@ -1919,6 +2012,23 @@ SOURCE_SNAPSHOT_CONTAINER_PREFIX = "dependency-flow-source-snapshot-"
 _REAP_MAX_AGE_SECONDS = 6 * 3600
 _REAP_MAX_CONTAINERS = 8
 _REAP_DONE = threading.Event()
+_ORPHAN_REAP_DEFERRED = contextvars.ContextVar("source_snapshot_orphan_reap_deferred", default=False)
+
+
+@contextlib.contextmanager
+def defer_orphan_snapshot_maintenance():
+    """Defer unrelated orphan reclamation, never source proof or owned cleanup.
+
+    Critical publication may use this scope to avoid spending its execution
+    allowance on an older run's storage backlog. A later ordinary capture still
+    gets its normal first-reap opportunity. State is context-local and nested
+    scopes cannot re-enable reaping accidentally.
+    """
+    token = _ORPHAN_REAP_DEFERRED.set(True)
+    try:
+        yield
+    finally:
+        _ORPHAN_REAP_DEFERRED.reset(token)
 
 
 def reap_orphaned_source_snapshots(
@@ -1938,6 +2048,8 @@ def reap_orphaned_source_snapshots(
     or linked trees before retirement. Unknown legacy containers and live
     owners are retained. Failing to reap leaves the tree for a later run.
     """
+    if _ORPHAN_REAP_DEFERRED.get():
+        return {"reaped": 0, "skipped": 0, "failed": 0}
     from verification_storage_maintenance import dead_trial_owner, _plain_directory, _has_links
     reaped = skipped = failed = 0
     from source_snapshot_storage import candidate_snapshot_parents
@@ -1998,7 +2110,7 @@ def reap_orphaned_source_snapshots(
 
 def _reap_once() -> None:
     """Bounded, best-effort, at most once per process."""
-    if _REAP_DONE.is_set():
+    if _ORPHAN_REAP_DEFERRED.get() or _REAP_DONE.is_set():
         return
     _REAP_DONE.set()
     try:
@@ -2057,6 +2169,7 @@ def build_source_tree_manifest(
     progress_label: str = "source manifest",
     progress_interval_seconds: int = 15,
     pass_role: str = "",
+    exact_timeout: bool = False,
 ) -> SourceTreeManifest:
     exclusive_links = str(pass_role) in _EXCLUSIVE_LINK_PASS_ROLES
     if not _observability_sink_is_source_safe(root, policy):
@@ -2070,6 +2183,7 @@ def build_source_tree_manifest(
                 progress_interval_seconds=progress_interval_seconds,
                 suppress_worker_observability=True,
                 require_exclusive_links=exclusive_links,
+                exact_timeout=exact_timeout,
             )
 
     operation_id = new_observability_id("source-manifest")
@@ -2093,6 +2207,7 @@ def build_source_tree_manifest(
             progress_label=progress_label,
             progress_interval_seconds=progress_interval_seconds,
             require_exclusive_links=exclusive_links,
+            exact_timeout=exact_timeout,
         )
     except BaseException as exc:
         after = process_resource_snapshot()

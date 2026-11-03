@@ -30,6 +30,15 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from verification_invocation import (
+    observe_command as _observe_invocation_command,
+    observe_reused_command as _observe_invocation_reused_command,
+    observe_reused_profile as _observe_invocation_reused_profile,
+    defer_workspace_cleanup as _defer_invocation_cleanup,
+    close_owned_resources as _close_invocation_resources,
+    guarded_cleanup as _observe_guarded_cleanup,
+    run_observed as _run_invocation_observed,
+)
 from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 
@@ -176,6 +185,12 @@ class BaselineVerifyConfig:
     unbounded_preparation: bool = False
     project_checks: str = "adaptive"  # off | diagnostic | adaptive | strict
     commands: Tuple[str, ...] = ()
+    # Explicit verification policy; default retains legacy lifecycle execution.
+    lifecycle_scripts: bool = True
+    # Code-only opt-in observation; never execution/goal admission authority.
+    observe_materialized_source_origin: bool = False
+    observe_materialized_dependency_obligations: bool = False
+    dependency_obligation_plan: Mapping[str, object] = dataclasses.field(default_factory=dict)
     registry: str = ""
     telemetry_path: str = ""
     proof_cache_dir: str = ""
@@ -256,6 +271,7 @@ class BaselineVerifyConfig:
                 ),
             ),
             project_checks=mode,
+            lifecycle_scripts=_as_bool(raw.get("lifecycleScripts"), True),
             commands=commands,
             recovery_checkpoints=_as_bool(raw.get("recoveryCheckpoints"), True),
             resolver_overrides=resolver_overrides,
@@ -367,6 +383,8 @@ class BaselineVerifyResult:
     command_checkpoint_refs: Tuple[str, ...] = ()
     verified_source_snapshot_key: str = ""
     verified_assignment_fingerprint: str = ""
+    materialized_source_origin: Mapping[str, object] = dataclasses.field(default_factory=dict)
+    materialized_dependency_obligations: Mapping[str, object] = dataclasses.field(default_factory=dict)
 
     @property
     def hard_failure(self) -> bool:
@@ -1030,6 +1048,13 @@ _SAME_RUN_PRIVATE_PREPARED_ACTIVE_ATTEMPTS: Dict[Tuple[str, str], str] = {}
 _SAME_RUN_PRIVATE_PREPARED_MAX_COUNT = 2
 
 
+def _verification_environment(config, runtime_env=None):
+    environment = project_verification_environment(runtime_env)
+    # Bind the actual lifecycle policy even when ambient env claims otherwise.
+    environment["DEPLOOM_VERIFIER_LIFECYCLE_SCRIPTS"] = "allow" if config.lifecycle_scripts else "deny"
+    return environment
+
+
 def _preparation_coordination_key(
     project_dir: Path,
     assignment: Mapping[str, str],
@@ -1042,6 +1067,7 @@ def _preparation_coordination_key(
         tuple(sorted(str(item) for item in remove_packages)),
         tuple(sorted(normalized_resolver_overrides(config.resolver_overrides).items())),
         str(config.registry or "").rstrip("/"),
+        config.lifecycle_scripts,
         tuple(sorted(semantic_verification_environment(os.environ).items())),
     )
 
@@ -2483,10 +2509,13 @@ def _apply_assignment(
         if package_changed:
             changed.append(name)
 
-    (project_dir / "package.json").write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    # A pre-applied exact candidate must retain its approved manifest bytes.
+    # Formatting a no-op silently changes source identity without changing scope.
+    if changed:
+        (project_dir / "package.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
     return changed
 
 OBSERVED_REMOVED = "<removed>"
@@ -2822,17 +2851,24 @@ def verify_assignment(
     attempt_started = time.monotonic()
     attempt_deadline = (float("inf") if config.unbounded_preparation
                         else attempt_started + config.attempt_timeout_seconds)
-    base_env = project_verification_environment()
+    base_env = _verification_environment(config)
     if runtime_env:
         # An EXPLICIT project/CI Node runtime beats ambient PATH exactly where
         # the runtime is the subject: proof/tool identity and subprocess PATH
         # must reflect the requested Node, matching what CI would run. The host
         # ambient runtime remains untouched.
-        base_env = project_verification_environment(runtime_env)
+        base_env = _verification_environment(config, runtime_env)
     remove_packages = tuple(sorted({str(item) for item in remove_packages}))
     telemetry_path = Path(config.telemetry_path).resolve() if config.telemetry_path else None
     assignment_hash = assignment_fingerprint(assignment)
+    materialized_source_origin = {}
+    source_origin_observation_digest = ""
+    materialized_dependency_obligations = {}
+    dependency_boundary_guards = []
+    inline_execution_unproven = False
 
+    if config.observe_materialized_dependency_obligations and not config.observe_materialized_source_origin:
+        return BaselineVerifyResult(False,"unknown","DEPENDENCY_OBLIGATION_SOURCE_ORIGIN_REQUIRED")
     try:
         _validate_assignment_materialization(
             preflight_project,
@@ -2916,10 +2952,18 @@ def verify_assignment(
         dir=str(trial_parent) if trial_parent is not None else None,
     )).resolve()
     from verification_storage_maintenance import register_trial_owner, retire_trial
-    register_trial_owner(temp_root)
+    def cleanup_observed_workspace():
+        shutil.rmtree(temp_root, ignore_errors=True)
+        if temp_root.exists():
+            retire_trial(temp_root)
+            if cleanup_deferred:
+                raise OSError("OBSERVED_PRIVATE_WORKSPACE_CLEANUP_INCOMPLETE")
+    # Register at ownership acquisition, before any resource release can fail.
+    cleanup_deferred = _defer_invocation_cleanup(cleanup_observed_workspace)
     source_binding = contextlib.ExitStack()
     guarded_trial_roots: set[Path] = set()
     try:
+        register_trial_owner(temp_root)
         workspace_root = temp_root / "repo"
         workspace_started = time.monotonic()
         event("verify.workspace.start")
@@ -3925,15 +3969,15 @@ def verify_assignment(
 
                 full_install = install_args_for_profile(
                     workspace_topology.profile,
-                    ignore_scripts=False,
+                    ignore_scripts=not config.lifecycle_scripts,
                     frozen=True,
                 )
                 full_argv, _ = _command_prefix(executable, full_install)
                 lifecycle_env = {
                     "CI": "1",
                     "YARN_ENABLE_IMMUTABLE_INSTALLS": "true",
-                    "YARN_ENABLE_SCRIPTS": "true",
-                    "npm_config_ignore_scripts": "false",
+                    "YARN_ENABLE_SCRIPTS": "true" if config.lifecycle_scripts else "false",
+                    "npm_config_ignore_scripts": "false" if config.lifecycle_scripts else "true",
                 }
                 lifecycle_env.update(_package_manager_cache_environment(config, manager))
                 if workspace_topology.profile.family == "yarn-berry" and config.registry:
@@ -4276,8 +4320,29 @@ def verify_assignment(
             if snapshot is None:
                 return BaselineVerifyResult(False, "infrastructure", "PREPARED_SNAPSHOT_UNAVAILABLE: project checks require a sealed preparation tree")
 
+            if config.observe_materialized_source_origin:
+                from verification_source_closure import compare_materialized_source_origin
+                try:
+                    materialized_source_origin = compare_materialized_source_origin(source_snapshot,snapshot,resolved_state)
+                    source_origin_observation_digest = hashlib.sha256(json.dumps(materialized_source_origin,
+                        sort_keys=True,separators=(",",":"),ensure_ascii=False).encode("utf-8")).hexdigest()
+                except Exception as exc:
+                    event("verify.source-origin.rejected",detail=str(exc))
+                    return BaselineVerifyResult(False,"unknown",f"SOURCE_ORIGIN_UNPROVEN: {exc}",workspace=str(workspace_project))
+                event("verify.source-origin.observed",sourceOriginObservationDigest=source_origin_observation_digest,
+                    preparedSourceContentKey=snapshot.source_closure_content_key)
+
+            if config.observe_materialized_dependency_obligations:
+                from resolved_dependency_state import observe_npm_dependency_obligations
+                try:
+                    materialized_dependency_obligations = observe_npm_dependency_obligations(
+                        snapshot.workspace_root/snapshot.project_relative, dict(config.dependency_obligation_plan),
+                        source_origin_digest=source_origin_observation_digest, resolved_state_key=resolved_state.key, deadline=config.budget_phase_deadline or None)
+                except Exception as exc:
+                    return BaselineVerifyResult(False,"unknown",f"DEPENDENCY_OBLIGATION_UNPROVEN: {exc}")
+
             project_failures: List[BaselineProjectFailure] = []
-            project_publication_allowed = True
+            project_publication_allowed = not config.observe_materialized_source_origin
             reusable_private_root: Optional[Path] = None
             reusable_private_project: Optional[Path] = None
             source_entries_by_path = {os.path.normcase(str(item["path"])).replace("\\", "/"): item
@@ -4287,7 +4352,7 @@ def verify_assignment(
 
             command_checkpoints = None
             command_checkpoint_refs = []
-            if config.recovery_checkpoints and proof_store.root is not None:
+            if config.recovery_checkpoints and not config.observe_materialized_source_origin and proof_store.root is not None:
                 # Reopened snapshots have no same-call publication flag. The
                 # durable loader (or None) owns cross-process receipt authority.
                 from verification_stage_checkpoint import CommandCheckpoint
@@ -4298,8 +4363,9 @@ def verify_assignment(
                     proof_identity, checkpoint_artifact, config.commands, base_env)
 
             for command_index, command in enumerate(config.commands, start=1):
-                receipt = command_checkpoints.lookup(command_index, command) if command_checkpoints else None
+                receipt = command_checkpoints.lookup(command_index, command) if command_checkpoints and not config.observe_materialized_source_origin else None
                 if receipt:
+                    _observe_invocation_reused_command(command_index, command, proof_identity.event_fields())
                     command_checkpoint_refs.append(receipt)
                     event("verify.project-check.checkpoint-hit", command=command, check=command_index, receipt=receipt)
                     _emit_progress(progress, f"{progress_label}: project check {command_index}/{len(config.commands)} checkpoint PASS: {command}")
@@ -4354,6 +4420,7 @@ def verify_assignment(
                     try:
                         command_fastpath_allowed = (
                             _allow_prepared_fastpath
+                            and not config.observe_materialized_dependency_obligations
                             and bool(snapshot.dependency_roots)
                             and _prepared_command_fastpath_allowed(
                                 project_dir, command
@@ -4456,6 +4523,10 @@ def verify_assignment(
                 check_result: Optional[subprocess.CompletedProcess[str]] = None
                 lower_check_clean = False
                 command_pass_verified = False
+                inline_node = None
+                inline_node_tool_unchanged = True
+                dependency_pre = None
+                dependency_post = None
                 try:
                     removed_caches = clean_ephemeral_verification_caches(command_root, snapshot.dependency_roots)
                     if removed_caches:
@@ -4522,7 +4593,7 @@ def verify_assignment(
                             detail=precheck_failure,
                         )
                         if clone_isolation == "ntfs-junction-guarded":
-                            cleanup_guarded_clone(command_root)
+                            _observe_guarded_cleanup(cleanup_guarded_clone, command_root)
                         _disable_prepared_command_fastpath(project_dir, command)
                         _disable_prepared_snapshot_fastpath(
                             proof_identity.preparation_proof_key, project_dir
@@ -4578,7 +4649,21 @@ def verify_assignment(
                         checks=len(config.commands),
                         isolation=clone_isolation,
                     )
-                    shell_argv = project_check_command_argv(command)
+                    if config.observe_materialized_source_origin:
+                        from verification_stage_checkpoint import pinned_inline_node_invocation
+                        try:inline_node = pinned_inline_node_invocation(command,base_env)
+                        except (ValueError,OSError) as exc:
+                            return BaselineVerifyResult(False,"unknown",str(exc),workspace=str(command_project))
+                    if config.observe_materialized_dependency_obligations:
+                        try:
+                            dependency_pre = observe_npm_dependency_obligations(command_project,
+                                dict(config.dependency_obligation_plan), source_origin_digest=source_origin_observation_digest,
+                                resolved_state_key=resolved_state.key, deadline=config.budget_phase_deadline or None)
+                            if dependency_pre != materialized_dependency_obligations:
+                                raise ValueError("DEPENDENCY_OBLIGATION_PRE_BOUNDARY_DRIFT")
+                        except Exception as exc:
+                            return BaselineVerifyResult(False,"unknown",f"DEPENDENCY_OBLIGATION_UNPROVEN: {exc}")
+                    shell_argv = inline_node["argv"] if inline_node else project_check_command_argv(command)
                     try:
                         check_result = _run(
                             shell_argv,
@@ -4615,7 +4700,7 @@ def verify_assignment(
                         )
                         budget_cutoff = isinstance(exc, subprocess.TimeoutExpired) and _budget_deadline_hit(config)
                         if clone_isolation == "ntfs-junction-guarded":
-                            cleanup_guarded_clone(command_root)
+                            _observe_guarded_cleanup(cleanup_guarded_clone, command_root)
                             _evict_prepared_workspace_snapshot(
                                 proof_identity.preparation_proof_key, project_dir
                             )
@@ -4636,6 +4721,18 @@ def verify_assignment(
                             )
                         return BaselineVerifyResult(False, "infrastructure", f"project check launch failed: {exc}", command=command)
 
+                    if config.observe_materialized_dependency_obligations:
+                        try:
+                            dependency_post = observe_npm_dependency_obligations(command_project,
+                                dict(config.dependency_obligation_plan), source_origin_digest=source_origin_observation_digest,
+                                resolved_state_key=resolved_state.key, deadline=config.budget_phase_deadline or None)
+                            if dependency_post != dependency_pre:
+                                raise ValueError("DEPENDENCY_OBLIGATION_POST_BOUNDARY_DRIFT")
+                            dependency_boundary_guards.append({"commandIndex":command_index,
+                                "status":"PRE_POST_OBSERVED", "obligationPlanDigest":dependency_pre["obligationPlanDigest"],
+                                "materializedTreeObservationDigest":dependency_pre["materializedTreeObservationDigest"]})
+                        except Exception as exc:
+                            return BaselineVerifyResult(False,"unknown",f"DEPENDENCY_OBLIGATION_UNPROVEN: {exc}")
                     if clone_isolation == "ntfs-junction-guarded" and command_index < len(config.commands):
                         from prepared_workspace_fastpath import peek_guarded_clone
                         guard_result = peek_guarded_clone(command_root)
@@ -4651,7 +4748,7 @@ def verify_assignment(
                         # authoritative for the preparation identity. Even an
                         # integrity-matched final state may have been transiently
                         # mutated while another consumer was reading it.
-                        cleanup_guarded_clone(command_root)
+                        _observe_guarded_cleanup(cleanup_guarded_clone, command_root)
                         # This is performance state only. The command is still
                         # freshly executed in an isolated private clone.
                         _disable_prepared_command_fastpath(project_dir, command)
@@ -4820,12 +4917,37 @@ def verify_assignment(
                             dependency_roots=(snapshot.dependency_roots
                                 if lower_check_clean and guarded_clone_is_active(command_root) else ()))
 
+                    if inline_node:
+                        from verification_stage_checkpoint import file_digest
+                        try:inline_node_tool_unchanged = file_digest(inline_node["argv"][0])==inline_node["nodeExecutableSha256"]
+                        except OSError:inline_node_tool_unchanged = False
+                        inline_execution_unproven = inline_execution_unproven or not inline_node_tool_unchanged
+                        project_publication_allowed = project_publication_allowed and inline_node_tool_unchanged
+                    if check_result is not None:
+                        _observe_invocation_command(
+                            command_index, command, check_result,
+                            guarded=bool(command_pass_verified and lower_check_clean and inline_node_tool_unchanged
+                                and workspace_guard_started and workspace_changes is not None
+                                and not workspace_changes.errors
+                                and (not workspace_changes.changes or source_reset_for_reuse)),
+                            identities={**(proof_identity.event_fields() if proof_identity is not None else {}),
+                                "targetOnlyAssignmentFingerprint": assignment_hash,
+                                "resolvedLockfileHash": resolved_state.lockfile_hash if resolved_state is not None else "",
+                                "preparedSourceContentKey": snapshot.source_closure_content_key if materialized_source_origin else "",
+                                "sourceOriginObservationDigest": source_origin_observation_digest,
+                                "dependencyObligationPlanDigest": dependency_pre["obligationPlanDigest"] if dependency_pre else "",
+                                "materializedTreeObservationDigest": dependency_pre["materializedTreeObservationDigest"] if dependency_pre else "",
+                                "dependencyPrePostGuardStatus": "PRE_POST_OBSERVED" if dependency_pre and dependency_post==dependency_pre else "UNPROVEN",
+                                "inlineNodeBodySha256": inline_node["bodySha256"] if inline_node else "",
+                                "inlineNodeExecutionMode": inline_node["executionMode"] if inline_node and inline_node_tool_unchanged else "",
+                                "nodeExecutableSha256": inline_node["nodeExecutableSha256"] if inline_node else ""},
+                        )
                     if command_checkpoints and check_result is not None:
                         # Command guards above retain their authority. A receipt
                         # also requires guaranteed process-tree quiescence.
                         receipt = command_checkpoints.complete(
                             command_index, command, check_result,
-                            safe=command_pass_verified and lower_check_clean
+                            safe=command_pass_verified and lower_check_clean and inline_node_tool_unchanged
                                 and _durable_proof_publication_allowed(check_result))
                         if receipt:
                             command_checkpoint_refs.append(receipt)
@@ -4882,9 +5004,11 @@ def verify_assignment(
                         reusable_private_root = None
                         reusable_private_project = None
                         if clone_isolation == "ntfs-junction-guarded":
-                            cleanup_guarded_clone(command_root)
+                            _observe_guarded_cleanup(cleanup_guarded_clone, command_root)
                         _cleanup_trial_root(command_root, event=event, command=command)
 
+            if inline_execution_unproven:
+                return BaselineVerifyResult(False,"unknown","INLINE_NODE_TOOLCHAIN_DRIFT")
             if project_failures:
                 summary_commands = ", ".join(item.command for item in project_failures)
                 output = "\n\n".join(
@@ -4915,9 +5039,21 @@ def verify_assignment(
                     "proof.cache.publish-skipped",
                     proofType="project",
                     cacheKey=proof_identity.project_proof_key,
-                    reason="process-tree-supervision-not-guaranteed",
+                    reason="non-reusable-source-origin-mode" if config.observe_materialized_source_origin else "process-tree-supervision-not-guaranteed",
                 )
 
+        if config.observe_materialized_dependency_obligations:
+            try:
+                final_dependency_observation = observe_npm_dependency_obligations(
+                    snapshot.workspace_root/snapshot.project_relative, dict(config.dependency_obligation_plan),
+                    source_origin_digest=source_origin_observation_digest, resolved_state_key=resolved_state.key, deadline=config.budget_phase_deadline or None)
+                if (final_dependency_observation != materialized_dependency_obligations
+                        or len(dependency_boundary_guards)!=len(config.commands)):
+                    raise ValueError("DEPENDENCY_OBLIGATION_FINAL_BOUNDARY_UNPROVEN")
+                materialized_dependency_obligations={**final_dependency_observation,
+                    "commandBoundaryGuards":dependency_boundary_guards,"finalBoundaryObserved":True}
+            except Exception as exc:
+                return BaselineVerifyResult(False,"unknown",f"DEPENDENCY_OBLIGATION_UNPROVEN: {exc}")
         _emit_progress(progress, f"{progress_label}: completed; elapsed={int(time.monotonic() - attempt_started)}s")
         return BaselineVerifyResult(
             True, "passed", f"resolver preflight passed for {len(changed)} changed direct package(s)",
@@ -4932,19 +5068,16 @@ def verify_assignment(
             command_checkpoint_refs=tuple(command_checkpoint_refs) if run_project_checks and config.commands else (),
             verified_source_snapshot_key=source_snapshot.key,
             verified_assignment_fingerprint=assignment_hash,
+            materialized_source_origin=materialized_source_origin,
+            materialized_dependency_obligations=materialized_dependency_obligations,
         )
     finally:
         # Early return may retain a trial provisionally. Release every owned
         # lower lease/guard even when a later check or evidence adapter aborts.
-        for guarded_root in guarded_trial_roots:
-            try:
-                cleanup_guarded_clone(guarded_root)
-            except Exception as exc:
-                event("verify.project-check.guard-cleanup-failed", detail=str(exc), workspace=str(guarded_root))
-        source_binding.close()
-        shutil.rmtree(temp_root, ignore_errors=True)
-        if temp_root.exists():
-            retire_trial(temp_root)
+        _close_invocation_resources(
+            guarded_trial_roots, cleanup_guarded_clone, source_binding,
+            cleanup_observed_workspace, cleanup_deferred, event,
+        )
 
 
 
@@ -5380,13 +5513,13 @@ def verify_assignment(
             progress_label=progress_label,
         )
 
-    environment = project_verification_environment()
+    environment = _verification_environment(config)
     if runtime_env:
         # The EXPLICIT project/CI Node runtime participates in proof identity:
         # a proof cached under the ambient host Node must never be reused for a
         # different requested runtime, and tool identity in the proof must name
         # the runtime CI actually uses.
-        environment = project_verification_environment(runtime_env)
+        environment = _verification_environment(config, runtime_env)
     try:
         identity = build_verification_proof_identity(
             project_dir,
@@ -5467,12 +5600,14 @@ def verify_assignment(
 
     # Arbitrary shell commands may invoke undeclared external runtimes. Their
     # PASS is not durable-reusable until a declared tool closure exists.
-    project_cache_reusable = wants_project_proof and project_proof_cache_reusable(config.commands)
+    project_cache_reusable = (wants_project_proof and not config.observe_materialized_source_origin
+                              and project_proof_cache_reusable(config.commands))
     if project_cache_reusable and resolver_hit:
         cache_event("proof.cache.lookup", "project", identity.project_proof_key)
         project_record = proof_store.lookup_pass("project", identity.project_proof_key)
         if project_record is not None:
             cache_event("proof.cache.hit", "project", identity.project_proof_key)
+            _observe_invocation_reused_profile(config.commands, identity.event_fields())
             emit_verification_event(
                 telemetry_path,
                 "verify.resolver.skipped",
@@ -5723,3 +5858,24 @@ def verify_assignment(
         )
         return result
 
+
+
+# Optional code-only observations; default callers retain immediate cleanup.
+_verify_assignment_before_invocation_observer = verify_assignment
+
+
+def verify_assignment(
+    project_dir: Path, assignment: Mapping[str, str], *, config: BaselineVerifyConfig,
+    run_project_checks: bool = False, remove_packages: Iterable[str] = (),
+    progress: Optional[ProgressCallback] = None, progress_label: str = "assignment verification",
+    runtime_env: Optional[Mapping[str, str]] = None,
+    invocation_observer: Optional[Callable[[Mapping[str, object]], None]] = None,
+) -> BaselineVerifyResult:
+    arguments = dict(config=config, run_project_checks=run_project_checks,
+        remove_packages=remove_packages, progress=progress,
+        progress_label=progress_label, runtime_env=runtime_env)
+    if invocation_observer is None:
+        return _verify_assignment_before_invocation_observer(project_dir, assignment, **arguments)
+    return _run_invocation_observed(invocation_observer, assignment_fingerprint(assignment),
+        config.commands if run_project_checks else (),
+        lambda: _verify_assignment_before_invocation_observer(project_dir, assignment, **arguments))

@@ -32,6 +32,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 from urllib.parse import urlparse
 
 from semantic_version import NpmSpec, Version
+from registry_candidate_diagnostics import safe_registry_artifact_url
 
 DIRECT_SECTIONS = ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies")
 INSTALL_SECTIONS = ("dependencies", "devDependencies", "optionalDependencies")
@@ -270,19 +271,35 @@ def _origin_tuple(url: str) -> Tuple[str, str, int]:
 
 
 def registry_artifact_url_allowed(registry: str, url: str) -> bool:
-    """Require lockfile package artifacts to stay inside configured registry."""
-    value = str(url or "").strip()
+    """Reuse the Core planner's strict same-origin/path tarball policy.
+
+    Keep the legacy behavior for non-http lockfile resolutions (workspace,
+    file, git), which are classified separately by the lockfile verifier.
+    """
+    value = str(url or "")
     if not registry or not value:
         return True
-    parsed = urlparse(value)
-    if parsed.scheme not in {"http", "https"}:
-        return True
-    registry_parsed = urlparse(registry)
-    if _origin_tuple(registry) != _origin_tuple(value):
+    try:
+        parsed = urlparse(value)
+    except ValueError:
         return False
-    prefix = registry_parsed.path.rstrip("/")
-    path = parsed.path or ""
-    return not prefix or path == prefix or path.startswith(prefix + "/")
+    if parsed.scheme not in {"http", "https"} and "://" not in value:
+        return True
+    # VCS resolutions are not npm tarballs; preserve their separate lockfile
+    # policy while rejecting unknown URL schemes and embedded passwords.
+    if parsed.scheme == "file":
+        # An absolute local file:/// resolution is not a registry artifact.
+        # Do not interpret remote file://host paths as local resources.
+        return (value == value.strip() and parsed.netloc in {"", "localhost"}
+                and bool(parsed.path) and not parsed.query and not parsed.fragment)
+    if parsed.scheme in {"git", "git+ssh", "git+https", "ssh"}:
+        try:
+            return (value == value.strip() and bool(parsed.hostname)
+                    and parsed.password is None and not parsed.query
+                    and (parsed.port is None or 1 <= parsed.port <= 65535))
+        except ValueError:
+            return False
+    return safe_registry_artifact_url(registry, value)
 
 
 def _yarn_lock_resolved_urls(lockfile: Path) -> List[str]:

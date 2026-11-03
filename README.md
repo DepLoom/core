@@ -48,7 +48,7 @@ monorepo test suite.
 
 ## Architecture and scope
 
-This first extraction keeps the **133-file headless runtime inventory**
+This extraction keeps the explicit headless runtime inventory
 previously bundled in MCP, with stable module names for compatibility.
 It is an operational split and a focused test split, **not yet a minimal
 import-closure refactor**. Further shrinking should follow measured import
@@ -58,6 +58,7 @@ The required-update transition regression is fixed here: `required` applies
 to the **final** solver assignment, not the original state before upgrading;
 genuine peer constraints still constrain transition cohorts.
 
+- [Core 0.1.1 changes and boundaries](docs/RELEASE_0_1_1.md)
 - [Decision contract](docs/DRAFT_DECISION_CONTRACT.md)
 - [Extraction status](docs/EXTRACTION_STATUS.md)
 - [MCP integration instructions](docs/INTEGRATION.md)
