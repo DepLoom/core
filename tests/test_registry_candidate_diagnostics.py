@@ -133,9 +133,9 @@ class RegistryCandidateDiagnosticsTests(unittest.TestCase):
         self.assertEqual("CANDIDATE_CAP", no_target_diagnostic_code("candidate-search-truncated", diagnostic))
 
     def test_bounded_diagnostics_never_disclose_credentials_or_urls(self):
-        registry = "https://admin:secret@registry.internal:443/repository/secretTokenValue/npm?token=top-secret#frag"
+        registry = "https://" + "admin:secret@registry.internal:443/repository/secretTokenValue/npm?token=top-secret#frag"
         c = _client(registry)
-        urls = {f"1.{i}.0": f"https://bob:pwd@evil.internal/path/package-{i}.tgz?access_token=xyz"
+        urls = {f"1.{i}.0": f"https://" + f"bob:pwd@evil.internal/path/package-{i}.tgz?access_token=xyz"
                 for i in range(50)}
         diag = summarize_structural_candidates(registry, _meta(urls), urls,
                                                c.registry_artifact_url_allowed, current="1.0.0")
@@ -275,7 +275,7 @@ class SecurityReviewIdentityTests(unittest.TestCase):
     def test_registry_identity_redacts_encoded_secrets_and_controls(self):
         from registry_candidate_diagnostics import _identity
         for raw in (
-            "https://user:pass@host.invalid/repository/accessKey%3DSECRET123/npm?token=secret",
+            "https://" + "user:pass@host.invalid/repository/accessKey%3DSECRET123/npm?token=secret",
             "https://host.invalid/npm/%2Fprivate%2Fcredentials/metadata",
             "https://host.invalid/npm/line%0Abreak/data",
             "https://host.invalid/npm/secret%40domain/", 

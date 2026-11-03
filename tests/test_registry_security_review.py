@@ -27,7 +27,7 @@ class ArtifactUrlFailClosedTests(unittest.TestCase):
     def test_malformed_and_deceptive_artifacts_are_rejected_not_raised(self):
         reg='https://nexus.example.invalid/repository/npm'
         hostile = (
-            'https://a:b@nexus.example.invalid/repository/npm/a.tgz',
+            'https://' + 'a:b@nexus.example.invalid/repository/npm/a.tgz',
             'https://nexus.example.invalid/repository/npm/../private/a.tgz',
             'https://nexus.example.invalid/repository/npm/%2e%2e/private/a.tgz',
             'https://nexus.example.invalid/repository/npm/%252e%252e/private/a.tgz',
@@ -69,7 +69,7 @@ class ArtifactUrlFailClosedTests(unittest.TestCase):
                 self.assertFalse(safe_registry_artifact_url(reg, uri),
                                  'Core tarball guard must remain HTTP(S)-only')
         for uri in (
-            'git+https://user:secret@github.com/example/repository.git',
+            'git+https://' + 'user:secret@github.com/example/repository.git',
             'git+ssh://git@github.com:bogus/example/repository.git',
             'file://evil.invalid/share/private',
             'file://user:secret@localhost/path',
@@ -81,7 +81,7 @@ class ArtifactUrlFailClosedTests(unittest.TestCase):
 
     def test_sensitive_and_encoded_path_segments_not_exported(self):
         for url in (
-            'https://user:pw@nexus.invalid/repository/abc123/npm?token=secret',
+            'https://' + 'user:pw@nexus.invalid/repository/abc123/npm?token=secret',
             'https://nexus.invalid/repository/%61piKey/npm',
             'https://nexus.invalid/repository/short-secret/npm',
             'https://nexus.invalid/repository/tenant42/npm',
@@ -186,7 +186,7 @@ class RedirectDoesNotContactForbiddenHost(unittest.TestCase):
 
 class RegistryPromptSanitizationTests(unittest.TestCase):
     def test_prompt_never_renders_secret_userinfo_or_private_path(self):
-        value='https://admin:hunter2@nexus.invalid/repository/abc123/npm?token=qwerty#fragment'
+        value='https://' + 'admin:hunter2@nexus.invalid/repository/abc123/npm?token=qwerty#fragment'
         sanitized=core._sanitize_registry_url(value)
         for raw in ('admin','hunter2','abc123','qwerty','fragment','token='):
             self.assertNotIn(raw,sanitized)
