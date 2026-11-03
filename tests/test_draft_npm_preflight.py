@@ -96,7 +96,7 @@ class NpmPreflightTests(unittest.TestCase):
 class NpmEntrypointDiscoveryTests(unittest.TestCase):
     def test_explicit_path_is_used_for_all_executable_lookups(self):
         with tempfile.TemporaryDirectory() as raw:
-            root=Path(raw);node=root/'node';node.write_bytes(b'node')
+            root=Path(raw).resolve();node=root/'node';node.write_bytes(b'node')
             script=root/'lib/npm/bin/npm-cli.js';script.parent.mkdir(parents=True);script.write_bytes(b'npm')
             def which(name, *, path):
                 self.assertEqual(path, 'CALLER_OWNED_PATH')

@@ -82,10 +82,8 @@ class NpmDependencyObligationTests(unittest.TestCase):
         try:
             if os.name=='nt':
                 import subprocess
-                env=dict(os.environ);env.update(DEPLOOM_TEST_LINK=str(link),DEPLOOM_TEST_TARGET=str(target))
-                result=subprocess.run(['powershell.exe','-NoProfile','-NonInteractive','-Command',
-                    'New-Item -ItemType Junction -Path $env:DEPLOOM_TEST_LINK -Target $env:DEPLOOM_TEST_TARGET | Out-Null'],
-                    env=env,capture_output=True,timeout=10,creationflags=subprocess.CREATE_NO_WINDOW)
+                result=subprocess.run(['cmd.exe','/d','/c','mklink','/J',str(link),str(target)],
+                    capture_output=True,timeout=10,creationflags=subprocess.CREATE_NO_WINDOW)
                 if result.returncode:raise OSError('test junction creation not permitted')
             else:os.symlink(target,link,target_is_directory=True)
         except OSError as exc:self.skipTest('OS does not permit test link: '+str(exc))
