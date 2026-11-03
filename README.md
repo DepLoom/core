@@ -1,5 +1,7 @@
 # DepLoom Core
 
+Release maintainers: see the [component release instructions](docs/RELEASING.md).
+
 **Headless, evidence-aware dependency upgrade planning for JavaScript projects.**
 
 DepLoom Core proposes bounded dependency-version assignments, evaluates npm peer

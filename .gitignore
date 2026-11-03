@@ -6,3 +6,6 @@ build/
 dist/
 *.egg-info/
 *.log
+
+# Durable component-release state (never published)
+.component-release/

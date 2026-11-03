@@ -1,0 +1,111 @@
+name: Component release
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing annotated tag to resume; never moves it
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: component-release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+jobs:
+  qualify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      commit: ${{ steps.identity.outputs.commit }}
+      tag: ${{ steps.identity.outputs.tag }}
+      tagObject: ${{ steps.identity.outputs.tagObject }}
+      version: ${{ steps.identity.outputs.version }}
+      ciRuns: ${{ steps.identity.outputs.ciRuns }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Wait for existing full main CI on this exact commit
+        id: identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: python scripts/release_ci.py wait-main --tag "$RELEASE_TAG"
+  package:
+    needs: qualify
+    runs-on: windows-latest
+    timeout-minutes: 15
+    outputs:
+      artifact-id: ${{ steps.bundle.outputs.artifact-id }}
+      artifact-digest: ${{ steps.bundle.outputs.artifact-digest }}
+      manifest-sha: ${{ steps.assets.outputs.manifest-sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.qualify.outputs.commit }}
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.18.0'
+      - name: Install runtime and build prerequisites
+        run: python -m pip install -e . build setuptools wheel
+      - name: Sanitize, build, install, rebuild from sdist and smoke exact assets
+        id: assets
+        env:
+          RELEASE_TAG: ${{ needs.qualify.outputs.tag }}
+          REQUIRED_MAIN_CI_JSON: ${{ needs.qualify.outputs.ciRuns }}
+          EXPECTED_TAG_OBJECT: ${{ needs.qualify.outputs.tagObject }}
+        run: python scripts/release_ci.py build --tag $env:RELEASE_TAG
+      - uses: actions/upload-artifact@v4
+        id: bundle
+        with:
+          name: component-release-${{ needs.qualify.outputs.commit }}
+          path: .component-release/ci-artifacts/*
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+  publish:
+    needs: [qualify, package]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.qualify.outputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.package.outputs.artifact-id }}
+          merge-multiple: true
+          path: release-artifacts
+      - name: Verify immutable assets, publish draft, verify public release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.qualify.outputs.tag }}
+          RELEASE_ARTIFACT_ID: ${{ needs.package.outputs.artifact-id }}
+          RELEASE_ARTIFACT_DIGEST: ${{ needs.package.outputs.artifact-digest }}
+          EXPECTED_MANIFEST_SHA256: ${{ needs.package.outputs.manifest-sha }}
+          EXPECTED_TAG_OBJECT: ${{ needs.qualify.outputs.tagObject }}
+        run: python scripts/release_ci.py publish --tag "$RELEASE_TAG" --artifacts release-artifacts
