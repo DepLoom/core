@@ -103,8 +103,11 @@ def verify_current_workspace(project_dir, *, expected_source_key, dependency_pla
         contract=environment_contract,guarded=trusted_pre_popen_guard is not None)
     if any(str(env.get(k,'')).strip() for k in ('NODE_OPTIONS','NODE_PATH')):
         fail('CURRENT_WORKSPACE_EXTERNAL_NODE_LOADER_UNPROVEN')
-    node=shutil.which('node',path=env.get('PATH'));npm=Path(node).parent/'node_modules/npm/bin/npm-cli.js' if node else None
-    if not node or not npm.is_file():fail('CURRENT_WORKSPACE_TOOLCHAIN_UNAVAILABLE')
+    from draft_npm_preflight import _npm_command
+    try:
+        node,npm_entry=_npm_command(path=env.get('PATH'));npm=Path(npm_entry)
+    except OSError:
+        fail('CURRENT_WORKSPACE_TOOLCHAIN_UNAVAILABLE')
     tools={'nodeSha256':_sha(Path(node).read_bytes()),'npmCliSha256':_sha(npm.read_bytes())}
     lock=(project/'package-lock.json').read_bytes()
     if _sha(lock)!=dependency_plan['approvedLockSha256']:fail('CURRENT_WORKSPACE_APPROVED_LOCK_MISMATCH')

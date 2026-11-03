@@ -126,7 +126,7 @@ class OutputContractTests(_Fixture):
         self.outputs()
         with self.assertRaisesRegex(GeneratedOutputError,'DEADLINE'):capture_receipt(self.project,self.spec,deadline=time.time()-1,binding=self.binding)
 
-@unittest.skipUnless(shutil.which('node'),'native Node/npm required')
+@unittest.skipUnless(os.name=='nt' and shutil.which('node'),'Windows guaranteed-tree output profile required')
 class NativeOutputBoundaryTests(_Fixture):
     def invoke(self,*,spec=True):
         from materialized_workspace_verifier import verify_current_workspace

@@ -90,7 +90,8 @@ class MaterializedOriginTests(unittest.TestCase):
             (self.project/"package.json").write_text(json.dumps(manifest)+"\n",encoding="utf-8")
         env={**os.environ,"npm_config_cache":str(self.base/"npm-cache"),"npm_config_offline":"true",
             "npm_config_audit":"false","npm_config_fund":"false","npm_config_lockfile_version":"2"}
-        argv,shell=_command_prefix(resolve_executable("npm"),["install","--package-lock-only","--ignore-scripts","--offline","--lockfile-version=2"])
+        from draft_npm_preflight import _npm_command
+        argv=_npm_command()+["install","--package-lock-only","--ignore-scripts","--offline","--lockfile-version=2"];shell=False
         subprocess.run(argv,shell=shell,cwd=self.project,env=env,check=True,capture_output=True,timeout=30)
         body=b"throw new Error('intentional project failure');" if tool_drift else b"console.log('MUST_NOT_START');"
         encoded=base64.b64encode(body).decode("ascii")

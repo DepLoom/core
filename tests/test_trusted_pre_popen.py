@@ -7,6 +7,7 @@ from project_execution_environment import project_execution_environment,project_
 
 def digest(v):return hashlib.sha256(json.dumps(v,sort_keys=True,separators=(',',':'),ensure_ascii=False).encode()).hexdigest()
 
+@unittest.skipUnless(os.name=='nt','Native V2 launch profile is Windows-only')
 class TrustedPrePopenTests(unittest.TestCase):
  def setUp(self):
   self.t=tempfile.TemporaryDirectory();self.addCleanup(self.t.cleanup);self.root=Path(self.t.name)
@@ -42,5 +43,14 @@ class TrustedPrePopenTests(unittest.TestCase):
  def test_popen_failure_never_returns_started_witness(self):
   with patch('verification_process_supervisor.subprocess.Popen',side_effect=OSError('ACTUAL_SPAWN_FAILED')):
    with self.assertRaisesRegex(OSError,'ACTUAL_SPAWN_FAILED'):self.invoke(lambda e:{'role':'private','inputBindingHash':'d'*64})
+
+class AdaptedEnvironmentDenialTests(unittest.TestCase):
+ def test_supervision_marker_cannot_be_hidden_from_exact_environment_identity(self):
+  with tempfile.TemporaryDirectory() as raw:
+   env=project_execution_environment(os.environ,contract=V2)
+   with patch('verification_process_supervisor._LINUX_SUBREAPER',True),patch('verification_process_supervisor.subprocess.Popen') as popen:
+    with self.assertRaisesRegex(ProcessSupervisionError,'PROJECT_ACTUAL_LAUNCH_ENVIRONMENT_MISMATCH'):
+     run_supervised([sys.executable,'-c','print("MUST_NOT_RUN")'],Path(raw),base_env=env,timeout_seconds=5,expected_project_environment_digest=project_environment_fingerprint(env,contract=V2))
+    popen.assert_not_called()
 
 if __name__=='__main__':unittest.main()

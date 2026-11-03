@@ -93,5 +93,20 @@ class NpmPreflightTests(unittest.TestCase):
         self.assertEqual('UNKNOWN',result['status'])
         self.assertEqual('REGISTRY_NOT_CONFIGURED',result['projects']['fixture']['code'])
 
+class NpmEntrypointDiscoveryTests(unittest.TestCase):
+    def test_explicit_path_is_used_for_all_executable_lookups(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root=Path(raw);node=root/'node';node.write_bytes(b'node')
+            script=root/'lib/npm/bin/npm-cli.js';script.parent.mkdir(parents=True);script.write_bytes(b'npm')
+            def which(name, *, path):
+                self.assertEqual(path, 'CALLER_OWNED_PATH')
+                return str(node) if name=='node' else str(script) if name=='npm' else None
+            with patch.object(preflight.shutil,'which',side_effect=which):
+                self.assertEqual(preflight._npm_command(path='CALLER_OWNED_PATH'),[str(node),str(script)])
+    def test_missing_caller_toolchain_does_not_fall_back_to_ambient_path(self):
+        with patch.object(preflight.shutil,'which',return_value=None) as lookup:
+            with self.assertRaises(OSError):preflight._npm_command(path='EMPTY_PATH')
+            self.assertTrue(all(c.kwargs=={'path':'EMPTY_PATH'} for c in lookup.call_args_list))
+
 if __name__=='__main__':
     unittest.main()

@@ -33,9 +33,9 @@ def _digest(path: Path) -> str | None:
     return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
 
 
-def _npm_command() -> list[str]:
-    node = shutil.which("node")
-    npm = shutil.which("npm.cmd") or shutil.which("npm")
+def _npm_command(path: str | None = None) -> list[str]:
+    node = shutil.which("node", path=path)
+    npm = shutil.which("npm.cmd", path=path) or shutil.which("npm", path=path)
     if not node or not npm:
         raise OSError("npm runtime unavailable")
     candidates = [Path(npm).parent / "node_modules/npm/bin/npm-cli.js",

@@ -1,4 +1,4 @@
-import json,copy,time,unittest,importlib.util
+import json,copy,time,unittest,importlib.util,os
 from pathlib import Path
 from resolved_dependency_state import compile_npm_dependency_obligations,npm_root_assignment_from_obligations,MaterializedDependencyObligationError,_canonical_hash
 from source_snapshot import source_snapshot_fingerprint
@@ -12,6 +12,7 @@ class DeclaredRootAssignmentTests(unittest.TestCase):
   for name,meta in [('root',{'dependencies':{'leaf':'^1'}}),('leaf',{})]:
    p=self.project/'node_modules'/name;p.mkdir(parents=True);(p/'package.json').write_text(json.dumps({'name':name,'version':'1.0.0',**meta}))
   return compile_npm_dependency_obligations(raw,raw,exact_targets={},changed_instances=[],delta_digest='a'*64,scope_digest='b'*64)
+ @unittest.skipUnless(os.name=='nt','Native guaranteed-tree workspace profile is Windows-only')
  def test_hoisted_transitive_is_not_declared_root_but_stays_physical_obligation(self):
   plan=self.plan_with_hoisted_leaf();self.assertEqual(npm_root_assignment_from_obligations(plan),{'root':'1.0.0'});self.assertEqual(len(plan['instances']),2)
   result=verify_current_workspace(self.project,expected_source_key=source_snapshot_fingerprint(self.project),dependency_plan=plan,commands=[fixtures.command("console.log('actual root and hoisted leaf');")],cache_dir=self.cache,deadline=time.time()+45,final_profile_digest='c'*64)

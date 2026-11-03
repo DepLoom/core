@@ -25,7 +25,7 @@ def command(body):
     return 'node -e '+json.dumps("eval(Buffer.from('"+encoded+"','base64').toString('utf8'))")
 
 
-@unittest.skipUnless(shutil.which('node'),'Node/npm toolchain required')
+@unittest.skipUnless(os.name=='nt' and shutil.which('node'),'Windows guaranteed-tree current-workspace profile required')
 class CurrentWorkspaceVerificationTests(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)

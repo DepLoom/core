@@ -6,7 +6,8 @@ from verification_process_supervisor import run_supervised
 class NpmRangeNormalizationTests(unittest.TestCase):
  def test_official_installed_npm_semver_crosscheck(self):
   cases=[['>= 3.1.0 < 4','3.1.0'],['>= 3.1.0 < 4','3.9.1'],['>= 3.1.0 < 4','4.0.0'],['^ 1.2.3','1.5.0'],['^ 1.2.3','2.0.0'],['~ 1.2.3','1.2.4'],['~ 1.2.3','1.3.0'],['1.2.3 - 2.0.0','2.0.0'],['>= 1.0.0 || < 0.1.0','0.0.9'],['>= 1.0.0-beta.1 < 2','1.0.0-beta.2']]
-  node=Path(shutil.which('node'));semver=node.parent/'node_modules/npm/node_modules/semver';body="const s=require(process.argv[1]);const c=JSON.parse(process.argv[2]);console.log(JSON.stringify(c.map(([r,v])=>s.satisfies(v,r))))"
+  from draft_npm_preflight import _npm_command
+  node,npm=_npm_command();semver=Path(npm).resolve().parent.parent/'node_modules/semver';body="const s=require(process.argv[1]);const c=JSON.parse(process.argv[2]);console.log(JSON.stringify(c.map(([r,v])=>s.satisfies(v,r))))"
   result=run_supervised([str(node),'-e',body,str(semver),json.dumps(cases)],Path.cwd(),timeout_seconds=10,max_output_bytes=4096)
   self.assertEqual(result.returncode,0);self.assertEqual(result.supervision.quality,'guaranteed-tree');self.assertEqual(result.supervision.descendants_remaining,0)
   native=json.loads(result.stdout)

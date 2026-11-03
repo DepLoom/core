@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 import ast
 import asyncio
 import json
@@ -36,6 +37,7 @@ class VerificationInvocationTests(unittest.TestCase):
             self.assertIs(verifier.verify_assignment(Path.cwd(),ASSIGNMENT,config=config),expected)
             self.assertNotIn("invocation_observer",implementation.call_args.kwargs)
         self.assertEqual(verifier._durable_prepared_publication_policy(config),(False,"intermediate-role-private"))
+    @unittest.skipUnless(os.name=='nt','Native guaranteed-tree observation is Windows-only')
     def test_actual_supervisor_observation_precedes_deferred_workspace_cleanup(self):
         from verification_process_supervisor import run_supervised
         events=[]
@@ -84,7 +86,7 @@ class VerificationInvocationTests(unittest.TestCase):
             run_observed(events.append,FINGERPRINT,[COMMAND],action)
             self.assertEqual(events[-1]["status"],"INCOMPLETE_UNKNOWN")
     def test_missing_guards_or_supervision_cannot_pass_command(self):
-        for guarded,quality in [(False,"guaranteed-tree"),(True,"unknown")]:
+        for guarded,quality in [(False,"guaranteed-tree"),(True,"unknown"),(True,"best-effort")]:
             events=[]
             def action():
                 defer_workspace_cleanup(lambda:None);process=supervised();process.supervision.quality=quality

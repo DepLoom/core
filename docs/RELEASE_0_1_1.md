@@ -18,6 +18,11 @@ separate operator registration and capability boundary.
 - [Historical npm identities](NPM_HISTORICAL_IDENTITIES_V1.md)
 - [Unchanged v2 aliases](NPM_V2_UNCHANGED_ALIASES_V1.md)
 
+Native current-workspace, typed output and V2 exact-environment execution use
+the declared Windows guaranteed-tree profile. Linux CI covers planning, portable
+model/identity contracts and fail-closed negative boundaries; its best-effort
+process-group supervisor does not establish a verified execution checkpoint.
+
 Package version 0.1.1 is distinct from the retained upstream engine VERSION
 identifier. Exact Core commit and content hashes identify a bundled runtime.
 This release does not claim whole-workspace solving, universal execution support,
