@@ -187,6 +187,10 @@ def run_workspace_npm_preflight(
             "baselineLockSha256": hashlib.sha256(baseline_lock).hexdigest(),
             "sourceManifestSha256": {owner: hashlib.sha256(raw).hexdigest()
                                      for owner, raw in sorted(manifests.items())},
+            "candidateManifestSha256": {
+                path.parent.relative_to(workspace).as_posix(): hashlib.sha256(raw).hexdigest()
+                for path, raw in candidate_manifests.items()
+            },
             "assignment": [[*key, value] for key, value in sorted(assignment.items())],
             "mutable": [list(key) for key in sorted(mutable)],
             "reauthor": list(reauthor) if reauthor is not None else None,

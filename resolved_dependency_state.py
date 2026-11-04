@@ -513,18 +513,67 @@ def observe_npm_dependency_obligations(project_dir, plan, *, source_origin_diges
     if any(not isinstance(value, str) or re.fullmatch('[0-9a-f]{64}', value) is None
             for value in (source_origin_digest, resolved_state_key)):
         raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_ORIGIN_UNPROVEN')
+    from reparse_materialization import is_reparse
+    from workspace_npm_obligations import WORKSPACE_OBLIGATION_KIND, _owners
+    workspace = plan.get("kind") == WORKSPACE_OBLIGATION_KIND
+    if workspace and Path(project_dir).absolute() != project:
+        raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_REPARSE_UNPROVEN')
+
+    def no_link(path):
+        try:
+            observed = path.lstat()
+        except FileNotFoundError:
+            return
+        if is_reparse(path) or getattr(observed, "st_file_attributes", 0) & 0x400:
+            raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_REPARSE_UNPROVEN')
+
     lock = project / 'package-lock.json'
-    if not lock.is_file() or _sha256_bytes(lock.read_bytes()) != plan['approvedLockSha256']:
+    no_link(lock)
+    lock_bytes = lock.read_bytes() if lock.is_file() else b""
+    if _sha256_bytes(lock_bytes) != plan['approvedLockSha256']:
         raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_LOCK_DRIFT')
-    locked=_obligation_json(lock.read_bytes())
+    locked=_obligation_json(lock_bytes, 32 * 1024 * 1024 if workspace else 8 * 1024 * 1024)
     if (type(locked.get('lockfileVersion')) is not int or locked['lockfileVersion'] not in (2,3)
             or locked['lockfileVersion']==3 and 'dependencies' in locked
-            or plan.get('kind')!='APPROVED_NPM_V'+str(locked['lockfileVersion'])+'_INSTANCE_OBLIGATIONS'):
+            or (workspace and locked['lockfileVersion'] != 3)
+            or (not workspace and plan.get('kind')!='APPROVED_NPM_V'+str(locked['lockfileVersion'])+'_INSTANCE_OBLIGATIONS')):
         raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_LOCK_UNSUPPORTED')
-    manifest = _obligation_json((project / 'package.json').read_bytes(), 1024*1024)
-    _ordinary_npm_obligation_mode(manifest)
-    if {key: manifest.get(key, {}) for key in plan['rootDeclarations']} != plan['rootDeclarations']:
-        raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_MANIFEST_DRIFT')
+    owners = plan["workspaceOwners"] if workspace else {"": {"declarations": plan["rootDeclarations"]}}
+    workspace_links = plan["workspaceLinks"] if workspace else {}
+    if workspace:
+        _owners(locked["packages"], {owner or ".": row["manifestSha256"] for owner, row in owners.items()})
+        if (not isinstance(workspace_links, dict)
+                or set(workspace_links) != {slot for slot, row in locked["packages"].items() if row.get("link")}
+                or {row["owner"] for row in workspace_links.values()} != set(owners) - {""}
+                or len(workspace_links) != len(owners) - 1):
+            raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_WORKSPACE_LINKS_UNPROVEN')
+
+    def read_owner(owner, expected_owner):
+        budget()
+        directory = project
+        for part in owner.split("/") if owner else ():
+            directory /= part
+            no_link(directory)
+        path = directory / "package.json"
+        no_link(path)
+        limit = (2 if workspace else 1) * 1024 * 1024
+        with path.open("rb") as stream:
+            raw = stream.read(limit + 1)
+        manifest = _obligation_json(raw, limit)
+        _ordinary_npm_obligation_mode(manifest)
+        if ({key: manifest.get(key, {}) for key in expected_owner["declarations"]} != expected_owner["declarations"]
+                or (workspace and _sha256_bytes(raw) != expected_owner["manifestSha256"])):
+            raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_MANIFEST_DRIFT')
+        return manifest
+
+    owner_manifests = {owner: read_owner(owner, row) for owner, row in owners.items()}
+    for slot, row in workspace_links.items():
+        owner = row["owner"]
+        if (slot != "node_modules/" + row["name"] or locked["packages"][slot] != {"link": True, "resolved": owner}
+                or owner_manifests[owner].get("name") != row["name"]
+                or owner_manifests[owner].get("version") != row["version"]):
+            raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_WORKSPACE_LINKS_UNPROVEN')
+        _npm_obligation_name(slot, {"version": row["version"]})
     expected = {row['path']: row for row in plan['instances']}
     omission_proof={}
     if plan.get('optionalAbsenceRules'):
@@ -557,21 +606,20 @@ def observe_npm_dependency_obligations(project_dir, plan, *, source_origin_diges
     locked_paths_folded={path.casefold() for path in expected}
     if auxiliary_directory_observer is not None and not callable(auxiliary_directory_observer):
         raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_AUXILIARY_OBSERVER_INVALID')
-    def no_link(path):
-        if path.is_symlink() or (hasattr(path, 'is_junction') and path.is_junction()):
-            raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_REPARSE_UNPROVEN')
-    def scan_modules(directory, prefix='', depth=0):
+    observed_links = {}
+    def scan_modules(directory, depth=0):
         nonlocal manifest_bytes_read
         budget()
         if depth > 64:
             raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_DEPTH_LIMIT')
+        no_link(directory)
         if not directory.exists():
             return
-        no_link(directory)
         for entry in sorted(directory.iterdir(), key=lambda p: p.name):
             if entry.name in {'.bin', '.package-lock.json'}:
                 continue
-            no_link(entry)
+            if entry.relative_to(project).as_posix() not in workspace_links:
+                no_link(entry)
             # Only unscoped direct slots here: NEVER apply this predicate to
             # children inside @scope, where dot names may denote packages.
             if entry.name.startswith('.') and entry.name not in {'.','..'} and entry.is_dir():
@@ -597,8 +645,19 @@ def observe_npm_dependency_obligations(project_dir, plan, *, source_origin_diges
                 paths = [entry]
             for package in paths:
                 budget()
-                no_link(package)
                 relative = package.relative_to(project).as_posix()
+                if relative in workspace_links:
+                    link = workspace_links[relative]
+                    target = project / link["owner"]
+                    try:
+                        matches = is_reparse(package) and package.resolve(strict=True) == target and target.is_dir()
+                    except (OSError, RuntimeError):
+                        matches = False
+                    if not matches:
+                        raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_WORKSPACE_LINK_MISMATCH')
+                    observed_links[relative] = link["owner"]
+                    continue
+                no_link(package)
                 if relative.casefold() in folded or not package.is_dir() or len(actual) >= 10000:
                     raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_LAYOUT_UNPROVEN')
                 folded.add(relative.casefold())
@@ -613,8 +672,11 @@ def observe_npm_dependency_obligations(project_dir, plan, *, source_origin_diges
                 value = _obligation_json(raw, 1024*1024)
                 _ordinary_npm_obligation_mode(value,bundle_verified=relative in bundle_paths)
                 actual[relative] = (value, _sha256_bytes(raw))
-                scan_modules(package / 'node_modules', relative, depth+1)
-    scan_modules(project / 'node_modules')
+                scan_modules(package / 'node_modules', depth+1)
+    for owner in owners:
+        scan_modules(project / owner / 'node_modules')
+    if set(observed_links) != set(workspace_links):
+        raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_WORKSPACE_LINK_MISMATCH')
     if set(actual) != set(expected)-set(omission_proof):
         raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_INSTANCE_SET_MISMATCH: '
             + json.dumps({'missing': sorted(set(expected)-set(actual))[:20], 'extra': sorted(set(actual)-set(expected))[:20]}))
@@ -623,6 +685,15 @@ def observe_npm_dependency_obligations(project_dir, plan, *, source_origin_diges
         return location.rpartition('/node_modules/')[0] if '/node_modules/' in location else ''
     def resolve(location, name, peer=False):
         _npm_obligation_name('node_modules/'+name, {'version': '0.0.0'})
+        if workspace:
+            from resolution_inventory import _member_ancestor_prefixes
+            from workspace_npm_lock_delta import peer_context
+            context = peer_context(location) if peer else location
+            for base in _member_ancestor_prefixes(context):
+                candidate = (base + "/" if base else "") + "node_modules/" + name
+                if candidate in actual or candidate in observed_links:
+                    return candidate
+            return None
         base = parent_instance(location) if peer else location
         while True:
             candidate = (base+'/' if base else '')+'node_modules/'+name
@@ -642,7 +713,7 @@ def observe_npm_dependency_obligations(project_dir, plan, *, source_origin_diges
                 if len(matches)==1:
                     edges.append({'source':source,'name':name,'destination':matches[0],'peer':peer,'specifier':spec,
                         'outcome':'VERIFIED_PLATFORM_INAPPLICABLE'});return
-            if optional_peer and plan.get('optionalAbsenceRules'):
+            if optional_peer and (workspace or plan.get('optionalAbsenceRules')):
                 try:NpmSpec(normalize_npm_range(spec))
                 except (ValueError,TypeError) as exc:
                     raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_OPTIONAL_PEER_RANGE_UNPROVEN') from exc
@@ -655,12 +726,13 @@ def observe_npm_dependency_obligations(project_dir, plan, *, source_origin_diges
             if not match:
                 raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_ALIAS_UNPROVEN')
             wanted_name, spec = match.groups()
+        provider = owner_manifests[observed_links[destination]] if destination in observed_links else actual[destination][0]
         try:
-            matched = NpmSpec(normalize_npm_range(spec)).match(Version(actual[destination][0]['version']))
+            matched = NpmSpec(normalize_npm_range(spec)).match(Version(provider['version']))
         except (ValueError, KeyError) as exc:
             raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_EDGE_UNPROVEN') from exc
         expected_name = wanted_name if wanted_name is not None else name
-        if actual[destination][0].get('name') != expected_name:
+        if provider.get('name') != expected_name:
             raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_EDGE_IDENTITY_MISMATCH')
         if not matched:
             raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_EDGE_MISMATCH')
@@ -684,13 +756,34 @@ def observe_npm_dependency_obligations(project_dir, plan, *, source_origin_diges
                 edge(location,name,spec,key=='peerDependencies',optional=key=='optionalDependencies',optional_peer=peer_optional)
         rows.append({'path': location, 'name': wanted['name'], 'version': wanted['version'],
             'packageManifestSha256': digest, 'lockRecordDigest': wanted['lockRecordDigest'], 'held': wanted['held']})
-    for key, declarations in plan['rootDeclarations'].items():
-        if not isinstance(declarations, dict):
-            raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_ROOT_UNPROVEN')
-        for name, spec in declarations.items():
-            if key == 'dependencies' and name in plan['rootDeclarations']['optionalDependencies']:
-                continue
-            edge('',name,spec,optional=key=='optionalDependencies')
+    for owner, record in owners.items():
+        for key, declarations in record["declarations"].items():
+            if not isinstance(declarations, dict):
+                raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_ROOT_UNPROVEN')
+            for name, spec in declarations.items():
+                if key == 'dependencies' and name in record["declarations"]['optionalDependencies']:
+                    continue
+                optional_peer = False
+                if workspace and key == "peerDependencies":
+                    flags = owner_manifests[owner].get("peerDependenciesMeta", {}).get(name, {})
+                    optional_peer = flags.get("optional") is True
+                edge(owner, name, spec, peer=workspace and key == "peerDependencies",
+                     optional=key == "optionalDependencies", optional_peer=optional_peer)
+    workspace_evidence = {}
+    if workspace:
+        for owner, record in owners.items():
+            read_owner(owner, record)
+        no_link(lock)
+        if lock.read_bytes() != lock_bytes:
+            raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_LOCK_DRIFT')
+        for slot, owner in observed_links.items():
+            path = project / slot
+            if not is_reparse(path) or path.resolve() != project / owner:
+                raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_WORKSPACE_LINK_MISMATCH')
+        workspace_evidence = {"workspaceOwnerCount": len(owners), "workspaceLinkCount": len(observed_links),
+                              "workspaceBindingDigest": _canonical_hash({
+                                  "owners": owners, "links": observed_links, "resolver": plan["resolverIdentitySha256"],
+                              })}
     budget()
     if auxiliary_directory_observer is not None:auxiliary_directory_observer(auxiliary)
     bundle_counts=({'bundledMemberCount':sum(p['memberCount'] for p in bundle_proofs.values()),
@@ -702,10 +795,10 @@ def observe_npm_dependency_obligations(project_dir, plan, *, source_origin_diges
         'sourceOriginObservationDigest': source_origin_digest, 'resolvedStateKey': resolved_state_key,
         'approvedLockSha256': plan['approvedLockSha256'], 'obligationPlanDigest': plan['obligationPlanDigest'],
         'materializedTreeObservationDigest': _canonical_hash({'instances': rows, 'edges': edges,
-            **({'platformInapplicable':omission_proof} if omission_proof else {}), **bundle_counts}),
+            **({'platformInapplicable':omission_proof} if omission_proof else {}), **bundle_counts, **workspace_evidence}),
         'instanceCount': len(rows)+len(omission_proof),
         'heldInstanceCount': sum(row['held'] for row in rows)+sum(expected[path]['held'] for path in omission_proof),
-        **platform_counts, **bundle_counts,
+        **platform_counts, **bundle_counts, **workspace_evidence,
         'protectedEdgeCount': len(edges), 'changedInstanceCount': plan['changedInstanceCount'],
         'unknownCount': 0, 'violations': [], 'payloadAuthenticity': 'NOT_ATTESTED',
         'scope': 'PHYSICAL_INSTANCE_MANIFESTS_AND_SUPPORTED_NODE_EDGES_AT_BOUNDARIES', 'fullAcceptance': False}
