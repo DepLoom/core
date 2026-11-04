@@ -15,7 +15,7 @@ class WorkspaceLockChecks(unittest.TestCase):
             ("packages/legacy", "dependencies", "react"): "18.3.1",
             ("packages/legacy", "dependencies", "react-dom"): "18.3.1",
         }
-        renderer = {"version": "18.3.1", "peerDependencies": {"react": "^18.3.1"}}
+        renderer = {"version": "18.3.1", "peerDependencies": {"react": ">= 18.3.1 < 19"}}
         packages = {
             "node_modules/react": {"version": "19.0.0"},
             "packages/legacy/node_modules/react": {"version": "18.3.1"},
@@ -59,6 +59,45 @@ class WorkspaceLockChecks(unittest.TestCase):
             )
         runner.assert_not_called()
         self.assertEqual(result["code"], "UNAUTHORIZED_DECLARATION_DELTA")
+
+    def test_existing_root_overrides_reach_npm_unchanged(self):
+        overrides = {"parent@^1": {".": "1.2.0", "@scope/child": "$@scope/child"}}
+        root = {"workspaces": ["packages/*"], "dependencies": {"@scope/child": "1.0.0"},
+                "overrides": overrides}
+        member = {"name": "app", "version": "1.0.0"}
+        baseline = {"lockfileVersion": 3, "packages": {
+            "": {"workspaces": root["workspaces"], "dependencies": root["dependencies"]},
+            "packages/app": member,
+            "node_modules/@scope/child": {"version": "1.0.0"},
+        }}
+        inputs = {owner: json.dumps(project).encode() for owner, project in ((".", root), ("packages/app", member))}
+        assignment = {(".", "dependencies", "@scope/child"): "1.0.0"}
+
+        def resolve(argv, workspace, **kwargs):
+            self.assertEqual(json.loads((workspace / "package.json").read_bytes())["overrides"], overrides)
+            if argv[1] == "-e":
+                return subprocess.CompletedProcess(argv, 0, json.dumps({
+                    "status": "RESOLUTION_PASSED", "code": "LOCK_ASSIGNMENT_AND_PEERS_MATCH", "nodeCount": 3,
+                }))
+            self.assertEqual(argv[argv.index("--registry") + 1], "https://mirror.example.invalid/npm")
+            self.assertIn("--strict-peer-deps=true", argv)
+            return subprocess.CompletedProcess(argv, 0, "")
+
+        with (tempfile.TemporaryDirectory() as temp,
+              patch("workspace_npm_preflight._npm_command", return_value=[__file__, __file__]),
+              patch("workspace_npm_preflight.run_supervised", side_effect=resolve) as runner):
+            options = {"artifacts": Path(temp), "cache": Path(temp), "registry": "https://mirror.example.invalid/npm"}
+            result = run_workspace_npm_preflight(inputs, json.dumps(baseline).encode(), assignment, frozenset(), **options)
+            self.assertEqual(result["status"], "RESOLUTION_PASSED")
+            self.assertEqual(result["runtime"], "NOT_RUN")
+            for invalid in ({"parent": {"child": "$not-in-root"}},
+                            {"parent": {"child": "https://example.invalid/archive.tgz"}},
+                            {"parent@file:./x": "1.2.0"}):
+                inputs["."] = json.dumps({**root, "overrides": invalid}).encode()
+                result = run_workspace_npm_preflight(
+                    inputs, json.dumps(baseline).encode(), assignment, frozenset(), **options)
+                self.assertEqual(result["code"], "INVALID_WORKSPACE_PREFLIGHT_INPUT")
+            self.assertEqual(runner.call_count, 2)
 
     def test_native_timeout_is_unknown_and_never_learned(self):
         projects = {

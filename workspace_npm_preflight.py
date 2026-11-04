@@ -20,13 +20,14 @@ from semantic_version import NpmSpec, Version
 from draft_npm_preflight import _npm_command
 from verification_process_supervisor import run_supervised
 
+from project_runtime import normalize_npm_range
 from resolution_inventory import npm_lock_resolved_instance
 from workspace_peer_model import Declaration
 from workspace_glob import match_workspace_pattern
 from workspace_npm_lock_delta import INSTALL_SECTIONS, check_workspace_lock_delta, peer_context
 
 
-def check_workspace_lock(packages: dict, assignment: dict[Declaration, str]) -> dict:
+def check_workspace_lock(packages: dict, assignment: dict[Declaration, str], *, check_declared_peers=True) -> dict:
     evidence = {"authority": "LOCKFILE_ONLY", "installation": "NOT_RUN", "runtime": "NOT_RUN",
                 "learningAllowed": False}
     for (owner, section, name), expected in sorted(assignment.items()):
@@ -35,6 +36,8 @@ def check_workspace_lock(packages: dict, assignment: dict[Declaration, str]) -> 
             return {**evidence, "status": "RESOLUTION_FAILED", "code": "LOCK_ASSIGNMENT_MISMATCH",
                     "declaration": [owner, section, name], "expectedVersion": expected,
                     "actualVersion": instance[1] if instance else None}
+    if not check_declared_peers:
+        return {**evidence, "status": "RESOLUTION_PASSED", "code": "LOCK_ASSIGNMENT_MATCH"}
     for consumer, entry in sorted(packages.items()):
         if not isinstance(entry, dict):
             return {**evidence, "status": "UNKNOWN", "code": "INVALID_LOCK_ENTRY"}
@@ -55,7 +58,7 @@ def check_workspace_lock(packages: dict, assignment: dict[Declaration, str]) -> 
             if provider is None and flags.get("optional") is True:
                 continue
             try:
-                valid = provider is not None and NpmSpec(spec).match(Version(provider[1]))
+                valid = provider is not None and NpmSpec(normalize_npm_range(spec)).match(Version(provider[1]))
             except ValueError:
                 return {**evidence, "status": "UNKNOWN", "code": "UNSUPPORTED_LOCK_PEER_RANGE",
                         "consumer": consumer, "peer": name}
@@ -70,6 +73,36 @@ _SPEC = re.compile(r"[0-9A-Za-z.*+^~<>=| -]+")
 _VERSION = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
 
 
+_PACKAGE_NAME = r"(?:@[a-z0-9_~.-]+/)?[a-z0-9_~.-]+"
+_OVERRIDE_SELECTOR = re.compile(rf"{_PACKAGE_NAME}(?:@([0-9A-Za-z.*+^~<>=| -]+))?")
+
+
+def _check_root_overrides(project):
+    """Allow registry specs and root references, without emulating npm's resolution."""
+    declared = {name for section in (*INSTALL_SECTIONS, "peerDependencies")
+                for name in project.get(section, {})}
+
+    def check(rules, depth):
+        if not isinstance(rules, dict) or depth > 16:
+            raise ValueError("Unsupported npm overrides")
+        for selector, value in rules.items():
+            if selector == "." and depth > 0:
+                if not isinstance(value, str):
+                    raise ValueError("Invalid npm self override")
+            elif not _OVERRIDE_SELECTOR.fullmatch(selector):
+                raise ValueError("Invalid npm override selector")
+
+            if isinstance(value, dict):
+                check(value, depth + 1)
+            elif not isinstance(value, str) or not (
+                _SPEC.fullmatch(value) or (value.startswith("$") and re.fullmatch(_PACKAGE_NAME, value[1:])
+                                      and value[1:] in declared)
+            ):
+                raise ValueError("Unsupported npm override spec")
+
+    check(project["overrides"], 0)
+
+
 WORKSPACE_NPM_POLICY = (
     "--package-lock=true", "--strict-peer-deps=true", "--engine-strict=true",
     "--ignore-scripts=true", "--force=false", "--legacy-peer-deps=false",
@@ -78,6 +111,32 @@ WORKSPACE_NPM_POLICY = (
     "--include=prod", "--include=dev", "--include=optional", "--include=peer",
     "--offline=true", "--prefer-offline=false",
 )
+
+
+# Resolve effective peers with the same npm distribution that authored the lock.
+# Raw lock peer ranges can differ from effective edges after a root override.
+_NATIVE_PEER_CHECK = """
+const {createRequire} = require('node:module')
+const Arborist = createRequire(process.argv[1])('@npmcli/arborist')
+async function inspect() {
+  const root = await new Arborist({
+    path: process.cwd(), offline: true, ignoreScripts: true,
+    strictPeerDeps: true, legacyPeerDeps: false,
+  }).loadVirtual()
+  for (const node of root.inventory.values()) {
+    for (const edge of node.edgesOut.values()) {
+      if (edge.peer && edge.error) {
+        return {status: 'RESOLUTION_FAILED', code: 'LOCK_PEER_MISMATCH',
+          consumer: node.location, peer: edge.name, requiredRange: edge.spec,
+          providerPath: edge.to?.location ?? null, providerVersion: edge.to?.version ?? null}
+      }
+    }
+  }
+  return {status: 'RESOLUTION_PASSED', code: 'LOCK_ASSIGNMENT_AND_PEERS_MATCH',
+    nodeCount: root.inventory.size}
+}
+inspect().then(row => console.log(JSON.stringify(row))).catch(() => {process.exitCode = 1})
+"""
 
 
 def isolated_workspace_npm_environment(environment):
@@ -131,7 +190,7 @@ def run_workspace_npm_preflight(
                     or PurePosixPath(owner).is_absolute()
                     or any(part in {"", ".", "..", "node_modules", ".git"} for part in owner.split("/")))):
                 raise ValueError("Unsafe workspace owner")
-            if not isinstance(project, dict) or "overrides" in project:
+            if not isinstance(project, dict) or (owner != "." and "overrides" in project):
                 raise ValueError("Unsupported manifest")
             record = packages["" if owner == "." else owner]
             if any(project.get(section, {}) != record.get(section, {})
@@ -141,6 +200,8 @@ def run_workspace_npm_preflight(
                 for spec in project.get(section, {}).values():
                     if not isinstance(spec, str) or not _SPEC.fullmatch(spec):
                         raise ValueError("Unsupported dependency spec")
+        if "overrides" in projects["."]:
+            _check_root_overrides(projects["."])
         for path, row in packages.items():
             if path and (not re.fullmatch(r"[A-Za-z0-9_./@+-]+", path)
                          or any(part in {"", ".", "..", ".git"} for part in path.split("/"))):
@@ -219,6 +280,9 @@ def run_workspace_npm_preflight(
             "reauthor": list(reauthor) if reauthor is not None else None,
             "registrySha256": hashlib.sha256(registry.encode()).hexdigest(),
         }
+        has_overrides = bool(projects["."].get("overrides"))
+        if has_overrides:
+            identity["peerEvidenceMethod"] = "NPM_EFFECTIVE_VIRTUAL_EDGES"
         if immutable_instances:
             identity["immutableInstances"] = sorted(immutable_instances)
         for label, executable in (("nodeBinarySha256", node), ("npmEntrypointSha256", npm_cli)):
@@ -250,9 +314,32 @@ def run_workspace_npm_preflight(
 
         def check(exit_code, code):
             if exit_code:
-                status = "RESOLUTION_FAILED" if code in {"ERESOLVE", "EBADENGINE"} else "UNKNOWN"
+                status = "RESOLUTION_FAILED" if code in {"ERESOLVE", "EBADENGINE", "EOVERRIDE"} else "UNKNOWN"
                 return {"status": status, "code": code}
-            return check_workspace_lock(json.loads(lock_path.read_bytes())["packages"], assignment)
+            packages = json.loads(lock_path.read_bytes())["packages"]
+            result = check_workspace_lock(packages, assignment, check_declared_peers=not has_overrides)
+            if not has_overrides or result["status"] != "RESOLUTION_PASSED":
+                return result
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(argv, timeout_seconds)
+            observed = run_supervised([node, "-e", _NATIVE_PEER_CHECK, npm_cli], workspace,
+                                      timeout_seconds=remaining, progress_label="Workspace effective npm peers",
+                                      base_env=npm_env, max_output_bytes=8192)
+            unknown = {"status": "UNKNOWN", "code": "NPM_VIRTUAL_PEER_EVIDENCE_UNAVAILABLE"}
+            if observed.returncode:
+                return unknown
+            try:
+                native = json.loads(observed.stdout)
+                if (native["status"] == "RESOLUTION_FAILED" and native["code"] == "LOCK_PEER_MISMATCH"
+                        and native["consumer"] in packages):
+                    return native
+                if (native["status"] == "RESOLUTION_PASSED" and native["code"] == "LOCK_ASSIGNMENT_AND_PEERS_MATCH"
+                        and native["nodeCount"] == len(packages)):
+                    return {**result, "code": native["code"]}
+            except (KeyError, TypeError, ValueError):
+                pass
+            return unknown
 
         reauthored = None
         exit_code, code = resolve("npm-resolution")

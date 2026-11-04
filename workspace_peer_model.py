@@ -11,6 +11,8 @@ from typing import Mapping
 
 from semantic_version import NpmSpec, Version
 
+from project_runtime import normalize_npm_range
+
 from peer_solver_model import PackageVariable, PeerOptimizationModel, RequiresAny, forbidden
 from peer_solver_z3 import solve_z3_exact
 from resolution_inventory import npm_lock_resolved_instance
@@ -126,7 +128,7 @@ def compile_workspace_peer_model(
                 if environment is None or engine not in environment:
                     raise WorkspaceModelUnknown(f"ENGINE_VERSION_UNKNOWN: {key} -> {engine}")
                 try:
-                    matches = NpmSpec(spec).match(Version(environment[engine]))
+                    matches = NpmSpec(normalize_npm_range(spec)).match(Version(environment[engine]))
                 except ValueError as exc:
                     raise WorkspaceModelUnknown(f"ENGINE_RANGE_UNSUPPORTED: {key} -> {engine}: {spec}") from exc
                 if not matches:
@@ -151,7 +153,7 @@ def compile_workspace_peer_model(
                     if provider[2] != peer:
                         raise ValueError(f"PEER_PROVIDER_NAME_MISMATCH: {key} -> {peer}")
                     try:
-                        npm_range = NpmSpec(spec)
+                        npm_range = NpmSpec(normalize_npm_range(spec))
                         allowed = tuple(item.version for item in selected[provider]
                                         if npm_range.match(Version(item.version)))
                     except ValueError as exc:
