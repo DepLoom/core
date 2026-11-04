@@ -361,6 +361,12 @@ def plan_workspace_from_registry(
     topology: WorkspaceTopology | None = None,
     candidate_limit: int = 32,
     timeout_ms: int = 30_000,
+    candidate_versions: Mapping[Declaration, tuple[str, ...]] | None = None,
+    health_policy: WorkspaceHealthPolicy | None = None,
+    health_lag_months: int = 12,
+    osv_allowed_names: frozenset[str] = frozenset(),
+    excluded_assignments: tuple[Mapping[str, str], ...] = (),
+    include_constraint_evidence: bool = False,
 ) -> dict:
     """Read deduplicated packuments through the existing Core registry client."""
     from dependency_live_roadmap_generator import DraftBudgetExceeded, RegistryInfrastructureError
@@ -369,6 +375,14 @@ def plan_workspace_from_registry(
         raise ValueError("EXACT_OR_MUTABLE_TARGET_OUTSIDE_DECLARATIONS")
     if not 1 <= candidate_limit <= 128:
         raise ValueError("INVALID_WORKSPACE_CANDIDATE_LIMIT")
+    if candidate_versions is not None and (
+            candidate_versions.keys() != approved_lines.keys()
+            or any(not 1 <= len(versions) <= candidate_limit or len(versions) != len(set(versions))
+                   for versions in candidate_versions.values())
+            or any(target not in candidate_versions[key] for key, target in exact_targets.items())):
+        raise ValueError("INVALID_WORKSPACE_ADMITTED_CANDIDATES")
+    if health_policy is not None and (getattr(client, "deadline", None) is None or client.deadline.remaining is None):
+        raise ValueError("WORKSPACE_POLICY_REGISTRY_DEADLINE_REQUIRED")
     for key, target in exact_targets.items():
         version = Version(target)
         if version.prerelease or version.major not in approved_lines[key]:
@@ -376,6 +390,9 @@ def plan_workspace_from_registry(
 
     unknown = {"authority": "PLANNING_ONLY", "verification": "NOT_VERIFIED",
                "topology": "PROPOSED_INSTANCE_LAYOUT" if topology else "OBSERVED_LOCK_LAYOUT", "status": "UNKNOWN", "assignment": None}
+    if health_policy is not None:
+        unknown["policy"] = {"status": "UNKNOWN", "targetLevel": health_policy.target,
+                             "authority": "DECLARED_DOMAIN_PLANNING_ONLY", "finalAudit": "NOT_RUN"}
     packuments = {}
     admitted = {}
     for key in sorted(declarations):
@@ -401,7 +418,8 @@ def plan_workspace_from_registry(
         packument = packuments[name]
         current_semver = Version(current_version)
         candidates = []
-        versions = (exact_targets[key],) if key in exact_targets else packument["versions"]
+        versions = ((exact_targets[key],) if key in exact_targets else
+                    candidate_versions[key] if candidate_versions is not None else packument["versions"])
         for value in versions:
             if value == current_version and key not in exact_targets:
                 candidates.append(Version(value))
@@ -419,10 +437,37 @@ def plan_workspace_from_registry(
                 candidates.append(version)
         if not candidates or len(candidates) > candidate_limit:
             return {**unknown, "reason": f"WORKSPACE_CANDIDATE_DOMAIN_UNAVAILABLE: {key}"}
-        admitted[key] = tuple(str(value) for value in sorted(candidates, reverse=True))
+        if candidate_versions is not None and len(candidates) != len(versions):
+            return {**unknown, "reason": f"WORKSPACE_EXPLICIT_DOMAIN_INCOMPLETE: {key}"}
+        admitted[key] = (tuple(str(value) for value in candidates) if candidate_versions is not None
+                         else tuple(str(value) for value in sorted(candidates, reverse=True)))
 
-    return plan_workspace_upgrade(packages, declarations, admitted, exact_targets, packuments,
-                                  environment=environment, topology=topology, timeout_ms=timeout_ms)
+    facts = evidence = None
+    if health_policy is not None:
+        from workspace_health_evidence import collect_workspace_health_facts, workspace_registry_health_versions
+
+        query_versions = workspace_registry_health_versions(packages, declarations, admitted, exact_targets)
+        try:
+            facts, evidence = collect_workspace_health_facts(
+                client, packuments, query_versions, lag_months=health_lag_months,
+                osv_allowed_names=osv_allowed_names,
+            )
+        except (DraftBudgetExceeded, RegistryInfrastructureError):
+            return {**unknown, "reason": "WORKSPACE_POLICY_EVIDENCE_UNAVAILABLE"}
+        remaining_ms = int(client.deadline.remaining * 1000)
+        if remaining_ms < 1:
+            return {**unknown, "reason": "WORKSPACE_POLICY_EVIDENCE_TIMEOUT"}
+        timeout_ms = min(timeout_ms, remaining_ms)
+    result = plan_workspace_upgrade(
+        packages, declarations, admitted, exact_targets, packuments,
+        environment=environment, topology=topology, timeout_ms=timeout_ms,
+        health_policy=health_policy, health_facts=facts,
+        excluded_assignments=excluded_assignments, include_constraint_evidence=include_constraint_evidence,
+    )
+    if health_policy is not None:
+        result.setdefault("policy", unknown["policy"])
+        result["policy"]["evidence"] = evidence
+    return result
 
 
 def plan_workspace_upgrade(
