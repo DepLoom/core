@@ -499,6 +499,11 @@ def _trusted_guard_observation(guard,context,argv,launch_args,popen_kwargs,launc
     return {**native,**approval,'prePopenObservationHash':observation_hash}
 
 
+def has_guaranteed_tree_backend() -> bool:
+    """Whether this platform has a backend that can prove owned-tree closure."""
+    return os.name == "nt"
+
+
 def run_supervised(
     argv: Sequence[str],
     cwd: Path,

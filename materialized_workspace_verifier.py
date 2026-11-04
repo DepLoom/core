@@ -22,7 +22,7 @@ from source_snapshot import (verification_source_snapshot_scope,
     validate_source_snapshot, source_snapshot_live_source_continuity)
 from resolved_dependency_state import (capture_resolved_dependency_state,
     observe_npm_dependency_obligations,npm_root_assignment_from_obligations)
-from verification_process_supervisor import run_supervised
+from verification_process_supervisor import has_guaranteed_tree_backend, run_supervised
 from verification_stage_checkpoint import pinned_inline_node_invocation
 from verification_proof import environment_snapshot_fingerprint
 
@@ -80,6 +80,8 @@ def verify_current_workspace(project_dir, *, expected_source_key, dependency_pla
     if (not isinstance(commands,(tuple,list)) or not 1<=len(commands)<=64
             or any(not isinstance(c,str) or not c.strip() or len(c)>4096 for c in commands)):
         fail('CURRENT_WORKSPACE_PROFILE_UNPROVEN')
+    if not has_guaranteed_tree_backend():
+        fail('CURRENT_WORKSPACE_PROCESS_CLOSURE_UNAVAILABLE')
     from workspace_npm_obligations import WORKSPACE_OBLIGATION_KIND, guard_workspace_install_inputs
     from workspace_npm_preflight import WORKSPACE_NPM_POLICY, isolated_workspace_npm_environment
     workspace_mode = dependency_plan.get("kind") == WORKSPACE_OBLIGATION_KIND
