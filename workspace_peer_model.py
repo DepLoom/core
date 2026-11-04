@@ -14,6 +14,7 @@ from semantic_version import NpmSpec, Version
 from peer_solver_model import PackageVariable, PeerOptimizationModel, RequiresAny, forbidden
 from peer_solver_z3 import solve_z3_exact
 from resolution_inventory import npm_lock_resolved_instance
+from workspace_health_policy import WorkspaceHealthFact, WorkspaceHealthPolicy, solve_workspace_health
 
 Declaration = tuple[str, str, str]
 
@@ -226,6 +227,7 @@ def plan_workspace_from_lock(
     timeout_ms: int = 30_000,
     excluded_assignments: tuple[Mapping[str, str], ...] = (),
     include_constraint_evidence: bool = False,
+    health_solver=None,
 ) -> dict:
     """Plan conditionally on observed slots; an npm re-layout remains unmodeled."""
     result = {"authority": "PLANNING_ONLY", "verification": "NOT_VERIFIED",
@@ -253,7 +255,7 @@ def plan_workspace_from_lock(
 
     return _solve_workspace_model(
         model, result, timeout_ms, excluded_assignments,
-        _constraint_evidence(model, domains) if include_constraint_evidence else None,
+        _constraint_evidence(model, domains) if include_constraint_evidence else None, health_solver,
     )
 
 
@@ -266,6 +268,7 @@ def plan_workspace_in_topology(
     timeout_ms: int = 30_000,
     excluded_assignments: tuple[Mapping[str, str], ...] = (),
     include_constraint_evidence: bool = False,
+    health_solver=None,
 ) -> dict:
     """Check a proposed partition into npm instances before native resolution."""
     result = {"authority": "PLANNING_ONLY", "verification": "NOT_VERIFIED",
@@ -294,7 +297,7 @@ def plan_workspace_in_topology(
     model = PeerOptimizationModel(model.packages, model.constraints, tuple(requirements), model.objective_width)
     return _solve_workspace_model(
         model, result, timeout_ms, excluded_assignments,
-        _constraint_evidence(model, domains) if include_constraint_evidence else None,
+        _constraint_evidence(model, domains) if include_constraint_evidence else None, health_solver,
     )
 
 
@@ -328,7 +331,7 @@ def _constraint_evidence(model, domains):
             "rules": rules, "ruleCount": total}
 
 
-def _solve_workspace_model(model, result, timeout_ms, excluded_assignments, constraint_evidence):
+def _solve_workspace_model(model, result, timeout_ms, excluded_assignments, constraint_evidence, health_solver):
     if constraint_evidence is not None:
         result["constraintEvidence"] = constraint_evidence
     if excluded_assignments:
@@ -337,6 +340,8 @@ def _solve_workspace_model(model, result, timeout_ms, excluded_assignments, cons
                       provenance="workspace-request-enumeration")
             for vector in excluded_assignments
         )
+    if health_solver is not None:
+        return {**result, **health_solver(model, timeout_ms)}
     solved = solve_z3_exact(model, timeout_ms=timeout_ms)
     if solved.status == "optimal" and solved.assignment is not None:
         return {**result, "status": "SAT_IN_MODELED_DOMAIN", "assignment": solved.assignment}
@@ -432,8 +437,12 @@ def plan_workspace_upgrade(
     timeout_ms: int = 30_000,
     excluded_assignments: tuple[Mapping[str, str], ...] = (),
     include_constraint_evidence: bool = False,
+    health_policy: WorkspaceHealthPolicy | None = None,
+    health_facts: Mapping[tuple[str, str], WorkspaceHealthFact] | None = None,
 ) -> dict:
     """Use a bounded metadata snapshot to plan under the observed npm lock layout."""
+    if health_facts is not None and health_policy is None:
+        raise ValueError("WORKSPACE_HEALTH_FACTS_REQUIRE_POLICY")
     try:
         domains = workspace_domains_from_inputs(
             packages, declarations, admitted_versions, exact_targets, packuments)
@@ -441,11 +450,29 @@ def plan_workspace_upgrade(
         return {"authority": "PLANNING_ONLY", "verification": "NOT_VERIFIED",
                 "topology": "PROPOSED_INSTANCE_LAYOUT" if topology else "OBSERVED_LOCK_LAYOUT", "status": "UNKNOWN",
                 "reason": str(exc), "assignment": None}
+    health_solver = None
+    if health_policy is not None:
+        active_names = {}
+        for key in domains:
+            owner, _, name = key
+            instance = npm_lock_resolved_instance(packages, name, "" if owner == "." else owner)
+            if not packages[instance[0]].get("link"):
+                active_names[declaration_id(key)] = name
+
+        def health_solver(model, budget):
+            if not active_names:
+                return {"status": "UNKNOWN", "assignment": None, "reason": "WORKSPACE_POLICY_SCOPE_EMPTY"}
+            result = solve_workspace_health(model, active_names, health_facts or {}, health_policy, timeout_ms=budget)
+            result["policy"]["internalLinkDeclarations"] = len(domains) - len(active_names)
+            return result
+
     if topology is not None:
         return plan_workspace_in_topology(domains, topology.providers, topology.instance_groups,
                                           environment=environment, timeout_ms=timeout_ms,
                                           excluded_assignments=excluded_assignments,
-                                          include_constraint_evidence=include_constraint_evidence)
+                                          include_constraint_evidence=include_constraint_evidence,
+                                          health_solver=health_solver)
     return plan_workspace_from_lock(packages, domains, environment=environment,
                                     timeout_ms=timeout_ms, excluded_assignments=excluded_assignments,
-                                    include_constraint_evidence=include_constraint_evidence)
+                                    include_constraint_evidence=include_constraint_evidence,
+                                    health_solver=health_solver)

@@ -62,11 +62,26 @@ class RequiresAny:
 
 
 @dataclasses.dataclass(frozen=True)
+class GroupedCardinality:
+    """Count one hit for each group with at least one selected literal."""
+
+    groups: Tuple[Tuple[Literal, ...], ...]
+    reason: str
+    minimum: int = 0
+    maximum: Optional[int] = None
+
+    def violated_by(self, assignment: Mapping[str, str]) -> bool:
+        count = sum(any(assignment.get(name) == version for name, version in group) for group in self.groups)
+        return count < self.minimum or (self.maximum is not None and count > self.maximum)
+
+
+@dataclasses.dataclass(frozen=True)
 class PeerOptimizationModel:
     packages: Tuple[PackageVariable, ...]
     constraints: Tuple[ForbiddenCombination, ...] = ()
     requirements: Tuple[RequiresAny, ...] = ()
     objective_width: int = 0
+    cardinalities: Tuple[GroupedCardinality, ...] = ()
 
     def package_map(self) -> Dict[str, PackageVariable]:
         return {package.name: package for package in self.packages}
@@ -128,6 +143,21 @@ class PeerOptimizationModel:
             for version in requirement.allowed_versions:
                 if version not in provider.domain:
                     return f"REQUIREMENT_VERSION_OUTSIDE_DOMAIN: {requirement.provider}@{version}"
+        for constraint in self.cardinalities:
+            if (type(constraint.minimum) is not int or constraint.minimum < 0
+                    or (constraint.maximum is not None and
+                        (type(constraint.maximum) is not int or constraint.maximum < constraint.minimum))):
+                return "INVALID_CARDINALITY_BOUNDS"
+            for group in constraint.groups:
+                seen = set()
+                if not group:
+                    return "EMPTY_CARDINALITY_GROUP"
+                for name, version in group:
+                    if name not in package_map or version not in package_map[name].domain:
+                        return "CARDINALITY_LITERAL_OUTSIDE_DOMAIN"
+                    if (name, version) in seen:
+                        return "DUPLICATE_CARDINALITY_LITERAL"
+                    seen.add((name, version))
         return ""
 
     def assignment_issue(self, assignment: Mapping[str, str]) -> str:
@@ -144,6 +174,9 @@ class PeerOptimizationModel:
         for requirement in self.requirements:
             if requirement.violated_by(assignment):
                 return requirement.reason or "REQUIRES_ALLOWED_VERSION"
+        for constraint in self.cardinalities:
+            if constraint.violated_by(assignment):
+                return constraint.reason or "CARDINALITY_VIOLATION"
         return ""
 
     def assignment_score(self, assignment: Mapping[str, str]) -> ScoreVector:
