@@ -107,6 +107,15 @@ class CurrentWorkspaceVerificationTests(unittest.TestCase):
         with self.assertRaisesRegex(MaterializedWorkspaceVerificationError,'INPUT_CHANGED'):
             self.invoke("require('node:fs').mkdirSync('dist');require('node:fs').writeFileSync('dist/result.js','changed');")
 
+    def test_missing_tree_backend_refuses_before_install(self):
+        with patch("materialized_workspace_verifier.has_guaranteed_tree_backend", return_value=False), \
+             patch("materialized_workspace_verifier.run_supervised") as runner:
+            with self.assertRaisesRegex(MaterializedWorkspaceVerificationError, "PROCESS_CLOSURE_UNAVAILABLE") as caught:
+                self.invoke("process.exit(0);")
+        runner.assert_not_called()
+        self.assertEqual(caught.exception.operation_observations, ())
+        self.assertFalse((self.project / "node_modules").exists())
+
     def test_stale_source_stops_before_install(self):
         with self.assertRaisesRegex(MaterializedWorkspaceVerificationError,'SOURCE_MISMATCH'):
             self.invoke('process.exit(0);',key='0'*32)

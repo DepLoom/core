@@ -93,6 +93,15 @@ def _solve_z3_exact_impl(
             else:
                 optimize.add(z3.Not(trigger))
 
+        for constraint in model.cardinalities:
+            hits = [z3.If(z3.Or(*(variables[literal] for literal in group)), 1, 0)
+                    for group in constraint.groups]
+            count = z3.Sum(hits) if hits else z3.IntVal(0)
+            if constraint.minimum:
+                optimize.add(count >= constraint.minimum)
+            if constraint.maximum is not None:
+                optimize.add(count <= constraint.maximum)
+
         for objective_index in range(model.objective_width):
             terms = []
             for package in model.packages:
