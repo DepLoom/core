@@ -325,6 +325,20 @@ def _kill_posix_process_group(pgid: int) -> int:
         return 0
 
 
+def _reap_linux_group_children(pgid: int) -> bool:
+    """Reap adopted children in this run's private group. Return whether one is still alive."""
+    # waitpid(-1) could steal another invocation's exit status in the shared server.
+    if pgid <= 1:
+        return False
+    while True:
+        try:
+            pid, _ = os.waitpid(-pgid, os.WNOHANG)
+        except ChildProcessError:
+            return False
+        if pid == 0:
+            return True
+
+
 def _resume_windows_process(process: subprocess.Popen[str]) -> None:
     """Resume a CREATE_SUSPENDED process only after Job Object association."""
     try:
@@ -387,7 +401,8 @@ def _quiesce_owned_tree(
         while time.monotonic() < deadline:
             owned = [pid for pid in _linux_token_processes(linux_token) if pid != process.pid]
             live = [pid for pid in owned if not _pid_is_zombie(pid)]
-            if not live:
+            group_pending = _reap_linux_group_children(pgid)
+            if not live and not group_pending:
                 stable_empty += 1
                 if stable_empty >= 2:
                     break
@@ -413,6 +428,10 @@ def _quiesce_owned_tree(
             raise ProcessSupervisionError(
                 "PROCESS_SUPERVISION_DESCENDANTS_REMAIN: "
                 + ",".join(str(pid) for pid in remaining_pids[:16])
+            )
+        if _reap_linux_group_children(pgid):
+            raise ProcessSupervisionError(
+                f"PROCESS_SUPERVISION_DESCENDANTS_REMAIN: process group {pgid}"
             )
         quiescence_ms = int((time.monotonic() - started) * 1000)
         # /proc environment tokens are observable aids, not complete descendant
