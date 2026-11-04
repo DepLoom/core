@@ -1,4 +1,5 @@
 """Native controls for the optional Linux owned-tree backend."""
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -11,8 +12,28 @@ from verification_linux_pid_namespace import linux_pid_namespace_available
 from verification_process_supervisor import ProcessSupervisionError, run_supervised
 
 
-@unittest.skipUnless(sys.platform == "linux" and linux_pid_namespace_available(), "Linux PID namespace tools required")
+NATIVE_REQUIRED = os.environ.get("DEPLOOM_CI_REQUIRE_PID_NAMESPACE") == "1"
+
+
+@unittest.skipUnless(sys.platform == "linux" and (NATIVE_REQUIRED or linux_pid_namespace_available()),
+                     "Linux PID namespace tools required")
 class LinuxPidNamespaceTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # Some hosted runners ship unshare but disallow unprivileged namespaces.
+        # Keep the fail-closed test runnable there and make the native CI lane
+        # require the real production handshake.
+        with tempfile.TemporaryDirectory() as directory:
+            try:
+                run = run_supervised([sys.executable, "-I", "-B", "-c", "import os; print(os.getpid())"],
+                                     Path(directory), timeout_seconds=8, require_guaranteed_tree=True)
+            except ProcessSupervisionError:
+                cls.native = False
+            else:
+                cls.native = run.returncode == 0 and run.stdout.strip() == "1"
+        if NATIVE_REQUIRED and not cls.native:
+            raise AssertionError("native Linux PID namespace is required on this CI lane")
+
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -23,6 +44,8 @@ class LinuxPidNamespaceTests(unittest.TestCase):
                               timeout_seconds=timeout, require_guaranteed_tree=True)
 
     def test_exit_status_and_isolated_pid(self):
+        if not self.native:
+            self.skipTest("runner does not permit native PID namespaces")
         result = self.supervise("import os, sys; print(os.getpid(), flush=True); sys.exit(7)")
         self.assertEqual(result.returncode, 7)
         self.assertEqual(result.stdout.strip(), "1")
@@ -51,11 +74,15 @@ class LinuxPidNamespaceTests(unittest.TestCase):
         self.assertFalse((self.root / "escaped").exists())
 
     def test_exit_kills_detached_child_without_environment_token(self):
+        if not self.native:
+            self.skipTest("runner does not permit native PID namespaces")
         result = self.supervise(self.detached(False))
         self.assertEqual(result.returncode, 0)
         self.assert_detached_gone(result.supervision)
 
     def test_timeout_kills_detached_child_without_environment_token(self):
+        if not self.native:
+            self.skipTest("runner does not permit native PID namespaces")
         with self.assertRaises(subprocess.TimeoutExpired) as caught:
             self.supervise(self.detached(True), timeout=1)
         self.assert_detached_gone(caught.exception.supervision)

@@ -44,3 +44,17 @@ jobs:
         run: |
           python -m compileall -q peer_solver_transition.py dependency_live_roadmap_generator.py
           python dependency_live_roadmap_generator.py --help
+
+  native-linux-namespace:
+    name: Linux owned process tree
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    env:
+      DEPLOOM_CI_REQUIRE_PID_NAMESPACE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Require real namespace and detached-child closure
+        run: python -m unittest discover -s tests -p test_linux_pid_namespace.py -v
