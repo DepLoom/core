@@ -96,6 +96,7 @@ def run_workspace_npm_preflight(
     registry: str,
     timeout_seconds: int = 60,
     reauthor: Declaration | None = None,
+    immutable_instances: frozenset[str] = frozenset(),
 ) -> dict:
     """Check a hash-bound candidate with npm in an isolated, offline directory."""
     evidence = {"authority": "LOCKFILE_ONLY", "installation": "NOT_RUN", "runtime": "NOT_RUN",
@@ -155,6 +156,14 @@ def run_workspace_npm_preflight(
                 if url.scheme != "https" or not url.hostname or url.username or url.password:
                     raise ValueError("Unsupported lock artifact")
 
+        if (not isinstance(immutable_instances, frozenset) or len(immutable_instances) > 128
+                or any(not isinstance(path, str) or "node_modules" not in path.split("/")
+                       or path not in packages or packages[path].get("link")
+                       or any(not isinstance(packages[path].get(field), str) or not packages[path][field]
+                              for field in ("version", "resolved", "integrity"))
+                       for path in immutable_instances)):
+            return {**evidence, "status": "UNKNOWN", "code": "INVALID_IMMUTABLE_LOCK_INSTANCE"}
+
         observed = {(owner, section, name) for owner, project in projects.items()
                     for section in INSTALL_SECTIONS for name in project.get(section, {})}
         if observed != assignment.keys():
@@ -210,6 +219,8 @@ def run_workspace_npm_preflight(
             "reauthor": list(reauthor) if reauthor is not None else None,
             "registrySha256": hashlib.sha256(registry.encode()).hexdigest(),
         }
+        if immutable_instances:
+            identity["immutableInstances"] = sorted(immutable_instances)
         for label, executable in (("nodeBinarySha256", node), ("npmEntrypointSha256", npm_cli)):
             with Path(executable).open("rb") as stream:
                 identity[label] = hashlib.file_digest(stream, "sha256").hexdigest()
@@ -278,10 +289,13 @@ def run_workspace_npm_preflight(
             result = {"status": "UNKNOWN", "code": "CANDIDATE_MANIFEST_CHANGED"}
         if result["status"] == "RESOLUTION_PASSED":
             delta = check_workspace_lock_delta(
-                lock, json.loads(lock_path.read_bytes()), manifest_deltas, assignment, changed, reauthored)
+                lock, json.loads(lock_path.read_bytes()), manifest_deltas, assignment, changed, reauthored,
+                immutable_instances)
             if delta["status"] != "RESOLUTION_PASSED":
                 result.update(status=delta["status"], code=delta["code"])
             result["lockDelta"] = delta
+        if immutable_instances:
+            result["immutableInstanceCount"] = len(immutable_instances)
         receipt = {**evidence, **result, "npmExitCode": exit_code, "attempts": attempts,
                    "baselineLockSha256": identity["baselineLockSha256"],
                    "candidateLockSha256": hashlib.sha256(lock_path.read_bytes()).hexdigest(),

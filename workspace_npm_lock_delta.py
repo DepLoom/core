@@ -33,7 +33,9 @@ def _artifact(entry):
     return tuple(entry.get(key) for key in ("version", "resolved", "integrity", "link"))
 
 
-def check_workspace_lock_delta(baseline, candidate, manifest_deltas, assignment, changed, reauthored):
+def check_workspace_lock_delta(
+    baseline, candidate, manifest_deltas, assignment, changed, reauthored, immutable_instances=frozenset(),
+):
     """Reject unrelated node or edge churn using both observed lock graphs.
 
     A target can affect descendants along changed package rows and provider
@@ -47,6 +49,12 @@ def check_workspace_lock_delta(baseline, candidate, manifest_deltas, assignment,
     before, after = baseline["packages"], candidate["packages"]
     if max(len(before), len(after)) > 20000:
         return {"status": "UNKNOWN", "code": "LOCK_DELTA_ENTRY_LIMIT"}
+
+    for path in sorted(immutable_instances):
+        original, planned = before.get(path), after.get(path)
+        if (original is None or planned is None or _artifact(original) != _artifact(planned)
+                or original.get("name") != planned.get("name")):
+            return {"status": "RESOLUTION_FAILED", "code": "IMMUTABLE_LOCK_INSTANCE_CHANGED", "path": path}
 
     owners = {"" if owner == "." else owner for owner, _, _ in assignment} | {""}
     owners.update(path for path in before if "node_modules" not in path.split("/"))

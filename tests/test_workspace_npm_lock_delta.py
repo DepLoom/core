@@ -26,10 +26,10 @@ class WorkspaceLockDeltaTests(unittest.TestCase):
         }
         self.after["packages"]["node_modules/related"]["version"] = "2.0.0"
 
-    def check(self, reauthored=None):
+    def check(self, reauthored=None, pins=frozenset()):
         return check_workspace_lock_delta(
             self.before, self.after, {"": {"dependencies": {"target": "2.0.0"}}},
-            self.assignment, {self.target}, reauthored,
+            self.assignment, {self.target}, reauthored, pins,
         )
 
     def test_related_transitive_delta_has_changed_dependency_edge(self):
@@ -37,6 +37,11 @@ class WorkspaceLockDeltaTests(unittest.TestCase):
             "status": "RESOLUTION_PASSED", "code": "LOCK_IMPACT_CLOSURE_MATCH",
             "changedPackageCount": 2, "changedEdgeCount": 2, "impactedInstanceCount": 2,
         })
+
+    def test_explicit_immutable_instance_cannot_change_even_within_impact(self):
+        result = self.check(pins=frozenset({"node_modules/related"}))
+        self.assertEqual(result["code"], "IMMUTABLE_LOCK_INSTANCE_CHANGED")
+        self.assertEqual(result["path"], "node_modules/related")
 
     def test_unrelated_transitive_change_is_rejected(self):
         self.after["packages"]["node_modules/unrelated"]["version"] = "1.1.0"
