@@ -210,6 +210,41 @@ def _member_ancestor_prefixes(package_relative: str) -> List[str]:
     return ["/".join(parts[:index]) for index in range(len(parts), 0, -1)] + [""]
 
 
+def npm_lock_resolved_instance(
+    packages: Dict[str, Any],
+    package_name: str,
+    package_relative: str = "",
+) -> Optional[Tuple[str, str]]:
+    """Return the package-lock entry key and version visible from a given owner.
+
+    A workspace link keeps its own entry key, with the version from its target.
+    This is lock evidence only; it does not observe the installed peer provider.
+    """
+    name = package_name
+    rel = package_relative
+    for prefix in _member_ancestor_prefixes(rel):
+        key = f"{prefix}/node_modules/{name}" if prefix else f"node_modules/{name}"
+        entry = packages.get(key)
+        if not isinstance(entry, dict):
+            continue
+        # A portal at the NEAREST prefix decides the member's resolution;
+        # a hoisted root copy of the same name must not override the
+        # locally linked package.
+        if entry.get("link") and isinstance(entry.get("resolved"), str):
+            linked = packages.get(entry["resolved"].replace("\\", "/").strip("/"))
+            if isinstance(linked, dict):
+                version = linked.get("version")
+                if isinstance(version, str) and version:
+                    return key, version
+            # A link whose target record has no provable version: abstain
+            # rather than guess a hoisted root copy.
+            return None
+        version = entry.get("version")
+        if isinstance(version, str) and version:
+            return key, version
+    return None
+
+
 def npm_lock_resolved_version(
     packages: Optional[Dict[str, Any]],
     dependencies: Optional[Dict[str, Any]],
@@ -233,27 +268,8 @@ def npm_lock_resolved_version(
     name = str(package_name)
     rel = (package_relative or "").replace("\\", "/").strip("/")
     if isinstance(packages, dict) and packages:
-        for prefix in _member_ancestor_prefixes(rel):
-            key = f"{prefix}/node_modules/{name}" if prefix else f"node_modules/{name}"
-            entry = packages.get(key)
-            if not isinstance(entry, dict):
-                continue
-            # A portal at the NEAREST prefix decides the member's resolution;
-            # a hoisted root copy of the same name must not override the
-            # locally linked package.
-            if entry.get("link") and isinstance(entry.get("resolved"), str):
-                linked = packages.get(entry["resolved"].replace("\\", "/").strip("/"))
-                if isinstance(linked, dict):
-                    version = linked.get("version")
-                    if isinstance(version, str) and version:
-                        return version
-                # A link whose target record has no provable version: abstain
-                # rather than guess a hoisted root copy.
-                return None
-            version = entry.get("version")
-            if isinstance(version, str) and version:
-                return version
-        return None
+        instance = npm_lock_resolved_instance(packages, name, rel)
+        return instance[1] if instance is not None else None
     if rel:
         return None
     if isinstance(dependencies, dict):
