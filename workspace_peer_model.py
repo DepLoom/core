@@ -225,6 +225,7 @@ def plan_workspace_from_lock(
     environment: Mapping[str, str] | None = None,
     timeout_ms: int = 30_000,
     excluded_assignments: tuple[Mapping[str, str], ...] = (),
+    include_constraint_evidence: bool = False,
 ) -> dict:
     """Plan conditionally on observed slots; an npm re-layout remains unmodeled."""
     result = {"authority": "PLANNING_ONLY", "verification": "NOT_VERIFIED",
@@ -250,7 +251,10 @@ def plan_workspace_from_lock(
     except WorkspaceModelUnknown as exc:
         return {**result, "status": "UNKNOWN", "reason": str(exc)}
 
-    return _solve_workspace_model(model, result, timeout_ms, excluded_assignments)
+    return _solve_workspace_model(
+        model, result, timeout_ms, excluded_assignments,
+        _constraint_evidence(model, domains) if include_constraint_evidence else None,
+    )
 
 
 def plan_workspace_in_topology(
@@ -261,6 +265,7 @@ def plan_workspace_in_topology(
     environment: Mapping[str, str] | None = None,
     timeout_ms: int = 30_000,
     excluded_assignments: tuple[Mapping[str, str], ...] = (),
+    include_constraint_evidence: bool = False,
 ) -> dict:
     """Check a proposed partition into npm instances before native resolution."""
     result = {"authority": "PLANNING_ONLY", "verification": "NOT_VERIFIED",
@@ -287,10 +292,45 @@ def plan_workspace_in_topology(
                     provenance="workspace-proposed-instance",
                 ))
     model = PeerOptimizationModel(model.packages, model.constraints, tuple(requirements), model.objective_width)
-    return _solve_workspace_model(model, result, timeout_ms, excluded_assignments)
+    return _solve_workspace_model(
+        model, result, timeout_ms, excluded_assignments,
+        _constraint_evidence(model, domains) if include_constraint_evidence else None,
+    )
 
 
-def _solve_workspace_model(model, result, timeout_ms, excluded_assignments):
+def _constraint_evidence(model, domains):
+    """Capture compiled static rules touching mutable declarations, before retry exclusions."""
+    scope = {declaration_id(key) for key, domain in domains.items() if domain.mutable}
+    rules = []
+    total = 0
+    for requirement in model.requirements:
+        consumer, version = requirement.trigger
+        if consumer not in scope and requirement.provider not in scope:
+            continue
+        total += 1
+        if len(rules) < 128:
+            rules.append({
+                "consumer": consumer, "version": version, "provider": requirement.provider,
+                "allowedVersions": list(requirement.allowed_versions),
+                "provenance": requirement.provenance,
+            })
+    for clause in model.constraints:
+        if clause.provenance != "workspace-modeled-engine-range":
+            continue
+        consumer, version = clause.literals[0]
+        if consumer not in scope:
+            continue
+        total += 1
+        if len(rules) < 128:
+            rules.append({"consumer": consumer, "version": version, "provider": None,
+                          "allowedVersions": [], "provenance": clause.provenance})
+    return {"domains": {package.name: list(package.domain) for package in model.packages if package.name in scope},
+            "rules": rules, "ruleCount": total}
+
+
+def _solve_workspace_model(model, result, timeout_ms, excluded_assignments, constraint_evidence):
+    if constraint_evidence is not None:
+        result["constraintEvidence"] = constraint_evidence
     if excluded_assignments:
         model = model.with_constraints(
             forbidden(model.assignment_key(vector), reason="Previously tried complete candidate",
@@ -391,6 +431,7 @@ def plan_workspace_upgrade(
     topology: WorkspaceTopology | None = None,
     timeout_ms: int = 30_000,
     excluded_assignments: tuple[Mapping[str, str], ...] = (),
+    include_constraint_evidence: bool = False,
 ) -> dict:
     """Use a bounded metadata snapshot to plan under the observed npm lock layout."""
     try:
@@ -403,6 +444,8 @@ def plan_workspace_upgrade(
     if topology is not None:
         return plan_workspace_in_topology(domains, topology.providers, topology.instance_groups,
                                           environment=environment, timeout_ms=timeout_ms,
-                                          excluded_assignments=excluded_assignments)
+                                          excluded_assignments=excluded_assignments,
+                                          include_constraint_evidence=include_constraint_evidence)
     return plan_workspace_from_lock(packages, domains, environment=environment,
-                                    timeout_ms=timeout_ms, excluded_assignments=excluded_assignments)
+                                    timeout_ms=timeout_ms, excluded_assignments=excluded_assignments,
+                                    include_constraint_evidence=include_constraint_evidence)
