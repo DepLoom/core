@@ -144,7 +144,7 @@ def verify_current_workspace(project_dir, *, expected_source_key, dependency_pla
                     'commandIndex':command_index,'sealedCommandHash':None if command_index is None else _sha(commands[command_index-1].encode()),
                     'profileDigest':final_profile_digest,'argvDigest':_digest(argv)})
         x=run_supervised(argv,project,timeout_seconds=remaining(),base_env=actual_env,
-            progress_label=label,max_output_bytes=65536,**launch_options)
+            progress_label=label,max_output_bytes=65536,require_guaranteed_tree=True,**launch_options)
         if command_index is not None and x.returncode!=0:
             failed_command_diagnostic={'commandIndex':command_index,'returnCode':x.returncode,
                 'invocationId':invocation_id,'stdoutTail':(x.stdout or '').encode('utf-8')[-8192:].decode('utf-8',errors='ignore')}

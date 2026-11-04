@@ -33,7 +33,7 @@ class ProcessSupervisionError(OSError):
 @dataclasses.dataclass(frozen=True)
 class SupervisionMetadata:
     quality: str
-    descendants_terminated: int = 0
+    descendants_terminated: Optional[int] = 0
     descendants_remaining: int = 0
     quiescence_ms: int = 0
     captured_bytes: int = 0
@@ -501,7 +501,8 @@ def _trusted_guard_observation(guard,context,argv,launch_args,popen_kwargs,launc
 
 def has_guaranteed_tree_backend() -> bool:
     """Whether this platform has a backend that can prove owned-tree closure."""
-    return os.name == "nt"
+    from verification_linux_pid_namespace import linux_pid_namespace_available
+    return os.name == "nt" or linux_pid_namespace_available()
 
 
 def run_supervised(
@@ -519,6 +520,7 @@ def run_supervised(
     expected_project_environment_digest: Optional[str] = None,
     trusted_pre_popen_guard=None,
     trusted_pre_popen_context=None,
+    require_guaranteed_tree: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     if trusted_pre_popen_guard is None and trusted_pre_popen_context is not None:
         raise ProcessSupervisionError("TRUSTED_PRE_POPEN_CONTEXT_WITHOUT_GUARD")
@@ -527,7 +529,14 @@ def run_supervised(
         merged_env.update({str(k): str(v) for k, v in env.items()})
     argv, launch_cwd, merged_env = prepare_unc_shell(argv, cwd, merged_env)
     linux_token = uuid.uuid4().hex
-    if _LINUX_SUBREAPER:
+    namespace = None
+    if require_guaranteed_tree and os.name != "nt":
+        from verification_linux_pid_namespace import LinuxPidNamespace, LinuxPidNamespaceError, linux_pid_namespace_available
+        if (not linux_pid_namespace_available() or trusted_pre_popen_guard is not None
+                or expected_project_environment_digest is not None):
+            raise ProcessSupervisionError("PROCESS_SUPERVISION_GUARANTEED_BACKEND_UNAVAILABLE")
+        namespace = LinuxPidNamespace(argv, merged_env)
+    elif _LINUX_SUBREAPER:
         merged_env["DEPLOOM_SUPERVISION_TOKEN"] = linux_token
 
     started = time.monotonic()
@@ -568,7 +577,24 @@ def run_supervised(
     if trusted_pre_popen_guard is not None:
         guarded_spawn=_trusted_guard_observation(trusted_pre_popen_guard,trusted_pre_popen_context,
             argv,launch_args,popen_kwargs,launch_environment)
-    process: subprocess.Popen[str] = subprocess.Popen(launch_args, **popen_kwargs)
+    capture = _BoundedOutput(max_output_bytes, output_observer)
+    interval = max(1, int(progress_interval_seconds or 15))
+    if timeout_seconds > 0:
+        interval = min(interval, max(1, int(timeout_seconds)))
+    if namespace is None:
+        process: subprocess.Popen[str] = subprocess.Popen(launch_args, **popen_kwargs)
+    else:
+        process = None
+        try:
+            process = subprocess.Popen(namespace.launch(popen_kwargs), **popen_kwargs)
+            namespace.attach(process, started + (timeout_seconds if timeout_seconds > 0 else 5))
+        except BaseException as exc:
+            namespace.cleanup(process)
+            if process is not None and process.stdout is not None:
+                process.stdout.close()
+            if isinstance(exc, (OSError, LinuxPidNamespaceError)):
+                raise ProcessSupervisionError("PROCESS_SUPERVISION_LINUX_NAMESPACE_UNPROVEN") from exc
+            raise
     # A handful of historical unit tests use minimal Popen doubles. Keep that
     # seam without weakening production: real subprocess.Popen always exposes
     # stdout/wait and therefore always takes the supervised path below.
@@ -604,12 +630,10 @@ def run_supervised(
             job.close()
             raise
         _emit(progress, f"{progress_label}: process supervisor=windows-job-object; attachBeforeExecution=true; pid={process.pid}")
-    elif _LINUX_SUBREAPER:
+    elif namespace is None and _LINUX_SUBREAPER:
         _emit(progress, f"{progress_label}: process supervisor=linux-subreaper-session; pid={process.pid}")
-    else:
+    elif namespace is None:
         _emit(progress, f"{progress_label}: process supervisor=posix-process-group-best-effort; pid={process.pid}")
-
-    capture = _BoundedOutput(max_output_bytes, output_observer)
 
     def reader() -> None:
         stream = process.stdout
@@ -641,16 +665,22 @@ def run_supervised(
         name=f"deploom-output-{process.pid}",
         daemon=True,
     )
-    reader_thread.start()
-
-    interval = max(1, int(progress_interval_seconds or 15))
-    if timeout_seconds > 0:
-        interval = min(interval, max(1, int(timeout_seconds)))
     next_progress = started + interval
     timed_out = False
     return_code = 0
     metadata: Optional[SupervisionMetadata] = None
+
+    def terminate_owned():
+        if namespace is None:
+            terminate_process_tree(process, job=job, progress=progress, progress_label=progress_label)
+        else:
+            namespace.terminate()
+
     try:
+        reader_thread.start()
+        if namespace is not None:
+            _emit(progress, f"{progress_label}: process supervisor=linux-pid-namespace; "
+                            f"attachBeforeExecution=true; pid={process.pid}")
         while process.poll() is None:
             now = time.monotonic()
             elapsed = now - started
@@ -661,9 +691,7 @@ def run_supervised(
                     f"{progress_label}: HARD_TIMEOUT after {int(elapsed)}s; "
                     f"terminating owned process tree pid={process.pid}",
                 )
-                terminate_process_tree(
-                    process, job=job, progress=progress, progress_label=progress_label
-                )
+                terminate_owned()
                 break
             if now >= next_progress:
                 _emit(
@@ -677,9 +705,7 @@ def run_supervised(
         try:
             process.wait(timeout=5.0)
         except subprocess.TimeoutExpired:
-            terminate_process_tree(
-                process, job=job, progress=progress, progress_label=progress_label
-            )
+            terminate_owned()
             try:
                 process.wait(timeout=5.0)
             except subprocess.TimeoutExpired as exc:
@@ -688,15 +714,20 @@ def run_supervised(
                 ) from exc
         return_code = int(process.returncode or 0)
 
-        quality, killed, remaining, quiescence_ms = _quiesce_owned_tree(
-            process,
-            job=job,
-            pgid=pgid,
-            linux_token=linux_token,
-            progress=progress,
-            progress_label=progress_label,
-        )
+        if namespace is None:
+            quality, killed, remaining, quiescence_ms = _quiesce_owned_tree(
+                process, job=job, pgid=pgid, linux_token=linux_token,
+                progress=progress, progress_label=progress_label,
+            )
+        else:
+            closure_started = time.monotonic()
+            if not namespace.closed(3):
+                raise ProcessSupervisionError("PROCESS_SUPERVISION_LINUX_NAMESPACE_INIT_REMAINS")
+            quality, killed, remaining = "guaranteed-tree", None, 0
+            quiescence_ms = int((time.monotonic() - closure_started) * 1000)
         reader_thread.join(timeout=3.0)
+        if namespace is not None and reader_thread.is_alive():
+            raise ProcessSupervisionError("PROCESS_SUPERVISION_LINUX_NAMESPACE_OUTPUT_REMAINS")
         output, captured_bytes, dropped_bytes, truncated = capture.render()
         metadata = SupervisionMetadata(
             quality=quality,
@@ -706,7 +737,7 @@ def run_supervised(
             captured_bytes=captured_bytes,
             dropped_bytes=dropped_bytes,
             output_truncated=truncated,
-            attach_before_execution=(os.name == "nt"),
+            attach_before_execution=(os.name == "nt" or namespace is not None),
         )
         emit_observability_event(
             "process.supervision",
@@ -732,9 +763,9 @@ def run_supervised(
         setattr(completed, "output_truncated", truncated)
         return completed
     finally:
-        if process.poll() is None:
-            terminate_process_tree(
-                process, job=job, progress=progress, progress_label=progress_label
-            )
+        if namespace is not None:
+            namespace.cleanup(process)
+        elif process.poll() is None:
+            terminate_owned()
         if job is not None:
             job.close()
