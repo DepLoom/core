@@ -5,6 +5,8 @@ import hashlib
 import json
 import re
 
+from reparse_materialization import is_reparse
+
 from resolved_dependency_state import (
     MaterializedDependencyObligationError,
     _canonical_hash,
@@ -55,6 +57,13 @@ def compile_npm_workspace_obligations(baseline_lock, candidate_lock, candidate_m
             or receipt.get("candidateLockSha256") != _sha256_bytes(candidate_lock)
             or any(lock.get("lockfileVersion") != 3 or "dependencies" in lock for lock in (before, after))):
         _fail("RESOLVER_EVIDENCE_UNBOUND")
+    from workspace_npm_preflight import WORKSPACE_NPM_POLICY
+    resolver_tools = {"nodeSha256": identity.get("nodeBinarySha256"), "npmCliSha256": identity.get("npmEntrypointSha256")}
+    registry_digest = identity.get("registrySha256")
+    if (any(not isinstance(value, str) or not re.fullmatch(r"[a-f0-9]{64}", value)
+            for value in (*resolver_tools.values(), registry_digest))
+            or identity.get("npmPolicy") != ["install", "--package-lock-only", *WORKSPACE_NPM_POLICY]):
+        _fail("RESOLVER_POLICY_UNPROVEN")
     packages = after.get("packages")
     if (not isinstance(packages, dict) or not 2 <= len(packages) <= 10001
             or len({key.casefold() for key in packages}) != len(packages)
@@ -107,7 +116,8 @@ def compile_npm_workspace_obligations(baseline_lock, candidate_lock, candidate_m
         "schemaVersion": 1, "kind": WORKSPACE_OBLIGATION_KIND,
         "approvedLockSha256": receipt["candidateLockSha256"],
         "baselineLockSha256": receipt["baselineLockSha256"],
-        "resolverIdentitySha256": identity_digest,
+        "resolverIdentitySha256": identity_digest, "resolverToolchain": resolver_tools,
+        "registrySha256": registry_digest,
         "rootDeclarations": owner_records[""]["declarations"],
         "workspaceOwners": owner_records, "workspaceLinks": links,
         "instances": instances,
@@ -116,3 +126,36 @@ def compile_npm_workspace_obligations(baseline_lock, candidate_lock, candidate_m
                                     if path not in owners and path not in links),
     }
     return {**plan, "obligationPlanDigest": _canonical_hash(plan)}
+
+
+def guard_workspace_install_inputs(project, plan, lock_bytes):
+    """Refuse dependency trees or config that npm ci could remove or honor."""
+    locked = _obligation_json(lock_bytes, 32 * 1024 * 1024)
+    owners = plan["workspaceOwners"]
+    _owners(locked["packages"], {owner or ".": row["manifestSha256"] for owner, row in owners.items()})
+
+    def ordinary(path):
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            return False
+        if is_reparse(path) or getattr(info, "st_file_attributes", 0) & 0x400:
+            _fail("INSTALL_REPARSE_UNPROVEN")
+        return True
+
+    for owner, row in owners.items():
+        directory = project
+        for part in owner.split("/") if owner else ():
+            directory /= part
+            if not ordinary(directory) or not directory.is_dir():
+                _fail("INSTALL_OWNER_UNPROVEN")
+        manifest = directory / "package.json"
+        if not ordinary(manifest) or not manifest.is_file() or manifest.stat().st_size > 2 * 1024 * 1024:
+            _fail("MANIFEST_DRIFT")
+        if _sha256_bytes(manifest.read_bytes()) != row["manifestSha256"]:
+            _fail("MANIFEST_DRIFT")
+        modules = directory / "node_modules"
+        if ordinary(modules) and (not modules.is_dir() or any(modules.iterdir())):
+            _fail("INSTALL_EXISTING_TREE_REQUIRES_RECOVERABLE_STAGING")
+        if ordinary(directory / ".npmrc"):
+            _fail("INSTALL_NPMRC_UNSUPPORTED")

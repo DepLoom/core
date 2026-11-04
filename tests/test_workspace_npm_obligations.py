@@ -7,7 +7,8 @@ import unittest
 
 from reparse_materialization import _create_junction
 from resolved_dependency_state import MaterializedDependencyObligationError, observe_npm_dependency_obligations
-from workspace_npm_obligations import compile_npm_workspace_obligations
+from workspace_npm_obligations import compile_npm_workspace_obligations, guard_workspace_install_inputs
+from workspace_npm_preflight import WORKSPACE_NPM_POLICY
 
 
 def encode(value):
@@ -32,7 +33,9 @@ class WorkspacePhysicalTests(unittest.TestCase):
                          "node_modules/react": {"version": "19.0.0"},
                          "apps/a/node_modules/react": {"version": "18.3.1"}}
         self.lock = encode({"lockfileVersion": 3, "packages": self.packages})
-        self.identity = {"baselineLockSha256": digest(self.lock),
+        self.identity = {"baselineLockSha256": digest(self.lock), "registrySha256": "c" * 64,
+                         "nodeBinarySha256": "d" * 64, "npmEntrypointSha256": "e" * 64,
+                         "npmPolicy": ["install", "--package-lock-only", *WORKSPACE_NPM_POLICY],
                          "candidateManifestSha256": {owner: digest(raw) for owner, raw in self.manifests.items()}}
         self.record = {"identity": self.identity, "receipt": {
             "authority": "LOCKFILE_ONLY", "status": "RESOLUTION_PASSED",
@@ -87,6 +90,17 @@ class WorkspacePhysicalTests(unittest.TestCase):
         self.write(self.root / "apps/a/node_modules/react/package.json", encode({"name": "react", "version": "19.0.0"}))
         with self.assertRaisesRegex(MaterializedDependencyObligationError, "IDENTITY_MISMATCH"):
             self.observe()
+
+    def test_existing_nested_tree_is_not_removable_by_frozen_install(self):
+        plan = compile_npm_workspace_obligations(self.lock, self.lock, self.manifests, self.record)
+        root_package = self.root / "node_modules/react/package.json"
+        root_package.unlink()
+        root_package.parent.rmdir()
+        nested = self.root / "apps/a/node_modules/react/package.json"
+        original = nested.read_bytes()
+        with self.assertRaisesRegex(MaterializedDependencyObligationError, "EXISTING_TREE_REQUIRES_RECOVERABLE_STAGING"):
+            guard_workspace_install_inputs(self.root, plan, self.lock)
+        self.assertEqual(nested.read_bytes(), original)
 
     def test_receipt_is_bound_to_exact_candidate_lock(self):
         with self.assertRaisesRegex(MaterializedDependencyObligationError, "RESOLVER_EVIDENCE_UNBOUND"):

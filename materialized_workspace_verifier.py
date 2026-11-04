@@ -42,7 +42,8 @@ def _sha(raw):
 
 def verify_current_workspace(project_dir, *, expected_source_key, dependency_plan,
         commands, cache_dir, deadline, final_profile_digest, environment=None, materialize=False,
-        environment_contract='LEGACY_INHERITED_ENV_V1', trusted_pre_popen_guard=None, command_cache_directories=None, generated_output_spec=None):
+        environment_contract='LEGACY_INHERITED_ENV_V1', trusted_pre_popen_guard=None, command_cache_directories=None,
+        generated_output_spec=None, workspace_registry=None):
     """Freshly check THIS authorized workspace; optional cold-only npm-ci.
 
     No caller-provided evidence, reusable command PASS or previous prepared tree
@@ -79,7 +80,12 @@ def verify_current_workspace(project_dir, *, expected_source_key, dependency_pla
     if (not isinstance(commands,(tuple,list)) or not 1<=len(commands)<=64
             or any(not isinstance(c,str) or not c.strip() or len(c)>4096 for c in commands)):
         fail('CURRENT_WORKSPACE_PROFILE_UNPROVEN')
+    from workspace_npm_obligations import WORKSPACE_OBLIGATION_KIND, guard_workspace_install_inputs
+    from workspace_npm_preflight import WORKSPACE_NPM_POLICY, isolated_workspace_npm_environment
+    workspace_mode = dependency_plan.get("kind") == WORKSPACE_OBLIGATION_KIND
     project=Path(project_dir).absolute();cache=Path(cache_dir).absolute()
+    if workspace_mode and (project != project.resolve() or project.is_relative_to(cache.resolve())):
+        fail('CURRENT_WORKSPACE_PATH_UNPROVEN')
     if (project.is_symlink() or cache.is_symlink()
             or (hasattr(project,'is_junction') and project.is_junction())
             or (hasattr(cache,'is_junction') and cache.is_junction())
@@ -109,12 +115,24 @@ def verify_current_workspace(project_dir, *, expected_source_key, dependency_pla
     except OSError:
         fail('CURRENT_WORKSPACE_TOOLCHAIN_UNAVAILABLE')
     tools={'nodeSha256':_sha(Path(node).read_bytes()),'npmCliSha256':_sha(npm.read_bytes())}
-    lock=(project/'package-lock.json').read_bytes()
+    lock_path = project / "package-lock.json"
+    if workspace_mode:
+        info = lock_path.lstat()
+        if lock_path.is_symlink() or getattr(info, "st_file_attributes", 0) & 0x400:
+            fail('CURRENT_WORKSPACE_APPROVED_LOCK_MISMATCH')
+        if tools != dependency_plan.get("resolverToolchain"):
+            fail('CURRENT_WORKSPACE_RESOLVER_TOOLCHAIN_MISMATCH')
+        if materialize and (not isinstance(workspace_registry, str)
+                or _sha(workspace_registry.encode()) != dependency_plan.get("registrySha256")):
+            fail('CURRENT_WORKSPACE_RESOLVER_REGISTRY_MISMATCH')
+    lock=lock_path.read_bytes()
     if _sha(lock)!=dependency_plan['approvedLockSha256']:fail('CURRENT_WORKSPACE_APPROVED_LOCK_MISMATCH')
-    def run(argv,label,command_index=None):
+
+    def run(argv,label,command_index=None, execution_env=None):
         nonlocal failed_command_diagnostic
         failed_command_diagnostic=None
-        started=time.monotonic();actual_env=command_envs.get(command_index,env)
+        started=time.monotonic()
+        actual_env = execution_env if execution_env is not None else command_envs.get(command_index,env)
         launch_options={}
         if environment_contract=='HOST_OWNED_PROJECT_EXECUTION_ENV_V1':
             launch_options['expected_project_environment_digest']=project_environment_fingerprint(actual_env,contract=environment_contract)
@@ -134,7 +152,7 @@ def verify_current_workspace(project_dir, *, expected_source_key, dependency_pla
             'durationMs':int((time.monotonic()-started)*1000),'returnCode':x.returncode,
             'supervision':getattr(s,'quality',None),'descendantsRemaining':getattr(s,'descendants_remaining',None),
             'timedOut':bool(getattr(x,'timed_out',False)),'cancelled':bool(getattr(x,'cancelled',False))})
-        if launch_options:
+        if 'expected_project_environment_digest' in launch_options:
             from project_execution_environment import native_launch_observation_matches
             launch=getattr(x,'project_execution_environment',None)
             if not native_launch_observation_matches(launch,launch_options['expected_project_environment_digest'],_digest(str(project))):
@@ -173,35 +191,66 @@ def verify_current_workspace(project_dir, *, expected_source_key, dependency_pla
         source_guard()
         installation={'status':'EXISTING_TREE_REQUIRES_PHYSICAL_OBSERVATION','scriptsEnabled':False}
         if materialize:
-            install=run([node,str(npm),'ci','--offline','--ignore-scripts','--strict-peer-deps',
-                '--engine-strict','--force=false','--legacy-peer-deps=false','--no-audit','--no-fund',
-                '--cache',str(cache)],'current-workspace frozen install')
+            if workspace_mode:
+                guard_workspace_install_inputs(project, dependency_plan, lock)
+                configs = [project / f".deploom-ci-{invocation_id}-{name}.npmrc" for name in ("user", "global")]
+                if any(path.exists() or path.is_symlink() for path in configs):
+                    fail('CURRENT_WORKSPACE_INSTALL_CONFIG_UNPROVEN')
+                install_argv = [node, str(npm), "ci", *WORKSPACE_NPM_POLICY,
+                                "--registry", workspace_registry, "--cache", str(cache),
+                                "--userconfig", str(configs[0]), "--globalconfig", str(configs[1])]
+                install_env = isolated_workspace_npm_environment(env)
+            else:
+                install_argv = [node,str(npm),'ci','--offline','--ignore-scripts','--strict-peer-deps',
+                                '--engine-strict','--force=false','--legacy-peer-deps=false','--no-audit','--no-fund',
+                                '--cache',str(cache)]
+                install_env = None
+            install=run(install_argv,'current-workspace frozen install',execution_env=install_env)
             source_guard()
             if install.returncode!=0:fail('CURRENT_WORKSPACE_INSTALL_NOT_VERIFIED')
             installation={'status':'FRESH_COLD_FROZEN_INSTALL_OBSERVED','scriptsEnabled':False,
                 'supervision':'guaranteed-tree','stdoutDigest':_sha((install.stdout or '').encode())}
         if typed_output:require_absent(project,deadline=deadline)
-        roots=npm_root_assignment_from_obligations(dependency_plan)
-        observed=observed_resolved_assignment(project,roots)
-        state=capture_resolved_dependency_state(project,manager='npm',
-            resolver_input_key=_digest({'sourceKey':snapshot.key,'plan':dependency_plan['obligationPlanDigest'],
-                'toolchain':tools,'environment':environment_snapshot_fingerprint(env)}),
-            observed_resolved_hash=observed_resolved_hash(observed),proof_cache_dir=None)
+        resolver_key = _digest({'sourceKey':snapshot.key,'plan':dependency_plan['obligationPlanDigest'],
+                                'toolchain':tools,'environment':environment_snapshot_fingerprint(env)})
+        def resolved_state(observed_hash):
+            return capture_resolved_dependency_state(
+                project, manager='npm', resolver_input_key=resolver_key,
+                observed_resolved_hash=observed_hash, proof_cache_dir=None)
+
+        state = None
+        if not workspace_mode:
+            roots = npm_root_assignment_from_obligations(dependency_plan)
+            state = resolved_state(observed_resolved_hash(observed_resolved_assignment(project, roots)))
         origin={'schemaVersion':1,'scope':'CURRENT_HOST_WORKSPACE',
             'inputSourceSnapshotKey':snapshot.key,'workspacePathDigest':_digest(str(project)),
-            'resolvedLockfileHash':state.lockfile_hash,'toolchain':tools}
+            'resolvedLockfileHash':_sha(lock),'toolchain':tools}
+        if workspace_mode:
+            origin["workspaceVerificationBinding"] = _digest({
+                "source": snapshot.key, "obligationPlan": dependency_plan["obligationPlanDigest"],
+                "resolver": dependency_plan["resolverIdentitySha256"], "profile": final_profile_digest,
+                "commands": [_sha(command.encode()) for command in commands], "materialize": materialize,
+                "executionEnvironment": project_environment_fingerprint(env, contract=environment_contract),
+            })
         auxiliary_observations=[]
         def tree(phase):
             def auxiliary(rows):
                 auxiliary_observations.append({'phase':phase,'directories':rows,'arbitraryFilesystemSemanticsVerified':False})
             try:
                 return observe_npm_dependency_obligations(project,dependency_plan,
-                    source_origin_digest=_digest(origin),resolved_state_key=state.key,
+                    source_origin_digest=_digest(origin),
+                    resolved_state_key=state.key if state is not None else dependency_plan["obligationPlanDigest"],
                     deadline=time.monotonic()+max(0,deadline-time.time()),auxiliary_directory_observer=auxiliary)
             except Exception as exc:
                 exc.operation_observations=tuple(operations)
                 raise
         initial=tree('initial');rows=[]
+        if workspace_mode:
+            # The initial observation is internal until the observed tree binds the resolved state.
+            state = resolved_state(initial["materializedTreeObservationDigest"])
+            if state.lockfile_hash != origin["resolvedLockfileHash"]:
+                fail('CURRENT_WORKSPACE_INPUT_CHANGED')
+            initial["resolvedStateKey"] = state.key
         if not materialize:installation['status']='EXISTING_TREE_PHYSICALLY_OBSERVED'
         for index,command in enumerate(commands,1):
             if typed_output:

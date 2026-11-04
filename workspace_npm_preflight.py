@@ -70,6 +70,21 @@ _SPEC = re.compile(r"[0-9A-Za-z.*+^~<>=| -]+")
 _VERSION = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
 
 
+WORKSPACE_NPM_POLICY = (
+    "--package-lock=true", "--strict-peer-deps=true", "--engine-strict=true",
+    "--ignore-scripts=true", "--force=false", "--legacy-peer-deps=false",
+    "--install-strategy=hoisted", "--prefer-dedupe=false", "--no-audit", "--no-fund",
+    "--global=false", "--workspaces=true", "--include-workspace-root=true",
+    "--include=prod", "--include=dev", "--include=optional", "--include=peer",
+    "--offline=true", "--prefer-offline=false",
+)
+
+
+def isolated_workspace_npm_environment(environment):
+    return {key: value for key, value in environment.items()
+            if not key.upper().startswith(("NPM_CONFIG_", "NODE_", "NPM_PACKAGE_", "NPM_LIFECYCLE_"))}
+
+
 def run_workspace_npm_preflight(
     manifests: dict[str, bytes],
     baseline_lock: bytes,
@@ -181,8 +196,7 @@ def run_workspace_npm_preflight(
         global_config = workspace / "global.npmrc"
         for config in (user_config, global_config):
             config.touch(exist_ok=False)
-        npm_env = {key: value for key, value in os.environ.items()
-                   if not key.upper().startswith(("NPM_CONFIG_", "NODE_", "NPM_PACKAGE_", "NPM_LIFECYCLE_"))}
+        npm_env = isolated_workspace_npm_environment(os.environ)
         identity = {
             "baselineLockSha256": hashlib.sha256(baseline_lock).hexdigest(),
             "sourceManifestSha256": {owner: hashlib.sha256(raw).hexdigest()
@@ -200,12 +214,7 @@ def run_workspace_npm_preflight(
             with Path(executable).open("rb") as stream:
                 identity[label] = hashlib.file_digest(stream, "sha256").hexdigest()
         argv = [node, npm_cli,
-            "install", "--package-lock-only", "--package-lock=true", "--strict-peer-deps=true",
-            "--engine-strict=true", "--ignore-scripts=true", "--force=false", "--legacy-peer-deps=false",
-            "--install-strategy=hoisted", "--prefer-dedupe=false", "--no-audit", "--no-fund",
-            "--global=false", "--workspaces=true", "--include-workspace-root=true",
-            "--include=prod", "--include=dev", "--include=optional", "--include=peer",
-            "--offline=true", "--prefer-offline=false", "--registry", registry, "--cache", str(cache),
+            "install", "--package-lock-only", *WORKSPACE_NPM_POLICY, "--registry", registry, "--cache", str(cache),
             "--userconfig", str(user_config), "--globalconfig", str(global_config),
         ]
         # Record only deterministic policy flags. Registry, cache and config paths stay local.
