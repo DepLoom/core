@@ -9,10 +9,46 @@ import unittest
 from unittest.mock import patch
 
 from verification_linux_pid_namespace import linux_pid_namespace_available
-from verification_process_supervisor import ProcessSupervisionError, run_supervised
+from verification_process_supervisor import _LINUX_SUBREAPER, ProcessSupervisionError, run_supervised
 
 
 NATIVE_REQUIRED = os.environ.get("DEPLOOM_CI_REQUIRE_PID_NAMESPACE") == "1"
+
+
+@unittest.skipUnless(_LINUX_SUBREAPER, "Linux subreaper required")
+class LinuxSubreaperTests(unittest.TestCase):
+    def test_timeout_reaps_only_children_in_the_owned_group(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            body = (
+                "import subprocess, sys, time; from pathlib import Path\n"
+                "child = subprocess.Popen([sys.executable, '-I', '-B', '-c', "
+                "'import time; time.sleep(30)'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+                "Path('child').write_text(str(child.pid))\n"
+                "time.sleep(30)\n"
+            )
+            with subprocess.Popen([sys.executable, "-I", "-B", "-c", "raise SystemExit(17)"]) as unrelated:
+                # Leave its status available during cleanup, without asking Popen to reap it.
+                deadline = time.monotonic() + 2
+                stat = Path(f"/proc/{unrelated.pid}/stat")
+                while not stat.read_text().rsplit(")", 1)[1].split()[0] == "Z":
+                    if time.monotonic() >= deadline:
+                        self.fail("independent process did not exit")
+                    time.sleep(0.01)
+                with self.assertRaises(subprocess.TimeoutExpired) as caught:
+                    run_supervised([sys.executable, "-I", "-B", "-c", body], root, timeout_seconds=1)
+                self.assertEqual(unrelated.wait(timeout=2), 17)
+            child = int((root / "child").read_text())
+            try:
+                self.assertFalse(Path(f"/proc/{child}").exists(), "supervised child was not reaped")
+            finally:
+                # Keep the regression safe even when exercised against an older Core.
+                try:
+                    os.waitpid(child, os.WNOHANG)
+                except ChildProcessError:
+                    pass
+            self.assertEqual(caught.exception.supervision.quality, "best-effort")
+            self.assertEqual(caught.exception.supervision.descendants_remaining, 0)
 
 
 @unittest.skipUnless(sys.platform == "linux" and (NATIVE_REQUIRED or linux_pid_namespace_available()),
