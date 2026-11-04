@@ -224,6 +224,7 @@ def plan_workspace_from_lock(
     *,
     environment: Mapping[str, str] | None = None,
     timeout_ms: int = 30_000,
+    excluded_assignments: tuple[Mapping[str, str], ...] = (),
 ) -> dict:
     """Plan conditionally on observed slots; an npm re-layout remains unmodeled."""
     result = {"authority": "PLANNING_ONLY", "verification": "NOT_VERIFIED",
@@ -249,7 +250,7 @@ def plan_workspace_from_lock(
     except WorkspaceModelUnknown as exc:
         return {**result, "status": "UNKNOWN", "reason": str(exc)}
 
-    return _solve_workspace_model(model, result, timeout_ms)
+    return _solve_workspace_model(model, result, timeout_ms, excluded_assignments)
 
 
 def plan_workspace_in_topology(
@@ -259,6 +260,7 @@ def plan_workspace_in_topology(
     *,
     environment: Mapping[str, str] | None = None,
     timeout_ms: int = 30_000,
+    excluded_assignments: tuple[Mapping[str, str], ...] = (),
 ) -> dict:
     """Check a proposed partition into npm instances before native resolution."""
     result = {"authority": "PLANNING_ONLY", "verification": "NOT_VERIFIED",
@@ -285,10 +287,16 @@ def plan_workspace_in_topology(
                     provenance="workspace-proposed-instance",
                 ))
     model = PeerOptimizationModel(model.packages, model.constraints, tuple(requirements), model.objective_width)
-    return _solve_workspace_model(model, result, timeout_ms)
+    return _solve_workspace_model(model, result, timeout_ms, excluded_assignments)
 
 
-def _solve_workspace_model(model, result, timeout_ms):
+def _solve_workspace_model(model, result, timeout_ms, excluded_assignments):
+    if excluded_assignments:
+        model = model.with_constraints(
+            forbidden(model.assignment_key(vector), reason="Previously tried complete candidate",
+                      provenance="workspace-request-enumeration")
+            for vector in excluded_assignments
+        )
     solved = solve_z3_exact(model, timeout_ms=timeout_ms)
     if solved.status == "optimal" and solved.assignment is not None:
         return {**result, "status": "SAT_IN_MODELED_DOMAIN", "assignment": solved.assignment}
@@ -382,6 +390,7 @@ def plan_workspace_upgrade(
     environment: Mapping[str, str] | None = None,
     topology: WorkspaceTopology | None = None,
     timeout_ms: int = 30_000,
+    excluded_assignments: tuple[Mapping[str, str], ...] = (),
 ) -> dict:
     """Use a bounded metadata snapshot to plan under the observed npm lock layout."""
     try:
@@ -393,6 +402,7 @@ def plan_workspace_upgrade(
                 "reason": str(exc), "assignment": None}
     if topology is not None:
         return plan_workspace_in_topology(domains, topology.providers, topology.instance_groups,
-                                          environment=environment, timeout_ms=timeout_ms)
+                                          environment=environment, timeout_ms=timeout_ms,
+                                          excluded_assignments=excluded_assignments)
     return plan_workspace_from_lock(packages, domains, environment=environment,
-                                    timeout_ms=timeout_ms)
+                                    timeout_ms=timeout_ms, excluded_assignments=excluded_assignments)
