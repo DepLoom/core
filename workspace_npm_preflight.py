@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import subprocess
 import tempfile
@@ -22,6 +23,7 @@ from verification_process_supervisor import run_supervised
 from resolution_inventory import npm_lock_resolved_instance
 from workspace_peer_model import Declaration
 from workspace_glob import match_workspace_pattern
+from workspace_npm_lock_delta import INSTALL_SECTIONS, check_workspace_lock_delta, peer_context
 
 
 def check_workspace_lock(packages: dict, assignment: dict[Declaration, str]) -> dict:
@@ -44,8 +46,7 @@ def check_workspace_lock(packages: dict, assignment: dict[Declaration, str]) -> 
             return {**evidence, "status": "UNKNOWN", "code": "INVALID_LOCK_PEER_METADATA"}
         # Registry package peers resolve next to the consumer or above it.
         # Workspace manifests resolve relative to the real workspace directory.
-        parent, separator, _ = ("/" + consumer).rpartition("/node_modules/")
-        context = parent.strip("/") if separator else consumer
+        context = peer_context(consumer)
         for name, spec in sorted(peers.items()):
             flags = peer_meta.get(name, {})
             if not isinstance(spec, str) or not isinstance(flags, dict):
@@ -65,7 +66,6 @@ def check_workspace_lock(packages: dict, assignment: dict[Declaration, str]) -> 
                         "providerVersion": provider[1] if provider else None}
     return {**evidence, "status": "RESOLUTION_PASSED", "code": "LOCK_ASSIGNMENT_AND_PEERS_MATCH"}
 
-_INSTALL_SECTIONS = ("dependencies", "devDependencies", "optionalDependencies")
 _SPEC = re.compile(r"[0-9A-Za-z.*+^~<>=| -]+")
 _VERSION = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
 
@@ -119,9 +119,9 @@ def run_workspace_npm_preflight(
                 raise ValueError("Unsupported manifest")
             record = packages["" if owner == "." else owner]
             if any(project.get(section, {}) != record.get(section, {})
-                   for section in (*_INSTALL_SECTIONS, "peerDependencies")):
+                   for section in (*INSTALL_SECTIONS, "peerDependencies")):
                 raise ValueError("Manifest and lock disagree")
-            for section in (*_INSTALL_SECTIONS, "peerDependencies"):
+            for section in (*INSTALL_SECTIONS, "peerDependencies"):
                 for spec in project.get(section, {}).values():
                     if not isinstance(spec, str) or not _SPEC.fullmatch(spec):
                         raise ValueError("Unsupported dependency spec")
@@ -141,9 +141,11 @@ def run_workspace_npm_preflight(
                     raise ValueError("Unsupported lock artifact")
 
         observed = {(owner, section, name) for owner, project in projects.items()
-                    for section in _INSTALL_SECTIONS for name in project.get(section, {})}
+                    for section in INSTALL_SECTIONS for name in project.get(section, {})}
         if observed != assignment.keys():
             raise ValueError("Incomplete owner assignment")
+        manifest_deltas = {}
+        changed = set()
         for key, expected in assignment.items():
             owner, section, name = key
             instance = npm_lock_resolved_instance(packages, name, "" if owner == "." else owner)
@@ -154,6 +156,9 @@ def run_workspace_npm_preflight(
                     return {**evidence, "status": "RESOLUTION_FAILED", "code": "UNAUTHORIZED_DECLARATION_DELTA",
                             "declaration": list(key)}
                 projects[owner][section][name] = expected
+                lock_owner = "" if owner == "." else owner
+                manifest_deltas.setdefault(lock_owner, {}).setdefault(section, {})[name] = expected
+                changed.add(key)
     except (AttributeError, KeyError, TypeError, ValueError):
         return {**evidence, "status": "UNKNOWN", "code": "INVALID_WORKSPACE_PREFLIGHT_INPUT"}
 
@@ -171,12 +176,37 @@ def run_workspace_npm_preflight(
             candidate_manifests[path] = raw
         lock_path = workspace / "package-lock.json"
         lock_path.write_bytes(baseline_lock)
-        argv = _npm_command() + [
+        node, npm_cli = _npm_command()
+        user_config = workspace / "user.npmrc"
+        global_config = workspace / "global.npmrc"
+        for config in (user_config, global_config):
+            config.touch(exist_ok=False)
+        npm_env = {key: value for key, value in os.environ.items()
+                   if not key.upper().startswith(("NPM_CONFIG_", "NODE_", "NPM_PACKAGE_", "NPM_LIFECYCLE_"))}
+        identity = {
+            "baselineLockSha256": hashlib.sha256(baseline_lock).hexdigest(),
+            "sourceManifestSha256": {owner: hashlib.sha256(raw).hexdigest()
+                                     for owner, raw in sorted(manifests.items())},
+            "assignment": [[*key, value] for key, value in sorted(assignment.items())],
+            "mutable": [list(key) for key in sorted(mutable)],
+            "reauthor": list(reauthor) if reauthor is not None else None,
+            "registrySha256": hashlib.sha256(registry.encode()).hexdigest(),
+        }
+        for label, executable in (("nodeBinarySha256", node), ("npmEntrypointSha256", npm_cli)):
+            with Path(executable).open("rb") as stream:
+                identity[label] = hashlib.file_digest(stream, "sha256").hexdigest()
+        argv = [node, npm_cli,
             "install", "--package-lock-only", "--package-lock=true", "--strict-peer-deps=true",
             "--engine-strict=true", "--ignore-scripts=true", "--force=false", "--legacy-peer-deps=false",
             "--install-strategy=hoisted", "--prefer-dedupe=false", "--no-audit", "--no-fund",
+            "--global=false", "--workspaces=true", "--include-workspace-root=true",
+            "--include=prod", "--include=dev", "--include=optional", "--include=peer",
             "--offline=true", "--prefer-offline=false", "--registry", registry, "--cache", str(cache),
+            "--userconfig", str(user_config), "--globalconfig", str(global_config),
         ]
+        # Record only deterministic policy flags. Registry, cache and config paths stay local.
+        identity["npmPolicy"] = argv[2:argv.index("--registry")]
+        identity_digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
         deadline = time.monotonic() + timeout_seconds
         attempts = []
 
@@ -185,7 +215,7 @@ def run_workspace_npm_preflight(
             if remaining <= 0:
                 raise subprocess.TimeoutExpired(argv, timeout_seconds)
             proc = run_supervised(argv, workspace, timeout_seconds=remaining,
-                                  progress_label=f"Workspace npm resolution: {label}")
+                                  progress_label=f"Workspace npm resolution: {label}", base_env=npm_env)
             output = proc.stdout or ""
             log = workspace / f"{label}.log"
             log.write_text(output, encoding="utf-8")
@@ -200,6 +230,7 @@ def run_workspace_npm_preflight(
                 return {"status": status, "code": code}
             return check_workspace_lock(json.loads(lock_path.read_bytes())["packages"], assignment)
 
+        reauthored = None
         exit_code, code = resolve("npm-resolution")
         result = check(exit_code, code)
         if (reauthor is not None and reauthor in assignment and reauthor not in mutable
@@ -214,6 +245,7 @@ def run_workspace_npm_preflight(
             if (instance is not None and result["consumer"] == instance[0]
                     and same_slot == [reauthor] and projects[owner][section][name] == assignment[reauthor]
                     and _VERSION.fullmatch(assignment[reauthor]) and not resolved[instance[0]].get("link")):
+                reauthored = reauthor
                 attempts[-1].update(status=result["status"], code=result["code"])
                 path = workspace / owner / "package.json"
                 before = path.read_bytes()
@@ -231,10 +263,20 @@ def run_workspace_npm_preflight(
                     result = check(exit_code, code)
         if any(path.read_bytes() != raw for path, raw in candidate_manifests.items()):
             result = {"status": "UNKNOWN", "code": "CANDIDATE_MANIFEST_CHANGED"}
-        return {**evidence, **result, "npmExitCode": exit_code, "workspace": str(workspace),
-                "attempts": attempts, "baselineLockSha256": hashlib.sha256(baseline_lock).hexdigest(),
-                "candidateLockSha256": hashlib.sha256(lock_path.read_bytes()).hexdigest()}
+        if result["status"] == "RESOLUTION_PASSED":
+            delta = check_workspace_lock_delta(
+                lock, json.loads(lock_path.read_bytes()), manifest_deltas, assignment, changed, reauthored)
+            if delta["status"] != "RESOLUTION_PASSED":
+                result.update(status=delta["status"], code=delta["code"])
+            result["lockDelta"] = delta
+        receipt = {**evidence, **result, "npmExitCode": exit_code, "attempts": attempts,
+                   "baselineLockSha256": identity["baselineLockSha256"],
+                   "candidateLockSha256": hashlib.sha256(lock_path.read_bytes()).hexdigest(),
+                   "resolverIdentitySha256": identity_digest}
+        with (workspace / "receipt.json").open("x", encoding="utf-8") as stream:
+            json.dump({"identity": identity, "receipt": receipt}, stream, indent=2)
+        return {**receipt, "workspace": str(workspace)}
     except subprocess.TimeoutExpired:
         return {**evidence, "status": "UNKNOWN", "code": "RESOLVER_TIMEOUT"}
-    except (OSError, ValueError, KeyError, TypeError):
+    except (AttributeError, OSError, ValueError, KeyError, TypeError):
         return {**evidence, "status": "UNKNOWN", "code": "RESOLVER_EVIDENCE_UNAVAILABLE"}
