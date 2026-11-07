@@ -12,6 +12,46 @@ from draft_decision_contract import LATEST_APPROVED, normalize_decision_contract
 from draft_input_identity import capture_draft_semantic_inputs
 
 
+class DraftPlanningDeadlineTests(unittest.TestCase):
+    def test_expired_budget_during_input_copy_does_not_start_worker(self):
+        rows = {"fixture": ["original"]}
+        copy_rows = roadmap.copy.deepcopy
+        now = [0.0]
+
+        def expensive_copy(value):
+            now[0] = 10.0
+            return copy_rows(value)
+
+        with patch.object(roadmap.time, "monotonic", side_effect=lambda: now[0]):
+            clock = roadmap.DeadlineClock(10.0)
+            with (patch.object(roadmap.copy, "deepcopy", side_effect=expensive_copy),
+                  patch.object(roadmap, "stable_sha256_text") as worker):
+                with self.assertRaises(roadmap.DraftBudgetExceeded):
+                    roadmap.run_supervised_planning("test", clock, worker, rows)
+                worker.assert_not_called()
+        self.assertEqual(rows, {"fixture": ["original"]})
+
+    def test_expired_budget_during_result_copy_preserves_published_rows(self):
+        rows = {"fixture": ["original"]}
+        copy_rows = roadmap.copy.deepcopy
+        now = [0.0]
+
+        def copy_with_cost(value):
+            if value["fixture"] == ["changed"]:
+                now[0] = 10.0
+            return copy_rows(value)
+
+        def worker(working):
+            working["fixture"][:] = ["changed"]
+
+        with patch.object(roadmap.time, "monotonic", side_effect=lambda: now[0]):
+            clock = roadmap.DeadlineClock(10.0)
+            with patch.object(roadmap.copy, "deepcopy", side_effect=copy_with_cost):
+                with self.assertRaises(roadmap.DraftBudgetExceeded):
+                    roadmap.run_supervised_planning("test", clock, worker, rows)
+        self.assertEqual(rows, {"fixture": ["original"]})
+
+
 class DraftDecisionContractTests(unittest.TestCase):
     REGISTRY = "https://registry.example.invalid"
 
@@ -38,6 +78,25 @@ class DraftDecisionContractTests(unittest.TestCase):
             group=1, reason="synthetic fixture", notes="", target_default=target,
             target_yellow=target, target_green=target, draft_scan_state="done",
         )
+
+    def test_final_registry_evidence_keeps_exact_selection_and_unknowns(self):
+        row = self.row(target="1.1.0")
+        row.current_vulns = "unknown"
+        unavailable = self.row("unavailable", target="1.2.0")
+        fixed = self.row("not-registry")
+        fixed.requested_spec = "file:../not-registry"
+        fixed.current_vulns = "unknown"
+        with patch.object(self.client, "_query_registry_security_pairs", return_value={
+            (row.name, "1.1.0"): [{"database_specific": {"severity": "high"}}],
+        }) as audit:
+            roadmap.enrich_final_registry_security(
+                {"synthetic": [row, unavailable, fixed]}, self.client, self.REGISTRY
+            )
+        audit.assert_called_once_with([(row.name, "1.1.0"), (unavailable.name, "1.2.0")], self.REGISTRY)
+        self.assertEqual(roadmap._draft_target_for_major(row), "1.1.0")
+        self.assertEqual(row.current_vulns, "unknown")
+        self.assertEqual(roadmap._projected_row_security_full(row, "1.1.0"), (0, 1, 0, 0, True))
+        self.assertFalse(roadmap._projected_row_security_full(unavailable, "1.2.0")[-1])
 
     def package(self, name, versions):
         metadata = {}

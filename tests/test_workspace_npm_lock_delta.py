@@ -52,6 +52,29 @@ class WorkspaceLockDeltaTests(unittest.TestCase):
         self.after["packages"]["node_modules/held"]["integrity"] = "sha512-substituted"
         self.assertEqual(self.check(self.held)["code"], "HELD_LOCK_ARTIFACT_CHANGED")
 
+    def prepare_held_relocation(self):
+        old_path = "node_modules/held"
+        new_path = "app/node_modules/held"
+        for lock in (self.before, self.after):
+            lock["packages"][old_path]["resolved"] = "https://registry.npmjs.org/held/-/held-1.0.0.tgz"
+        self.after["packages"][new_path] = self.after["packages"].pop(old_path)
+        return old_path, new_path
+
+    def test_unique_relocation_preserves_held_artifact_and_edges(self):
+        old_path, _ = self.prepare_held_relocation()
+        self.assertEqual(self.check()["status"], "RESOLUTION_PASSED")
+        self.assertEqual(self.check(pins=frozenset({old_path}))["code"], "IMMUTABLE_LOCK_INSTANCE_CHANGED")
+
+    def test_relocation_cannot_rebind_a_held_consumer_edge(self):
+        _, _ = self.prepare_held_relocation()
+        self.after["packages"]["app/node_modules/unrelated"] = {"version": "1.1.0"}
+        self.assertEqual(self.check()["code"], "LOCK_UNRELATED_NODE_DELTA")
+
+    def test_identical_held_copies_cannot_be_merged(self):
+        old_path, new_path = self.prepare_held_relocation()
+        self.before["packages"][new_path] = deepcopy(self.before["packages"][old_path])
+        self.assertEqual(self.check()["code"], "LOCK_UNRELATED_NODE_DELTA")
+
     def test_workspace_link_and_unapproved_manifest_edit_are_rejected(self):
         self.after["packages"]["node_modules/app"]["resolved"] = "unrelated"
         self.assertEqual(self.check()["code"], "LOCK_WORKSPACE_LINK_CHANGED")

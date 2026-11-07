@@ -7,6 +7,28 @@ import unittest
 from unittest.mock import patch
 import dependency_live_roadmap_generator as core
 
+class DisabledExternalEvidenceTests(unittest.TestCase):
+    def test_policy_blocks_osv_queries_and_detail_before_network(self):
+        client = object.__new__(core.LiveDataClient)
+        with patch.dict("os.environ", {"DEPLOOM_DRAFT_DISABLE_EXTERNAL_EVIDENCE": "1"}):
+            with self.assertRaises(core.VulnerabilityEvidenceUnavailable):
+                client.query_osv_versions("example", ["1.0.0"])
+            with self.assertRaises(core.VulnerabilityEvidenceUnavailable):
+                client.fetch_osv_vuln("example")
+
+
+    def test_approved_registry_source_is_used_without_osv_fallback(self):
+        client = object.__new__(core.LiveDataClient)
+        registry = "https://registry.example.invalid/npm"
+        with patch.dict("os.environ", {"DEPLOOM_DRAFT_DISABLE_EXTERNAL_EVIDENCE": "1",
+                                      "DEPLOOM_DRAFT_REGISTRY_ADVISORY_SOURCE": registry}), patch.object(
+            client, "_query_registry_security_versions", side_effect=core.VulnerabilityEvidenceUnavailable
+        ) as query:
+            with self.assertRaises(core.VulnerabilityEvidenceUnavailable):
+                client.query_osv_versions("example", ["1.0.0"])
+            query.assert_called_once_with("example", ["1.0.0"], registry)
+
+
 class OsvDetailsTests(unittest.TestCase):
     def setUp(self):
         self.seen=[];self.active=0;self.peak=0;self.lock=threading.Lock();owner=self

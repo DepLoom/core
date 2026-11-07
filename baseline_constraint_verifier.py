@@ -116,6 +116,7 @@ from project_topology import (
 from reparse_materialization import (
     ReparseLink,
     ReparseMaterializationError,
+    _create_junction,
     inventory_reparse_plan,
 )
 # BLOCK_Z_PROJECT_TOPOLOGY_V1
@@ -1750,31 +1751,11 @@ def _remove_reparse_or_tree(path: Path) -> None:
 
 
 def _create_windows_junction(link: Path, target: Path) -> None:
-    comspec = os.environ.get("COMSPEC") or shutil.which("cmd.exe")
-    if not comspec:
-        raise RuntimeError(
-            "WORKSPACE_JUNCTION_CREATE_FAILED: cmd.exe unavailable"
-        )
     link.parent.mkdir(parents=True, exist_ok=True)
-    command = subprocess.list2cmdline(
-        ["mklink", "/J", str(link), str(target)]
-    )
-    result = subprocess.run(
-        [comspec, "/d", "/s", "/c", command],
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        timeout=30,
-        check=False,
-    )
-    if result.returncode != 0 or not _is_windows_junction(link):
-        raise RuntimeError(
-            "WORKSPACE_JUNCTION_CREATE_FAILED: "
-            f"{link} -> {target}; exit={result.returncode}; "
-            f"{(result.stdout or '')[-1000:]}"
-        )
+    try:
+        _create_junction(link, target)
+    except ReparseMaterializationError as error:
+        raise RuntimeError(f"WORKSPACE_JUNCTION_CREATE_FAILED: {error}") from error
 
 
 def _rebase_workspace_junctions(

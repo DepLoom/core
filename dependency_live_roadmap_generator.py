@@ -222,6 +222,7 @@ from block_v_prepared_artifact import (
     SEARCH_PRIORITY_PROMISING,
     prioritize_prepared_artifact_record,
 )
+from project_runtime import normalize_npm_range
 from project_topology import (
     ProjectTopologyError,
     discover_project_package_directories,
@@ -2410,6 +2411,8 @@ class LiveDataClient:
         metadata_cache_dir: Optional[Path] = None,
         metadata_cache_ttl: float = 0.0,
         metadata_cache_tool_version: str = "",
+        *,
+        allow_registry_metadata_redirects: bool = True,
     ):
         self.registry = registry.rstrip("/")
         self.timeout = timeout
@@ -2417,6 +2420,7 @@ class LiveDataClient:
         self.sleep_sec = sleep_sec
         self.use_system_proxy = use_system_proxy
         self.session = requests.Session()
+        self.allow_registry_metadata_redirects = allow_registry_metadata_redirects
         # Important for Windows/corporate setups: requests inherits proxy
         # settings from environment variables and WinINet/registry through
         # urllib.getproxies() when trust_env=True. That can make the tool try
@@ -2443,7 +2447,9 @@ class LiveDataClient:
         # Optional durable planning packument cache (C2): metadata read here is
         # merged across CLI invocations. Planning-only -- install, verification
         # and the vulnerability audit inventory never consult this cache.
-        self.metadata_cache_dir: Optional[Path] = Path(metadata_cache_dir) if metadata_cache_dir else None
+        self.metadata_cache_dir: Optional[Path] = (
+            Path(metadata_cache_dir) if metadata_cache_dir and allow_registry_metadata_redirects else None
+        )
         self.metadata_cache_ttl: float = float(metadata_cache_ttl or 0.0)
         self.metadata_cache_tool_version: str = metadata_cache_tool_version or ""
         self._metadata_request_context = request_context(self.session, self.registry, self.metadata_cache_tool_version)[0]
@@ -3075,7 +3081,8 @@ class LiveDataClient:
                 self.progress(operation="registry metadata", package=pkg, retry=attempt - 1, step="scan")
                 response = self._supervised(
                     lambda url=url: self.session.get(url, timeout=self._budgeted_timeout(), stream=True,
-                                                     **({"headers": conditional} if conditional else {}))
+                                                     **({"headers": conditional} if conditional else {}),
+                                                     **({} if self.allow_registry_metadata_redirects else {"allow_redirects": False}))
                 )
                 status = int(getattr(response, "status_code", 0) or 0)
                 if status == 304 and stale is not None:
@@ -3092,6 +3099,9 @@ class LiveDataClient:
                 if status == 304:
                     response.close()
                     raise ValueError("registry returned 304 without a validated cached subject")
+                if 300 <= status < 400 and not self.allow_registry_metadata_redirects:
+                    response.close()
+                    raise ValueError("registry metadata redirect refused")
                 if status == 404:
                     # A real 404 is a deterministic registry fact. Unlike a
                     # timeout/5xx it is safe to memoize as package absence.
@@ -3144,12 +3154,76 @@ class LiveDataClient:
             f"{last_error or 'registry request failed without a stable response'}"
         )
 
+    def query_registry_advisory_evidence(
+        self, pairs: List[Tuple[str, str]], approved_registry: str, *,
+        max_match_evaluations: int | None = None,
+    ):
+        from draft_npm_preflight import _npm_command
+        from registry_advisory_evidence import query_registry_advisories
+
+        semver_script = (
+            "const semver = require(process.argv[1]);"
+            "const [range, version] = JSON.parse(require('fs').readFileSync(0, 'utf8'));"
+            "const opts = {includePrerelease:true, loose:true};"
+            "if (semver.validRange(range, opts) === null) process.exit(2);"
+            "process.stdout.write(JSON.stringify(semver.satisfies(version, range, opts)));"
+        )
+        npm_runtime = None
+
+        def matches(spec: str, version: str) -> bool:
+            nonlocal npm_runtime
+            try:
+                if npm_runtime is None:
+                    node, npm = _npm_command()
+                    semver = Path(npm).resolve().parent.parent / "node_modules" / "semver"
+                    npm_runtime = [node, "-e", semver_script, str(semver)]
+                timeout = self._budgeted_timeout()
+                result = subprocess.run(
+                    npm_runtime, input=json.dumps([spec, version]), encoding="utf-8",
+                    capture_output=True, check=True, timeout=min(5, timeout[1] if isinstance(timeout, tuple) else timeout),
+                )
+                return json.loads(result.stdout)
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise ValueError("npm advisory range matching unavailable") from exc
+
+        return self._supervised(lambda: query_registry_advisories(
+            self.session, self.registry, approved_registry, pairs,
+            matches=matches, timeout=self._budgeted_timeout(), trust_omitted_packages=True,
+            max_match_evaluations=max_match_evaluations,
+        ))
+
+    def _query_registry_security_pairs(
+        self, pairs: List[Tuple[str, str]], approved_registry: str,
+    ) -> Dict[Tuple[str, str], List[Dict[str, Any]]]:
+        evidence = self.query_registry_advisory_evidence(pairs, approved_registry)
+        return {
+            pair: [
+                {"id": f"registry:{advisory.identifier}",
+                 "database_specific": {"severity": advisory.severity}}
+                for advisory in record.advisories
+            ] for pair, record in evidence.items() if record.status != "UNKNOWN"
+        }
+
+    def _query_registry_security_versions(
+        self, pkg: str, versions: List[str], approved_registry: str,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        pairs = [(pkg, version) for version in versions]
+        assessed = self._query_registry_security_pairs(pairs, approved_registry)
+        if any(pair not in assessed for pair in pairs):
+            raise VulnerabilityEvidenceUnavailable("REGISTRY_ADVISORY_EVIDENCE_UNAVAILABLE")
+        return {version: assessed[pkg, version] for version in versions}
+
     def query_osv_versions(
         self,
         pkg: str,
         versions: List[str],
         progress_label: str = "",
     ) -> Dict[str, List[Dict[str, Any]]]:
+        if os.environ.get("DEPLOOM_DRAFT_DISABLE_EXTERNAL_EVIDENCE") == "1":
+            approved_registry = os.environ.get("DEPLOOM_DRAFT_REGISTRY_ADVISORY_SOURCE")
+            if approved_registry:
+                return self._query_registry_security_versions(pkg, versions, approved_registry)
+            raise VulnerabilityEvidenceUnavailable("External vulnerability queries disabled by host policy")
         result: Dict[str, List[Dict[str, Any]]] = {}
         missing = [v for v in versions if (pkg, v) not in self.osv_cache]
         self.progress(operation=f"OSV query ({len(missing)} version(s))", package=pkg, step="scan")
@@ -3252,6 +3326,8 @@ class LiveDataClient:
         self.vuln_detail_cache.update(evidence)
 
     def fetch_osv_vuln(self, vuln_id: str) -> Dict[str, Any]:
+        if os.environ.get("DEPLOOM_DRAFT_DISABLE_EXTERNAL_EVIDENCE") == "1":
+            raise VulnerabilityEvidenceUnavailable("External vulnerability queries disabled by host policy")
         if vuln_id in self.vuln_detail_cache:
             return self.vuln_detail_cache[vuln_id]
         self.progress(operation="OSV detail", package=vuln_id, step="scan")
@@ -4675,6 +4751,86 @@ def normalized_lag_months(value: Any, default: int = 12) -> int:
 REGISTRY_PREFETCH_PARALLELISM = 8
 
 
+def _registry_prefetch_client(client: LiveDataClient) -> LiveDataClient:
+    worker = LiveDataClient(
+        client.registry, timeout=client.timeout,
+        batch_size=client.batch_size, sleep_sec=client.sleep_sec,
+        use_system_proxy=client.use_system_proxy,
+        metadata_cache_dir=client.metadata_cache_dir,
+        metadata_cache_ttl=client.metadata_cache_ttl,
+        metadata_cache_tool_version=client.metadata_cache_tool_version,
+        allow_registry_metadata_redirects=client.allow_registry_metadata_redirects,
+    )
+    worker.session.trust_env = client.session.trust_env
+    worker.session.max_redirects = client.session.max_redirects
+    worker.session.params = shallow_copy(client.session.params)
+    worker.session.headers.update(client.session.headers)
+    worker.session.auth = client.session.auth
+    worker.session.proxies.update(client.session.proxies)
+    worker.session.cookies.update(client.session.cookies)
+    worker.session.verify = client.session.verify
+    worker.session.cert = client.session.cert
+    worker.set_deadline(client.deadline)
+    worker.draft = client.draft
+    worker.progress = client.progress
+    return worker
+
+
+_DRAFT_METADATA_WINDOW = 4
+
+
+def _prefetch_draft_registry_window(
+    client: LiveDataClient, dependencies: Sequence[Tuple[str, str, str]],
+) -> Dict[str, RegistryInfrastructureError]:
+    """Warm one window without holding already published rows for later fetches."""
+    context, independently_fetchable = request_context(client.session, client.registry, client.metadata_cache_tool_version)
+    if context is None or not independently_fetchable:
+        return {}
+    if context != client._metadata_request_context:
+        client.npm_cache.clear()
+        client._metadata_request_context = context
+    names = list(dict.fromkeys(name for name, _, spec in dependencies
+                               if not is_non_registry_spec(spec) and name not in client.npm_cache))
+    if len(names) < 2:
+        return {}
+
+    def fetch(name: str) -> Any:
+        worker = _registry_prefetch_client(client)
+        try:
+            metadata = worker.fetch_npm_metadata(name)
+            return metadata, bool(worker.session.cookies)
+        finally:
+            worker.session.close()
+
+    # The same absolute deadline governs the batch wait and every HTTP read.
+    budget = max(0.0, client.deadline.remaining - DRAFT_FINALIZE_RESERVE_SECONDS)
+    if budget <= DRAFT_MIN_NET_BUDGET_SECONDS:
+        raise DraftBudgetExceeded("network")
+    errors = {}
+    results = {}
+    response_sets_cookie = False
+    pool = ThreadPoolExecutor(max_workers=min(_DRAFT_METADATA_WINDOW, len(names)))
+    try:
+        futures = {pool.submit(fetch, name): name for name in names}
+        for future in as_completed(futures, timeout=budget):
+            name = futures[future]
+            try:
+                metadata, stateful = future.result()
+                results[name] = metadata
+                response_sets_cookie |= stateful
+            except RegistryInfrastructureError as exc:
+                errors[name] = exc
+    except TimeoutError:
+        raise DraftBudgetExceeded("network") from None
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    if response_sets_cookie:
+        # Let the original session establish cookie-dependent metadata in order.
+        return {}
+    client.npm_cache.update(results)
+    return errors
+
+
 def _prefetch_registry_metadata(
     client: LiveDataClient,
     dependencies: Sequence[Tuple[str, str, str]],
@@ -4721,9 +4877,7 @@ def _prefetch_registry_metadata(
             )
             return
     if getattr(client, "deadline", None) is not None:
-        # Draft: per-package metadata is fetched by the deadline-aware row loop
-        # below; a parallel pool would swallow the per-future DraftBudgetExceeded
-        # signal and hide the run deadline from publication.
+        # Draft prefetches one window at a time in the deadline-aware row loop.
         return
     workers = 1 if context is None else max(1, min(int(max_workers), 16, len(names)))
     if workers <= 1:
@@ -4746,23 +4900,7 @@ def _prefetch_registry_metadata(
     def fetch_one(name: str) -> Any:
         worker = getattr(local, "client", None)
         if worker is None:
-            worker = LiveDataClient(
-                client.registry, timeout=client.timeout,
-                batch_size=client.batch_size, sleep_sec=client.sleep_sec,
-                use_system_proxy=client.use_system_proxy,
-                metadata_cache_dir=client.metadata_cache_dir,
-                metadata_cache_ttl=client.metadata_cache_ttl,
-                metadata_cache_tool_version=client.metadata_cache_tool_version,
-            )
-            worker.session.trust_env = client.session.trust_env
-            worker.session.max_redirects = client.session.max_redirects
-            worker.session.params = shallow_copy(client.session.params)
-            worker.session.headers.update(client.session.headers)
-            worker.session.auth = client.session.auth
-            worker.session.proxies.update(client.session.proxies)
-            worker.session.cookies.update(client.session.cookies)
-            worker.session.verify = client.session.verify
-            worker.session.cert = client.session.cert
+            worker = _registry_prefetch_client(client)
             local.client = worker
         return worker.fetch_npm_metadata(name)
 
@@ -4985,6 +5123,10 @@ def analyze_project(
             "Draft continues with per-package queries and records unknown instead of failing"
         )
 
+    draft_prefetch = (tolerate_registry_failure and isinstance(client, LiveDataClient)
+                      and client.deadline is not None and client.deadline.remaining is not None)
+    metadata_errors: Dict[str, RegistryInfrastructureError] = {}
+    window_end = 0
     for dependency_index, (name, kind, spec) in enumerate(dependencies, start=1):
         if getattr(client, "deadline", None) is not None:
             client.deadline.check(f"dependency:{name}")
@@ -5097,7 +5239,14 @@ def analyze_project(
             f"[info] {dependency_label}: current={current} ({current_source}); "
             "loading registry metadata"
         )
+        if draft_prefetch and dependency_index > window_end:
+            window_end = dependency_index + _DRAFT_METADATA_WINDOW - 1
+            metadata_errors = _prefetch_draft_registry_window(
+                client, dependencies[dependency_index - 1:window_end],
+            )
         try:
+            if name in metadata_errors:
+                raise metadata_errors[name]
             meta = client.fetch_npm_metadata(name)
         except RegistryInfrastructureError:
             if not tolerate_registry_failure:
@@ -6230,10 +6379,8 @@ def _severity_at_candidate_version(row: DependencyRow, planned: str, severity: s
     exactly the installed version; anything else needs the evidence map. No
     evidence for the exact version => None (unknown), never a comparison-based
     "safe" conclusion."""
-    if not _row_security_known(row):
-        return None
     if planned and planned == str(row.current_version or "").strip():
-        return parse_vuln_counts(row.current_vulns).get(severity, 0)
+        return parse_vuln_counts(row.current_vulns).get(severity, 0) if _row_security_known(row) else None
     if planned and row.vuln_evidence_by_version:
         summary = row.vuln_evidence_by_version.get(planned)
         if summary is not None and _summary_security_known(summary):
@@ -7117,7 +7264,7 @@ def _npm_peer_satisfied(spec: str, version: str) -> bool:
     if parsed is None:
         return False
     try:
-        return NpmSpec(str(spec)).match(parsed)
+        return NpmSpec(normalize_npm_range(str(spec))).match(parsed)
     except ValueError:
         # Unknown/non-semver peer declarations are not safe to reject based on
         # a parser guess; project verification remains the final authority.
@@ -7932,7 +8079,7 @@ def _known_peer_range_satisfaction(spec: str, version: str) -> Optional[bool]:
     if parsed is None:
         return None
     try:
-        return bool(NpmSpec(str(spec)).match(parsed))
+        return bool(NpmSpec(normalize_npm_range(str(spec))).match(parsed))
     except Exception:
         return None
 
@@ -8473,16 +8620,15 @@ def _build_peer_optimization_model(
     def add_requirement(
         trigger: Tuple[str, str],
         provider: str,
-        allowed_versions: Iterable[str],
+        allowed_versions: Tuple[str, ...],
         *,
         reason: str,
         provenance: str,
     ) -> None:
-        allowed = tuple(dict.fromkeys(str(version) for version in allowed_versions))
         requirement = RequiresAny(
             trigger=(str(trigger[0]), str(trigger[1])),
             provider=str(provider),
-            allowed_versions=allowed,
+            allowed_versions=allowed_versions,
             reason=reason,
             provenance=provenance,
         )
@@ -8546,6 +8692,13 @@ def _build_peer_optimization_model(
                 provenance="learned-nogood",
             )
 
+    from functools import lru_cache
+
+    @lru_cache(maxsize=512)
+    def matching_versions(peer_name: str, spec: str) -> Tuple[Tuple[str, ...], frozenset[str]]:
+        ordered = tuple(dict.fromkeys(version for version in domains[peer_name] if _npm_peer_satisfied(spec, version)))
+        return ordered, frozenset(ordered)
+
     for source_name in sorted(component):
         source = rows_by_name[source_name]
         for source_version in domains[source_name]:
@@ -8574,11 +8727,7 @@ def _build_peer_optimization_model(
                     continue
                 if peer_name not in component_set:
                     continue
-                allowed_versions = [
-                    peer_version
-                    for peer_version in domains[peer_name]
-                    if _npm_peer_satisfied(spec, peer_version)
-                ]
+                allowed_versions, allowed_set = matching_versions(peer_name, spec)
                 if source_moved:
                     add_requirement(
                         (source_name, source_version),
@@ -8597,7 +8746,7 @@ def _build_peer_optimization_model(
                 # becomes active.  This special case remains a compact binary
                 # nogood because the source may also move away from current.
                 for peer_version in domains[peer_name]:
-                    if peer_version == peer.current_version or _npm_peer_satisfied(spec, peer_version):
+                    if peer_version == peer.current_version or peer_version in allowed_set:
                         continue
                     add_constraint(
                         [(source_name, source_version), (peer_name, peer_version)],
@@ -8750,6 +8899,7 @@ def _run_z3_peer_component(
     """
     options = _peer_solver_backend_options(raw_config)
     configured_timeout_ms = int(options["timeoutMs"])
+    model_started = time.perf_counter()
     model = _build_peer_optimization_model(
         component,
         rows_by_name,
@@ -8759,6 +8909,8 @@ def _run_z3_peer_component(
         learned_nogoods,
         stability_targets,
     )
+    eprint(f"[info] peer timing: stage=model; packages={len(component)}; "
+           f"candidates={model.candidate_count()}; elapsedMs={int((time.perf_counter() - model_started) * 1000)}")
     # Part C / T2: a fully pinned component (every package has a residual
     # target -- a queued/prepared fallback from an earlier, already checked
     # assignment) is decided WITHOUT a fresh global solve -- but ONLY when the
@@ -8829,7 +8981,9 @@ def _run_z3_peer_component(
         """Start one real attempt with its own observability id and record it."""
         attempt_id = new_observability_id("z3")
         started_remaining = _remaining_for_attempt()
+        eprint(f"[info] peer timing: stage=z3-start; packages={len(component)}; timeoutMs={timeout_ms}")
         attempt_result = solve_z3_exact(model, timeout_ms=timeout_ms, operation_id=attempt_id)
+        eprint(f"[info] peer timing: stage=z3-end; packages={len(component)}; elapsedMs={int(attempt_result.elapsed_ms)}")
         attempts.append({
             "attemptId": attempt_id,
             "timeoutMs": timeout_ms,
@@ -9902,6 +10056,7 @@ def resolve_peer_compatibility(
                 mode=mode,
                 source="global-exact-exclusion",
             )
+            domains_started = time.perf_counter()
             domains: Dict[str, List[str]] = {}
             for name, row in solver_rows_by_name.items():
                 previous_target = residual_targets.get(name, "")
@@ -9913,6 +10068,7 @@ def resolve_peer_compatibility(
                 else:
                     domains[name] = _candidate_domain(row, mode, client)
 
+            eprint(f"[info] peer timing: stage=domains; elapsedMs={int((time.perf_counter() - domains_started) * 1000)}")
             # BLOCK_VF_ACTIVE_PREDICATE_SEARCH_V1
             # Predicate probes may reorder fallback *cost* but never remove
             # a version. Explicit residual/approved targets keep precedence.
@@ -9962,10 +10118,12 @@ def resolve_peer_compatibility(
                         "domain remains complete"
                     )
 
+            graph_started = time.perf_counter()
             domains, fixed_peer_stats = _apply_fixed_peer_constant_constraints(
                 solver_rows_by_name, fixed_rows_by_name, domains, client,
             )
             graph = _potential_peer_graph(solver_rows_by_name, domains, client)
+            eprint(f"[info] peer timing: stage=graph; elapsedMs={int((time.perf_counter() - graph_started) * 1000)}")
             merge_nogood_edges(graph, learned_nogoods)
             components = _graph_components(graph)
             eprint(
@@ -10046,6 +10204,8 @@ def resolve_peer_compatibility(
                     # starts a fresh attempt with the configured timeout when
                     # that budget is already gone. The supervisor thread-join
                     # stays the hard guarantee.
+                    component_started = time.perf_counter()
+                    eprint(f"[info] peer timing: stage=component-start; packages={len(component)}")
                     exact_report = _run_z3_peer_component(
                         component,
                         rows_by_name,
@@ -10062,6 +10222,8 @@ def resolve_peer_compatibility(
                             else {}
                         ),
                     )
+                    eprint(f"[info] peer timing: stage=component-end; packages={len(component)}; "
+                           f"elapsedMs={int((time.perf_counter() - component_started) * 1000)}")
                     exact_status = str(exact_report.get("status") or "")
                     if exact_status in {"optimal", "feasible"} and isinstance(exact_report.get("assignment"), dict):
                         component_assignment = dict(exact_report["assignment"])
@@ -24026,7 +24188,13 @@ def run_supervised_planning(
     budget = max(0.0, remaining - DRAFT_FINALIZE_RESERVE_SECONDS)
     if budget <= DRAFT_MIN_NET_BUDGET_SECONDS:
         raise DraftBudgetExceeded(phase)
+    started = time.perf_counter()
+    eprint(f"[info] planning timing: stage={phase}; state=start")
     working = copy.deepcopy(rows_by_project)
+    # Copying rows consumes the same absolute planning budget as the worker.
+    budget = max(0.0, deadline.remaining - DRAFT_FINALIZE_RESERVE_SECONDS)
+    if budget <= DRAFT_MIN_NET_BUDGET_SECONDS:
+        raise DraftBudgetExceeded(phase)
     box: Dict[str, Any] = {}
 
     def worker() -> None:
@@ -24042,8 +24210,11 @@ def run_supervised_planning(
         raise DraftBudgetExceeded(phase)
     if "exc" in box:
         raise box["exc"]
+    accepted = copy.deepcopy(working)
+    deadline.check_with_reserve(phase)
     rows_by_project.clear()
-    rows_by_project.update(copy.deepcopy(working))
+    rows_by_project.update(accepted)
+    eprint(f"[info] planning timing: stage={phase}; state=done; elapsedMs={int((time.perf_counter() - started) * 1000)}")
     return box["value"]
 
 
@@ -24333,6 +24504,34 @@ def _projected_row_security_full(row: DependencyRow, target: str) -> Tuple[int, 
     if crit is None or high is None or moderate is None or low is None:
         return 0, 0, 0, 0, False
     return int(crit), int(high), int(moderate), int(low), True
+
+
+def enrich_final_registry_security(
+    rows_by_project: Dict[str, List[DependencyRow]], client: LiveDataClient, approved_registry: str,
+) -> None:
+    """Fill only missing evidence for exact selected versions without changing targets."""
+    missing: Dict[Tuple[str, str], List[DependencyRow]] = defaultdict(list)
+    for rows in rows_by_project.values():
+        for row in rows:
+            if row.scope_excluded or _is_fixed_dependency_input(row):
+                continue
+            target = _draft_target_for_major(row)
+            version = _post_plan_version(row, target)
+            parsed = safe_version(version)
+            if parsed is None or str(parsed) != version or _projected_row_security_full(row, target)[-1]:
+                continue
+            missing[row.name, version].append(row)
+    if not missing:
+        return
+    assessed = client._query_registry_security_pairs(sorted(missing), approved_registry)
+    for pair, advisories in assessed.items():
+        summary = vuln_summary(advisories)
+        version = pair[1]
+        for row in missing[pair]:
+            if version == row.current_version:
+                row.current_vulns = summary
+            else:
+                row.vuln_evidence_by_version[version] = summary
 
 
 def _projected_row_security(row: DependencyRow, target: str) -> Tuple[int, int, bool]:
@@ -26395,6 +26594,11 @@ def publish_draft_result(
             "draftMaxCandidates": effective_cap,
             "candidateCapScope": "SECURITY_EVIDENCE_SEARCH",
             "staticSolverDomainCap": None,
+            **({"securityEvidenceMode": "REGISTRY_BULK_ADVISORY",
+                "securityEvidenceScope": "EXACT_VERSIONS_ONLY",
+                "fullDependencyTreeSecurityVerified": False}
+               if os.environ.get("DEPLOOM_DRAFT_DISABLE_EXTERNAL_EVIDENCE") == "1"
+               and os.environ.get("DEPLOOM_DRAFT_REGISTRY_ADVISORY_SOURCE") else {}),
         },
         "objectiveEvidence": {
             "objective": contract["objective"],
@@ -27377,6 +27581,9 @@ def main() -> None:
         metadata_cache_dir=metadata_cache_dir,
         metadata_cache_ttl=metadata_cache_ttl,
         metadata_cache_tool_version=tool_build_id(),
+        allow_registry_metadata_redirects=not (
+            args.draft_baseline and os.environ.get("DEPLOOM_DRAFT_DISABLE_EXTERNAL_EVIDENCE") == "1"
+        ),
     )
     if args.draft_baseline:
         # Draft: every registry/OSV request is bounded by the remaining run
@@ -27536,13 +27743,13 @@ def main() -> None:
         # on success, so a worker that outlives the budget never corrupts the
         # state the PARTIAL publication reads.
         health_by_project = run_supervised_planning(
-            "planning",
+            "health-target-enrichment",
             deadline_clock,
             lambda working: enrich_project_targets(working, planning_baselines),
             rows_by_project,
         )
-        run_supervised_planning("planning", deadline_clock, lambda working: apply_supervisor_scope_expansions(working), rows_by_project)
-        run_supervised_planning("planning", deadline_clock, lambda working: apply_decision_contract_targets(working, client), rows_by_project)
+        run_supervised_planning("scope-expansion", deadline_clock, lambda working: apply_supervisor_scope_expansions(working), rows_by_project)
+        run_supervised_planning("decision-target-selection", deadline_clock, lambda working: apply_decision_contract_targets(working, client), rows_by_project)
         enforce_storybook_cohort(rows_by_project, client)
         apply_planner_deferrals(rows_by_project)
         # BLOCK_W_P0_P1_TYPES_NESTED_FIX_V1
@@ -27551,7 +27758,7 @@ def main() -> None:
         # the exact planned runtime target or conservatively deferred before the
         # expensive resolver/project proof begins.
         run_supervised_planning(
-            "planning",
+            "draft-action-feasibility",
             deadline_clock,
             lambda working: plan_executable_actions(working, client, immutable_targets=False),
             rows_by_project,
@@ -27562,7 +27769,7 @@ def main() -> None:
         # fallbacks/companions without resurrecting an infeasible type-stub action.
         capture_desired_targets(rows_by_project)
         run_supervised_planning(
-            "planning",
+            "registry-target-evidence",
             deadline_clock,
             lambda working: enrich_registry_target_evidence(working, client),
             rows_by_project,
@@ -27582,7 +27789,7 @@ def main() -> None:
             # not the three required by the Verified planning loop, so the run
             # stays bounded and any expiry publishes the rows gathered so far.
             run_supervised_planning(
-                "planning",
+                "peer-solve",
                 deadline_clock,
                 lambda working: resolve_peer_compatibility(
                     working,
@@ -27651,7 +27858,7 @@ def main() -> None:
             # proof_envelopes_out is filled by reference; the function returns
             # the assignments alone.
             proven_assignments = run_supervised_planning(
-                "planning",
+                "verified-peer-solve",
                 deadline_clock,
                 lambda working: resolve_peer_compatibility_with_verification(
                     working, projects_by_name, client,
@@ -27667,7 +27874,7 @@ def main() -> None:
 
         deadline_clock.check("final-targets")
         run_supervised_planning(
-            "planning",
+            "final-registry-target-evidence",
             deadline_clock,
             lambda working: enrich_registry_target_evidence(
                 working,
@@ -27679,7 +27886,7 @@ def main() -> None:
         # A late @types action decision may fail the handoff, but may not mutate a
         # finalized dependency target.
         run_supervised_planning(
-            "planning",
+            "final-action-feasibility",
             deadline_clock,
             lambda working: plan_executable_actions(
                 working,
@@ -27691,11 +27898,19 @@ def main() -> None:
         if not args.draft_baseline:
             assert_proven_assignment_conformance(rows_by_project, proven_assignments)
         final_peer_issues = run_supervised_planning(
-            "planning",
+            "final-peer-validation",
             deadline_clock,
             lambda working: validate_final_peer_assignment(working, client),
             rows_by_project,
         )
+        approved_registry = os.environ.get("DEPLOOM_DRAFT_REGISTRY_ADVISORY_SOURCE")
+        if args.draft_baseline and approved_registry and os.environ.get("DEPLOOM_DRAFT_DISABLE_EXTERNAL_EVIDENCE") == "1":
+            run_supervised_planning(
+                "final-registry-security",
+                deadline_clock,
+                lambda working: enrich_final_registry_security(working, client, approved_registry),
+                rows_by_project,
+            )
         if final_peer_issues:
             if not args.draft_baseline:
                 raise RuntimeError(

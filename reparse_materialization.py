@@ -242,9 +242,15 @@ def _create_junction(link: Path, target: Path) -> None:
     comspec = os.environ.get("COMSPEC") or shutil.which("cmd.exe")
     if not comspec:
         raise ReparseMaterializationError("REPARSE_JUNCTION_CREATE_UNAVAILABLE: cmd.exe")
-    command = subprocess.list2cmdline(["mklink", "/J", str(link), str(target)])
+    paths = {"DEPLOOM_JUNCTION_LINK": str(link), "DEPLOOM_JUNCTION_TARGET": str(target)}
+    if any(any(ord(char) < 32 or char == '"' for char in value) for value in paths.values()):
+        raise ReparseMaterializationError("REPARSE_JUNCTION_CREATE_INVALID_PATH")
+    # cmd.exe does not parse the CRT's escaped quotes in a nested argv item.
+    # Use a fixed command with separately supplied, quoted path variables.
+    command = (subprocess.list2cmdline([comspec])
+               + ' /d /v:off /c mklink /J "%DEPLOOM_JUNCTION_LINK%" "%DEPLOOM_JUNCTION_TARGET%"')
     result = subprocess.run(
-        [comspec, "/d", "/s", "/c", command],
+        command, executable=comspec, env={**os.environ, **paths},
         text=True,
         encoding="utf-8",
         errors="replace",

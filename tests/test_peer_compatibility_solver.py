@@ -507,6 +507,22 @@ class PeerCompatibilitySolverTests(unittest.TestCase):
         self.assertEqual("2.0.0", runtime.target_default)
         self.assertEqual("2.0.0", development.target_default)
 
+    def test_spaced_npm_peer_comparator_is_a_registry_constraint(self):
+        development = self.row("demo-types", "18.3.0")
+        development.kind = "dev"
+        development.requested_spec = "^18.3"
+        peer = self.row("demo-types", "18.3.0")
+        peer.kind = "peer"
+        peer.requested_spec = ">= 17"
+        roadmap._assert_duplicate_dependency_source_contract([development, peer])
+        self.assertFalse(roadmap.is_non_registry_spec(peer.requested_spec))
+        self.assertTrue(roadmap._npm_peer_satisfied(peer.requested_spec, "18.3.0"))
+        self.assertFalse(roadmap._npm_peer_satisfied(peer.requested_spec, "16.9.0"))
+        self.assertIs(roadmap._known_peer_range_satisfaction(peer.requested_spec, "16.9.0"), False)
+        peer.requested_spec = "file:./types"
+        with self.assertRaisesRegex(roadmap.BaselineConstraintVerificationError, "HETEROGENEOUS_DIRECT"):
+            roadmap._assert_duplicate_dependency_source_contract([development, peer])
+
     def test_large_connected_component_uses_bounded_solver(self):
         client = self.make_client()
         rows = []
