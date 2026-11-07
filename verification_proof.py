@@ -14,6 +14,7 @@ from typing import Mapping, Sequence
 from urllib.parse import unquote, urlparse
 
 from semantic_version import NpmSpec
+from project_runtime import normalize_npm_range
 from block_vex_storage import semantic_verification_environment
 from verification_observability import emit_observability_event
 from substrate_identity import tool_build_id
@@ -206,7 +207,7 @@ def is_fixed_manifest_spec(spec: str) -> bool:
     if lowered.startswith(_FIXED_SPEC_PREFIXES):
         return True
     try:
-        NpmSpec(value)
+        NpmSpec(normalize_npm_range(value))
         return False
     except ValueError:
         return _REGISTRY_DIST_TAG.fullmatch(value) is None

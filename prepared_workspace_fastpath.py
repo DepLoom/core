@@ -18,6 +18,7 @@ from io_governor import io_slot
 from reparse_materialization import (
     ReparseLink,
     ReparseMaterializationError,
+    _create_junction as _create_checked_junction,
     inventory_reparse_plan,
     is_windows_junction,
 )
@@ -611,9 +612,6 @@ def _run_overlay_robocopy(
 
 
 def _create_junction(link: Path, target: Path) -> bool:
-    comspec = os.environ.get("COMSPEC") or shutil.which("cmd.exe")
-    if not comspec:
-        return False
     link.parent.mkdir(parents=True, exist_ok=True)
     if link.exists() or link.is_symlink():
         try:
@@ -623,21 +621,11 @@ def _create_junction(link: Path, target: Path) -> bool:
                 link.unlink()
         except OSError:
             return False
-    command = subprocess.list2cmdline(["mklink", "/J", str(link), str(target)])
     try:
-        result = subprocess.run(
-            [comspec, "/d", "/s", "/c", command],
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=30,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
+        _create_checked_junction(link, target)
+    except (OSError, subprocess.SubprocessError, ReparseMaterializationError):
         return False
-    return result.returncode == 0 and link.is_dir()
+    return True
 
 
 def _remove_junction(path: Path) -> None:

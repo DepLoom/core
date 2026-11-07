@@ -84,6 +84,27 @@ class PeerSolverModelTests(unittest.TestCase):
         )
         return model, rows_by_name, domains
 
+    def test_repeated_peer_range_is_evaluated_once_per_provider_version(self):
+        source = self.row("source")
+        provider = self.row("provider")
+        domains = {name: [f"{major}.0.0" for major in range(1, 51)] for name in ("source", "provider")}
+        rows = {row.name: row for row in (source, provider)}
+
+        def peers(row, version, client):
+            return [("provider", ">=2 <4", False)] if row.name == "source" else []
+
+        client = self.make_client()
+        self.addCleanup(client.session.close)
+        with (mock.patch.object(roadmap, "_peer_entries", side_effect=peers),
+              mock.patch.object(roadmap, "_project_environment_constraint_issue", return_value=None),
+              mock.patch.object(roadmap, "_npm_peer_satisfied", wraps=roadmap._npm_peer_satisfied) as satisfies):
+            model = roadmap._build_peer_optimization_model(list(rows), rows, domains, client, "default")
+        self.assertEqual(satisfies.call_count, 50)
+        self.assertEqual(len(model.requirements), 49)
+        self.assertTrue(all(req.allowed_versions == ("2.0.0", "3.0.0") for req in model.requirements))
+        self.assertFalse(model.assignment_issue({"source": "1.0.0", "provider": "1.0.0"}))
+        self.assertTrue(model.assignment_issue({"source": "2.0.0", "provider": "1.0.0"}))
+
     def test_reference_exact_uses_lexicographic_objective_and_deterministic_tie_break(self):
         model = PeerOptimizationModel(
             packages=(
@@ -209,6 +230,25 @@ class PeerSolverModelTests(unittest.TestCase):
         reference = solve_reference_exact(model)
         self.assertEqual("optimal", reference.status)
         self.assertEqual(2, sum(version == "2.0.0" for version in reference.assignment.values()))
+
+    def test_z3_budget_expired_during_encoding_skips_search(self):
+        try:
+            import z3
+        except ImportError:
+            self.skipTest("z3-solver is unavailable")
+        from peer_solver_z3 import _solve_z3_exact_impl
+
+        model = PeerOptimizationModel(
+            packages=(PackageVariable("sample", "1.0.0", ("1.0.0",), (("1.0.0", (1,)),)),),
+            objective_width=1,
+        )
+        with mock.patch("peer_solver_z3.time.perf_counter", side_effect=(10.0, 10.2)), mock.patch.object(
+            z3.Optimize, "check"
+        ) as search:
+            result = _solve_z3_exact_impl(model, timeout_ms=100)
+        search.assert_not_called()
+        self.assertEqual("unknown", result.status)
+        self.assertIn("budget exhausted before Optimize.check", result.detail)
 
     def test_z3_backend_is_optional_and_matches_reference_when_installed(self):
         model = PeerOptimizationModel(

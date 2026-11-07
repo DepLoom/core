@@ -1,14 +1,35 @@
 import unittest
 
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
 from unittest.mock import patch
-from workspace_npm_preflight import check_workspace_lock, run_workspace_npm_preflight
+from workspace_npm_preflight import (
+    WorkspacePeerEvidenceError, _workspace_npm_command, check_workspace_lock,
+    observe_workspace_peer_overrides, run_workspace_npm_preflight,
+)
+from verification_process_supervisor import ProcessSupervisionError
 
 
 class WorkspaceLockChecks(unittest.TestCase):
+    def test_peer_observer_distinguishes_timeout_and_process_supervision(self):
+        inputs = {"package.json": b'{"overrides":{"leaf":"1.0.0"}}'}
+        failures = (
+            (subprocess.TimeoutExpired(["private command"], 10), "NPM_OBSERVER_TIMEOUT"),
+            (ProcessSupervisionError("private diagnostic"), "NPM_OBSERVER_SUPERVISION_UNAVAILABLE"),
+        )
+        for failure, expected in failures:
+            with self.subTest(expected=expected), patch(
+                "workspace_npm_preflight._workspace_npm_command", return_value=("node", "npm-cli.js"),
+            ), patch("workspace_npm_preflight.run_supervised", side_effect=failure) as runner:
+                with self.assertRaises(WorkspacePeerEvidenceError) as raised:
+                    observe_workspace_peer_overrides(inputs, {}, {}, timeout_seconds=20)
+                self.assertEqual(runner.call_args.kwargs["timeout_seconds"], 20)
+                self.assertEqual(str(raised.exception), expected)
+                self.assertIsNone(raised.exception.__cause__)
+
     def test_same_direct_versions_do_not_hide_incompatible_hoisted_peer(self):
         assignment = {
             (".", "dependencies", "react"): "19.0.0",
@@ -40,6 +61,29 @@ class WorkspaceLockChecks(unittest.TestCase):
         packages["node_modules/react"] = {"version": "19.0.0"}
         self.assertEqual(check_workspace_lock(packages, {})["code"], "LOCK_PEER_MISMATCH")
 
+
+    def test_prod_edge_shadows_peer_with_same_name(self):
+        packages = {
+            "node_modules/consumer": {"version": "1.0.0", "dependencies": {"ajv": "^8"},
+                                      "peerDependencies": {"ajv": "^8"}},
+            "node_modules/consumer/node_modules/ajv": {"version": "8.20.0"},
+            "node_modules/ajv": {"version": "6.15.0"},
+        }
+        self.assertEqual(check_workspace_lock(packages, {})["status"], "RESOLUTION_PASSED")
+        del packages["node_modules/consumer"]["dependencies"]
+        self.assertEqual(check_workspace_lock(packages, {})["code"], "LOCK_PEER_MISMATCH")
+
+    def test_unobserved_nearest_peer_does_not_fall_back_or_become_absent(self):
+        packages = {
+            "packages/app/node_modules/consumer": {"version": "1.0.0", "peerDependencies": {"host": "^1"},
+                                                   "peerDependenciesMeta": {"host": {"optional": True}}},
+            "packages/app/node_modules/host": {"resolved": "https://registry.npmjs.org/host/-/host.tgz"},
+            "node_modules/host": {"version": "1.0.0"},
+        }
+        result = check_workspace_lock(packages, {})
+        self.assertEqual(result["status"], "UNKNOWN")
+        self.assertEqual(result["code"], "LOCK_PEER_PROVIDER_VERSION_UNOBSERVED")
+        self.assertEqual(result["providerPath"], "packages/app/node_modules/host")
 
     def test_protected_assignment_change_is_rejected_before_npm(self):
         projects = {
@@ -98,6 +142,42 @@ class WorkspaceLockChecks(unittest.TestCase):
                     inputs, json.dumps(baseline).encode(), assignment, frozenset(), **options)
                 self.assertEqual(result["code"], "INVALID_WORKSPACE_PREFLIGHT_INPUT")
             self.assertEqual(runner.call_count, 2)
+
+    def test_preflight_requires_effective_peers_without_overrides(self):
+        root = {"workspaces": ["packages/*"]}
+        member = {"name": "app", "version": "1.0.0"}
+        lock = {"lockfileVersion": 3, "packages": {"": root, "packages/app": member}}
+        inputs = {".": json.dumps(root).encode(), "packages/app": json.dumps(member).encode()}
+        native = {"status": "UNKNOWN", "code": "LOCK_PEER_PROVIDER_VERSION_UNOBSERVED",
+                  "consumer": "packages/app", "nodeCount": 2}
+        with (tempfile.TemporaryDirectory() as temp,
+              patch("workspace_npm_preflight._npm_command", return_value=[__file__, __file__]),
+              patch("workspace_npm_preflight.run_supervised", side_effect=[
+                  subprocess.CompletedProcess(["npm"], 0, ""),
+                  subprocess.CompletedProcess(["node"], 0, json.dumps(native)),
+              ]) as runner):
+            result = run_workspace_npm_preflight(
+                inputs, json.dumps(lock).encode(), {}, frozenset(),
+                artifacts=Path(temp), cache=Path(temp), registry="https://registry.npmjs.org/",
+            )
+        self.assertEqual((result["status"], result["code"]),
+                         ("UNKNOWN", "LOCK_PEER_PROVIDER_VERSION_UNOBSERVED"))
+        self.assertEqual(runner.call_args.args[0][1], "-e")
+        self.assertEqual(runner.call_count, 2)
+        self.assertFalse(result["learningAllowed"])
+
+    def test_host_pinned_npm_does_not_fall_back_to_path_npm(self):
+        with (tempfile.TemporaryDirectory() as temp,
+              patch("workspace_npm_preflight.shutil.which", return_value="node.exe"),
+              patch("workspace_npm_preflight._npm_command") as default):
+            entrypoint = Path(temp) / "npm-cli.js"
+            entrypoint.touch()
+            with patch.dict(os.environ, {"DEPLOOM_WORKSPACE_NPM_ENTRYPOINT": str(entrypoint)}):
+                self.assertEqual(_workspace_npm_command(), ["node.exe", str(entrypoint.resolve())])
+                entrypoint.unlink()
+                with self.assertRaises(OSError):
+                    _workspace_npm_command()
+            default.assert_not_called()
 
     def test_native_timeout_is_unknown_and_never_learned(self):
         projects = {

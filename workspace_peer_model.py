@@ -6,7 +6,7 @@ bindings are assumptions of the model, not a prediction of npm placement.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Mapping
 
 from semantic_version import NpmSpec, Version
@@ -15,7 +15,8 @@ from project_runtime import normalize_npm_range
 
 from peer_solver_model import PackageVariable, PeerOptimizationModel, RequiresAny, forbidden
 from peer_solver_z3 import solve_z3_exact
-from resolution_inventory import npm_lock_resolved_instance
+from resolution_inventory import npm_lock_resolution_slots, npm_lock_resolved_instance
+from workspace_npm_lock_delta import peer_context
 from workspace_health_policy import WorkspaceHealthFact, WorkspaceHealthPolicy, solve_workspace_health
 
 Declaration = tuple[str, str, str]
@@ -38,6 +39,13 @@ class WorkspaceDomain:
 
 
 @dataclass(frozen=True)
+class LockedWorkspacePeer:
+    """A registry peer version present in the observed npm lock layout."""
+
+    version: str
+
+
+@dataclass(frozen=True)
 class WorkspaceTopology:
     providers: Mapping[tuple[Declaration, str], Declaration | None]
     instance_groups: tuple[tuple[Declaration, ...], ...]
@@ -54,12 +62,15 @@ def declaration_id(declaration: Declaration) -> str:
 def workspace_providers_from_lock(
     packages: dict,
     domains: Mapping[Declaration, WorkspaceDomain],
-) -> dict[tuple[Declaration, str], Declaration]:
-    """Find unique provider variables for a modeled lock layout.
+) -> dict[tuple[Declaration, str], Declaration | LockedWorkspacePeer | None]:
+    """Find provider variables or fixed registry versions in the observed lock.
 
     Follow the consumer package location, not the declaration owner's lookup.
-    Absent, linked or ambiguously shared placements are left unbound. These
-    bindings describe this lock layout only and cannot verify a future install.
+    Declarations held at the same locked instance have the same provider version.
+    Leave shared placements with a mutable declaration unbound, because the
+    next install may re-layout them. Explicit absence is available only for a
+    lock-documented optional peer with no matching slot. These bindings only
+    describe this lock.
     """
     instances = {}
     by_path = {}
@@ -77,25 +88,39 @@ def workspace_providers_from_lock(
     bindings = {}
     for declaration, path in instances.items():
         for peer in sorted({name for item in domains[declaration].candidates for name in item.peers}):
-            instance = npm_lock_resolved_instance(packages, peer, path)
+            context = peer_context(path)
+            instance = npm_lock_resolved_instance(packages, peer, context)
             if instance is None:
+                record = packages[path]
+                if (peer in record.get("peerDependencies", {})
+                        and record.get("peerDependenciesMeta", {}).get(peer, {}).get("optional") is True
+                        and not any(slot in packages for slot in npm_lock_resolution_slots(peer, context))):
+                    bindings[declaration, peer] = None
                 continue
-            matches = by_path.get((instance[0], peer), ())
-            if len(matches) == 1:
-                bindings[declaration, peer] = matches[0]
+            slot, version = instance
+            matches = by_path.get((slot, peer), ())
+            if matches and (len(matches) == 1 or all(not domains[key].mutable for key in matches)):
+                bindings[declaration, peer] = min(matches)
+            elif not matches:
+                record = packages[slot]
+                resolved, integrity = record.get("resolved"), record.get("integrity")
+                if (not record.get("link") and record.get("name", peer) == peer
+                        and isinstance(resolved, str) and resolved.startswith("https://")
+                        and isinstance(integrity, str) and integrity):
+                    bindings[declaration, peer] = LockedWorkspacePeer(version)
     return bindings
 
 
 def compile_workspace_peer_model(
     domains: Mapping[Declaration, WorkspaceDomain],
-    providers: Mapping[tuple[Declaration, str], Declaration | None],
+    providers: Mapping[tuple[Declaration, str], Declaration | LockedWorkspacePeer | None],
     *,
     environment: Mapping[str, str] | None = None,
 ) -> PeerOptimizationModel:
     """Build existing solver IR, failing closed for absent provider evidence.
 
-    A missing binding is unknown. An explicit None is observed absence in
-    the modeled topology, allowed only for an optional peer.
+    A missing binding is unknown. An explicit None represents absence in the
+    modeled topology and only satisfies an optional peer.
     """
     selected = {}
     variables = []
@@ -118,7 +143,7 @@ def compile_workspace_peer_model(
         variables.append(PackageVariable(declaration_id(key), domain.current, versions, scores))
 
     requirements = []
-    engine_constraints = []
+    forbidden_constraints = []
     for key, candidates in selected.items():
         for candidate in candidates:
             trigger = (declaration_id(key), candidate.version)
@@ -132,7 +157,7 @@ def compile_workspace_peer_model(
                 except ValueError as exc:
                     raise WorkspaceModelUnknown(f"ENGINE_RANGE_UNSUPPORTED: {key} -> {engine}: {spec}") from exc
                 if not matches:
-                    engine_constraints.append(forbidden(
+                    forbidden_constraints.append(forbidden(
                         (trigger,), reason=f"{key}@{candidate.version} requires {engine}@{spec}",
                         provenance="workspace-modeled-engine-range",
                     ))
@@ -141,6 +166,18 @@ def compile_workspace_peer_model(
                 if binding not in providers:
                     raise WorkspaceModelUnknown(f"PEER_PROVIDER_UNKNOWN: {key}@{candidate.version} -> {peer}")
                 provider = providers[binding]
+                if isinstance(provider, LockedWorkspacePeer):
+                    try:
+                        matches = NpmSpec(normalize_npm_range(spec)).match(Version(provider.version))
+                    except ValueError as exc:
+                        raise WorkspaceModelUnknown(f"PEER_RANGE_UNSUPPORTED: {key} -> {peer}: {spec}") from exc
+                    if not matches:
+                        forbidden_constraints.append(forbidden(
+                            (trigger,), reason=f"{key}@{candidate.version} requires {peer}@{spec}; "
+                                              f"observed transitive version is {provider.version}",
+                            provenance="workspace-observed-transitive-peer",
+                        ))
+                    continue
                 if provider is None:
                     if peer in candidate.optional_peers:
                         continue
@@ -163,7 +200,7 @@ def compile_workspace_peer_model(
                     reason=f"{key}@{candidate.version} requires {peer}@{spec} via {provider}",
                     provenance="workspace-modeled-peer-range",
                 ))
-    return PeerOptimizationModel(tuple(variables), constraints=tuple(engine_constraints),
+    return PeerOptimizationModel(tuple(variables), constraints=tuple(forbidden_constraints),
                                  requirements=tuple(requirements), objective_width=2)
 
 
@@ -230,6 +267,7 @@ def plan_workspace_from_lock(
     excluded_assignments: tuple[Mapping[str, str], ...] = (),
     include_constraint_evidence: bool = False,
     health_solver=None,
+    effective_peer_ranges: Mapping[tuple[str, str, str, str], str] | None = None,
 ) -> dict:
     """Plan conditionally on observed slots; an npm re-layout remains unmodeled."""
     result = {"authority": "PLANNING_ONLY", "verification": "NOT_VERIFIED",
@@ -244,6 +282,21 @@ def plan_workspace_from_lock(
             if instance is None or instance[1] != domain.current or (domain.mutable and packages[instance[0]].get("link")):
                 raise WorkspaceModelUnknown(f"WORKSPACE_SLOT_UNPROVEN: {key}")
             instances.setdefault(instance[0], []).append(key)
+        if effective_peer_ranges:
+            domains = dict(domains)
+            for path, keys in instances.items():
+                for key in keys:
+                    domain = domains[key]
+                    if domain.mutable or packages[path].get("link"):
+                        continue
+                    candidates = tuple(
+                        replace(candidate, peers={
+                            peer: effective_peer_ranges.get((path, candidate.version, peer, spec), spec)
+                            for peer, spec in candidate.peers.items()
+                        }) if candidate.version == domain.current else candidate
+                        for candidate in domain.candidates
+                    )
+                    domains[key] = replace(domain, candidates=candidates)
         model = compile_workspace_peer_model(
             domains, workspace_providers_from_lock(packages, domains), environment=environment)
         variables = model.package_map()
@@ -320,7 +373,7 @@ def _constraint_evidence(model, domains):
                 "provenance": requirement.provenance,
             })
     for clause in model.constraints:
-        if clause.provenance != "workspace-modeled-engine-range":
+        if clause.provenance not in {"workspace-modeled-engine-range", "workspace-observed-transitive-peer"}:
             continue
         consumer, version = clause.literals[0]
         if consumer not in scope:
@@ -367,8 +420,10 @@ def plan_workspace_from_registry(
     health_policy: WorkspaceHealthPolicy | None = None,
     health_lag_months: int = 12,
     osv_allowed_names: frozenset[str] = frozenset(),
+    registry_advisory_source: str | None = None,
     excluded_assignments: tuple[Mapping[str, str], ...] = (),
     include_constraint_evidence: bool = False,
+    effective_peer_ranges: Mapping[tuple[str, str, str, str], str] | None = None,
 ) -> dict:
     """Read deduplicated packuments through the existing Core registry client."""
     from dependency_live_roadmap_generator import DraftBudgetExceeded, RegistryInfrastructureError
@@ -385,6 +440,15 @@ def plan_workspace_from_registry(
         raise ValueError("INVALID_WORKSPACE_ADMITTED_CANDIDATES")
     if health_policy is not None and (getattr(client, "deadline", None) is None or client.deadline.remaining is None):
         raise ValueError("WORKSPACE_POLICY_REGISTRY_DEADLINE_REQUIRED")
+    if registry_advisory_source is not None:
+        from registry_advisory_evidence import registry_advisory_source_matches, valid_registry_advisory_name
+
+        if health_policy is None or client.allow_registry_metadata_redirects or not registry_advisory_source_matches(
+            client.registry, registry_advisory_source,
+        ):
+            raise ValueError("WORKSPACE_REGISTRY_ADVISORY_NOT_AUTHORIZED")
+        if not all(valid_registry_advisory_name(name) for _, _, name in declarations):
+            raise ValueError("WORKSPACE_REGISTRY_ADVISORY_INVALID_PACKAGE")
     for key, target in exact_targets.items():
         version = Version(target)
         if version.prerelease or version.major not in approved_lines[key]:
@@ -452,7 +516,7 @@ def plan_workspace_from_registry(
         try:
             facts, evidence = collect_workspace_health_facts(
                 client, packuments, query_versions, lag_months=health_lag_months,
-                osv_allowed_names=osv_allowed_names,
+                osv_allowed_names=osv_allowed_names, registry_advisory_source=registry_advisory_source,
             )
         except (DraftBudgetExceeded, RegistryInfrastructureError):
             return {**unknown, "reason": "WORKSPACE_POLICY_EVIDENCE_UNAVAILABLE"}
@@ -463,7 +527,7 @@ def plan_workspace_from_registry(
     result = plan_workspace_upgrade(
         packages, declarations, admitted, exact_targets, packuments,
         environment=environment, topology=topology, timeout_ms=timeout_ms,
-        health_policy=health_policy, health_facts=facts,
+        health_policy=health_policy, health_facts=facts, effective_peer_ranges=effective_peer_ranges,
         excluded_assignments=excluded_assignments, include_constraint_evidence=include_constraint_evidence,
     )
     if health_policy is not None:
@@ -486,6 +550,7 @@ def plan_workspace_upgrade(
     include_constraint_evidence: bool = False,
     health_policy: WorkspaceHealthPolicy | None = None,
     health_facts: Mapping[tuple[str, str], WorkspaceHealthFact] | None = None,
+    effective_peer_ranges: Mapping[tuple[str, str, str, str], str] | None = None,
 ) -> dict:
     """Use a bounded metadata snapshot to plan under the observed npm lock layout."""
     if health_facts is not None and health_policy is None:
@@ -522,4 +587,4 @@ def plan_workspace_upgrade(
     return plan_workspace_from_lock(packages, domains, environment=environment,
                                     timeout_ms=timeout_ms, excluded_assignments=excluded_assignments,
                                     include_constraint_evidence=include_constraint_evidence,
-                                    health_solver=health_solver)
+                                    health_solver=health_solver, effective_peer_ranges=effective_peer_ranges)

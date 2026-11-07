@@ -63,9 +63,6 @@ def _solve_z3_exact_impl(
         optimize = z3.Optimize()
         optimize.set(priority="lex")
         objective_handles: list[object] = []
-        if timeout_ms > 0:
-            optimize.set(timeout=int(timeout_ms))
-
         variables: Dict[Tuple[str, str], object] = {}
         for package in model.packages:
             package_vars = []
@@ -82,16 +79,19 @@ def _solve_z3_exact_impl(
             else:
                 optimize.add(z3.Not(z3.And(*clause_vars)))
 
+        provider_membership: Dict[Tuple[str, Tuple[str, ...]], object] = {}
         for requirement in model.requirements:
             trigger = variables[requirement.trigger]
-            allowed = [
-                variables[(requirement.provider, version)]
-                for version in requirement.allowed_versions
-            ]
-            if allowed:
-                optimize.add(z3.Or(z3.Not(trigger), *allowed))
-            else:
+            if not requirement.allowed_versions:
                 optimize.add(z3.Not(trigger))
+                continue
+            key = (requirement.provider, requirement.allowed_versions)
+            if key not in provider_membership:
+                provider_membership[key] = z3.Or(*(
+                    variables[(requirement.provider, version)]
+                    for version in requirement.allowed_versions
+                ))
+            optimize.add(z3.Implies(trigger, provider_membership[key]))
 
         for constraint in model.cardinalities:
             hits = [z3.If(z3.Or(*(variables[literal] for literal in group)), 1, 0)
@@ -102,11 +102,12 @@ def _solve_z3_exact_impl(
             if constraint.maximum is not None:
                 optimize.add(count <= constraint.maximum)
 
+        scores_by_package = {package.name: dict(package.scores) for package in model.packages}
         for objective_index in range(model.objective_width):
             terms = []
             for package in model.packages:
                 for version in package.domain:
-                    score = package.score_for(version)[objective_index]
+                    score = scores_by_package[package.name][version][objective_index]
                     if score:
                         terms.append(z3.If(variables[(package.name, version)], int(score), 0))
             objective_handles.append(optimize.maximize(z3.Sum(terms) if terms else z3.IntVal(0)))
@@ -124,6 +125,17 @@ def _solve_z3_exact_impl(
                 ])
             ))
 
+        if timeout_ms > 0:
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            remaining_ms = int(timeout_ms - elapsed_ms)
+            if remaining_ms <= 0:
+                return ExactSolveResult(
+                    backend="z3",
+                    status="unknown",
+                    detail="Z3 attempt budget exhausted before Optimize.check",
+                    elapsed_ms=int(elapsed_ms),
+                )
+            optimize.set(timeout=remaining_ms)
         check = optimize.check()
         elapsed = int((time.perf_counter() - started) * 1000)
         if check == z3.unsat:

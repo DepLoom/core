@@ -380,6 +380,80 @@ def canonical_yarn_inventory(project: Path) -> Dict[str, Any]:
     }
 
 
+def yarn_classic_finding_roots(
+    project: Path, affected: set[Tuple[str, str]], *, max_paths: int = 4,
+) -> Dict[str, Any]:
+    """Find one exact lockfile witness per direct declaration for affected versions.
+
+    Missing selectors do not fall back to a same-name package. The result
+    describes declared lock reachability, including optional edges, without
+    claiming physical installation or runtime exploitability.
+    """
+    from collections import deque
+    from yarn_berry import owning_yarn_lock, registry_identity
+
+    lock_path = owning_yarn_lock(project)
+    entries = parse_yarn_lock_entries(lock_path)
+    by_selector: Dict[str, int] = {}
+    duplicates = set()
+    for index, entry in enumerate(entries):
+        for selector in entry["selectors"]:
+            if selector in by_selector and by_selector[selector] != index:
+                duplicates.add(selector)
+            by_selector[selector] = index
+
+    def exact(name: str, spec: str) -> Optional[int]:
+        selector = f"{name}@{spec}"
+        if selector in duplicates:
+            return None
+        return by_selector.get(selector)
+
+    findings = {pair: {"rootCount": 0, "paths": []} for pair in affected}
+    manifest = read_json(project / "package.json")
+    complete = not duplicates
+    visits = 0
+    for section in AUDIT_ROOT_SECTIONS:
+        for direct, spec in sorted((manifest.get(section) or {}).items()):
+            entry_index = exact(direct, str(spec))
+            if entry_index is None:
+                complete = False
+                continue
+            queue = deque([(entry_index, _npm_alias_target(direct, str(spec)), (), 0)])
+            seen = set()
+            witnessed = set()
+            while queue:
+                index, name, prefix, depth = queue.popleft()
+                if (index, name) in seen:
+                    continue
+                seen.add((index, name))
+                visits += 1
+                if visits > 100_000:
+                    return {"complete": False, "findings": findings}
+                entry = entries[index]
+                version = str(entry.get("version") or "")
+                path = (*prefix, (name, version)) if depth < 20 else prefix
+                identity = registry_identity(entry, name)
+                pair = (identity, version)
+                if pair in findings and pair not in witnessed:
+                    witnessed.add(pair)
+                    result = findings[pair]
+                    result["rootCount"] += 1
+                    if len(result["paths"]) < max_paths:
+                        result["paths"].append({
+                            "section": section, "directPackage": direct,
+                            "chain": [{"name": n, "version": v} for n, v in path],
+                            "chainTruncated": depth >= 20,
+                        })
+                for field in ("dependencies", "optionalDependencies"):
+                    for child, child_spec in sorted(entry[field].items()):
+                        child_index = exact(child, str(child_spec))
+                        if child_index is None:
+                            complete = False
+                        else:
+                            queue.append((child_index, _npm_alias_target(child, str(child_spec)), path, depth + 1))
+    return {"complete": complete, "findings": findings}
+
+
 def package_lock_version(path: Path, name: str) -> Optional[str]:
     data = read_json(path)
     packages = data.get("packages") or {}

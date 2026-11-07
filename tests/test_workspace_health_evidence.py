@@ -1,8 +1,9 @@
 """Tests for the Core-owned registry evidence path and privacy boundary."""
 import unittest
-from unittest.mock import Mock, call
+from unittest.mock import MagicMock, Mock, call, patch
 
-from dependency_live_roadmap_generator import DeadlineClock, LiveDataClient, VulnerabilityEvidenceUnavailable
+from dependency_live_roadmap_generator import DeadlineClock, LiveDataClient, RegistryInfrastructureError, VulnerabilityEvidenceUnavailable
+from registry_advisory_evidence import RegistryAdvisory, RegistryAdvisoryEvidence
 from workspace_health_evidence import collect_workspace_health_facts
 from workspace_health_policy import WorkspaceHealthPolicy
 from workspace_peer_model import declaration_id, plan_workspace_from_registry
@@ -36,11 +37,11 @@ class WorkspaceRegistryHealthTests(unittest.TestCase):
         }
         self.declarations = {APP: "1.0.0", LEGACY: "2.0.0", HELD: "2.0.0"}
 
-    def plan(self, allowed=frozenset({"demo", "held"})):
+    def plan(self, allowed=frozenset({"demo", "held"}), **kwargs):
         return plan_workspace_from_registry(
             self.packages, self.declarations, {APP: (1, 2)}, {}, self.client,
             candidate_versions={APP: ("1.0.0", "2.0.0")},
-            health_policy=WorkspaceHealthPolicy("yellow", 80), osv_allowed_names=allowed,
+            health_policy=WorkspaceHealthPolicy("yellow", 80), osv_allowed_names=allowed, **kwargs,
         )
 
     def test_registry_path_deduplicates_exact_osv_and_keeps_held_declarations(self):
@@ -74,6 +75,52 @@ class WorkspaceRegistryHealthTests(unittest.TestCase):
         self.assertTrue(facts["demo", "2.0.0"].lag_ok)
         self.assertIsNone(facts["demo", "2.0.0"].severities)
         self.assertEqual((evidence["unknownLagVersionCount"], evidence["unknownSecurityVersionCount"]), (1, 2))
+
+    def test_registry_only_batches_exact_pairs_across_owners_and_keeps_final_audit_open(self):
+        self.client.allow_registry_metadata_redirects = False
+        response_hash = "a" * 64
+        advisory = RegistryAdvisory("synthetic", "high", "<2.0.0")
+        pairs = {("demo", "1.0.0"): RegistryAdvisoryEvidence("AFFECTED", "EXACT", (advisory,), response_hash),
+                 ("demo", "2.0.0"): RegistryAdvisoryEvidence("NO_REPORTED_ADVISORIES", "EXACT", response_sha256=response_hash),
+                 ("held", "2.0.0"): RegistryAdvisoryEvidence("NO_REPORTED_ADVISORIES", "EXACT", response_sha256=response_hash)}
+        with patch.object(self.client, "query_registry_advisory_evidence", return_value=pairs) as query:
+            result = self.plan(registry_advisory_source=REGISTRY)
+        query.assert_called_once_with(list(pairs), REGISTRY, max_match_evaluations=256)
+        self.client.query_osv_versions.assert_not_called()
+        self.assertEqual(result["assignment"][declaration_id(APP)], "2.0.0")
+        self.assertEqual(result["assignment"][declaration_id(LEGACY)], "2.0.0")
+        self.assertEqual(result["policy"]["lagDenominator"], 3)
+        self.assertEqual(result["policy"]["finalAudit"], "NOT_RUN")
+        self.assertEqual(result["policy"]["evidence"]["source"], "REGISTRY_BULK_ADVISORY")
+        self.assertEqual(result["policy"]["evidence"]["registryAdvisoryResponseSha256"], [response_hash])
+
+    def test_registry_only_pair_budget_stays_unknown_without_osv_fallback(self):
+        self.client.allow_registry_metadata_redirects = False
+        with patch("workspace_health_evidence._MAX_REGISTRY_ADVISORY_PAIRS", 2), patch.object(
+            self.client, "query_registry_advisory_evidence",
+        ) as query:
+            result = self.plan(registry_advisory_source=REGISTRY)
+        query.assert_not_called()
+        self.client.query_osv_versions.assert_not_called()
+        self.assertEqual(result["status"], "UNKNOWN")
+        self.assertEqual(result["policy"]["evidence"]["registryAdvisoryUnknownReasons"], {"PAIR_BUDGET_EXHAUSTED": 3})
+
+    def test_registry_only_rejects_mismatch_before_fetching_private_names(self):
+        self.client.allow_registry_metadata_redirects = False
+        with self.assertRaisesRegex(ValueError, "WORKSPACE_REGISTRY_ADVISORY_NOT_AUTHORIZED"):
+            self.plan(registry_advisory_source=REGISTRY + "/other")
+        self.client.fetch_npm_metadata.assert_not_called()
+
+    def test_strict_metadata_request_refuses_redirect(self):
+        client = LiveDataClient(REGISTRY, timeout=1, batch_size=10, sleep_sec=0,
+                                allow_registry_metadata_redirects=False)
+        response = MagicMock(status_code=302)
+        with patch.object(client.session, "get", return_value=response) as get:
+            with self.assertRaisesRegex(RegistryInfrastructureError, "metadata redirect refused"):
+                client.fetch_npm_metadata("demo")
+        self.assertEqual(get.call_count, 1)
+        self.assertIs(get.call_args.kwargs["allow_redirects"], False)
+        response.close.assert_called_once()
 
     def test_no_policy_network_without_a_deadline(self):
         self.client.set_deadline(None)

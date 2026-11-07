@@ -30,6 +30,44 @@ class RegistryContextBoundaryTests(unittest.TestCase):
             self.assertIsNone(load_packument(root, 'https://fixture.invalid', 'a', 600, context='tenant-b', now=1001))
             self.assertEqual(load_packument(root, 'https://fixture.invalid', 'a', 600, context='tenant-a', now=1001), {'value': 1})
 
+    def test_draft_prefetch_overlaps_requests_and_preserves_redirect_policy(self):
+        client = roadmap.LiveDataClient("https://fixture.invalid/npm", timeout=2, batch_size=10, sleep_sec=0,
+                                        allow_registry_metadata_redirects=False)
+        client.set_deadline(roadmap.DeadlineClock(5))
+        client.draft = True
+        requests_started = threading.Barrier(2)
+        seen = []
+
+        def fetch(worker, name):
+            self.assertIs(worker.deadline, client.deadline)
+            self.assertTrue(worker.draft)
+            self.assertFalse(worker.allow_registry_metadata_redirects)
+            self.assertEqual(worker.registry, client.registry)
+            seen.append(name)
+            requests_started.wait(timeout=2)
+            if name == "b":
+                raise roadmap.RegistryInfrastructureError("incomplete registry")
+            return {"name": name}
+
+        deps = [("a", "runtime", "^1.0.0"), ("b", "runtime", "^1.0.0")]
+        with patch.object(roadmap.LiveDataClient, "fetch_npm_metadata", fetch):
+            failures = roadmap._prefetch_draft_registry_window(client, deps)
+        self.assertCountEqual(seen, ["a", "b"])
+        self.assertEqual(client.npm_cache, {"a": {"name": "a"}})
+        self.assertEqual(set(failures), {"b"})
+
+    def test_draft_prefetch_expiry_does_not_publish_unobserved_metadata(self):
+        client = roadmap.LiveDataClient("https://fixture.invalid/npm", timeout=2, batch_size=10, sleep_sec=0)
+        client.set_deadline(roadmap.DeadlineClock(0))
+        client.npm_cache["previous"] = {"name": "previous"}
+        with patch.object(roadmap.LiveDataClient, "fetch_npm_metadata") as fetch:
+            with self.assertRaises(roadmap.DraftBudgetExceeded):
+                roadmap._prefetch_draft_registry_window(
+                    client, [("a", "runtime", "^1.0.0"), ("b", "runtime", "^1.0.0")],
+                )
+            fetch.assert_not_called()
+        self.assertEqual(client.npm_cache, {"previous": {"name": "previous"}})
+
     def test_authenticated_fetch_and_parallel_prefetch_keep_the_callers_view(self):
         principals = []
         class Handler(BaseHTTPRequestHandler):

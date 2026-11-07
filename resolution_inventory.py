@@ -210,6 +210,12 @@ def _member_ancestor_prefixes(package_relative: str) -> List[str]:
     return ["/".join(parts[:index]) for index in range(len(parts), 0, -1)] + [""]
 
 
+def npm_lock_resolution_slots(package_name: str, package_relative: str = "") -> tuple[str, ...]:
+    """Return the possible lock keys for a package in nearest-first order."""
+    return tuple(f"{prefix}/node_modules/{package_name}" if prefix else f"node_modules/{package_name}"
+                 for prefix in _member_ancestor_prefixes(package_relative))
+
+
 def npm_lock_resolved_instance(
     packages: Dict[str, Any],
     package_name: str,
@@ -220,10 +226,7 @@ def npm_lock_resolved_instance(
     A workspace link keeps its own entry key, with the version from its target.
     This is lock evidence only; it does not observe the installed peer provider.
     """
-    name = package_name
-    rel = package_relative
-    for prefix in _member_ancestor_prefixes(rel):
-        key = f"{prefix}/node_modules/{name}" if prefix else f"node_modules/{name}"
+    for key in npm_lock_resolution_slots(package_name, package_relative):
         entry = packages.get(key)
         if not isinstance(entry, dict):
             continue

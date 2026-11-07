@@ -36,6 +36,25 @@ class WorkspacePeerModelTests(unittest.TestCase):
             declaration_id(LEGACY_REACT): "18.3.1",
         })
 
+    def test_effective_override_is_only_used_for_the_matching_held_peer(self):
+        provider = (".", "devDependencies", "provider")
+        consumer = (".", "devDependencies", "consumer")
+        packages = {
+            "node_modules/provider": {"version": "6.4.2"},
+            "node_modules/consumer": {"version": "2.6.0"},
+        }
+        domains = {
+            provider: WorkspaceDomain("6.4.2", (WorkspaceCandidate("6.4.2", {}),)),
+            consumer: WorkspaceDomain("2.6.0", (WorkspaceCandidate("2.6.0", {"provider": "^5.0.3"}),)),
+        }
+        overrides = {("node_modules/consumer", "2.6.0", "provider", "^5.0.3"): "6.4.2"}
+        self.assertEqual(plan_workspace_from_lock(packages, domains)["status"], "UNSAT_IN_MODELED_DOMAIN")
+        self.assertEqual(plan_workspace_from_lock(packages, domains, effective_peer_ranges=overrides)["status"],
+                         "SAT_IN_MODELED_DOMAIN")
+        domains[consumer] = WorkspaceDomain("2.6.0", domains[consumer].candidates, mutable=True)
+        self.assertEqual(plan_workspace_from_lock(packages, domains, effective_peer_ranges=overrides)["status"],
+                         "UNSAT_IN_MODELED_DOMAIN")
+
     def test_held_companion_makes_modeled_domain_unsatisfiable(self):
         domain = self.domains[APP_RENDERER]
         self.domains[APP_RENDERER] = WorkspaceDomain(domain.current, domain.candidates)
@@ -56,7 +75,7 @@ class WorkspacePeerModelTests(unittest.TestCase):
                                                 environment={"node": "24.18.0"})
         self.assertEqual(solve_z3_exact(accepted).status, "optimal")
 
-    def test_lock_binding_follows_renderer_location_and_abstains_on_shared_slot(self):
+    def test_lock_binding_follows_renderer_location_and_preserves_shared_held_provider(self):
         legacy_renderer = ("packages/legacy", "dependencies", "react-dom")
         root_react = (".", "dependencies", "react")
         self.domains[APP_REACT] = WorkspaceDomain("19.0.0", (WorkspaceCandidate("19.0.0", {}),))
@@ -73,6 +92,8 @@ class WorkspacePeerModelTests(unittest.TestCase):
         packages["node_modules/react-dom"] = packages.pop("packages/legacy/node_modules/react-dom")
         self.assertEqual(workspace_providers_from_lock(packages, self.domains)[key], APP_REACT)
         self.domains[root_react] = self.domains[APP_REACT]
+        self.assertEqual(workspace_providers_from_lock(packages, self.domains)[key], root_react)
+        self.domains[APP_REACT] = WorkspaceDomain("19.0.0", (WorkspaceCandidate("19.0.0", {}),), mutable=True)
         self.assertNotIn(key, workspace_providers_from_lock(packages, self.domains))
 
     def test_lock_planner_keeps_separate_slots_and_refuses_implicit_split(self):
@@ -89,6 +110,55 @@ class WorkspacePeerModelTests(unittest.TestCase):
         result = plan_workspace_from_lock(packages, self.domains)
         self.assertEqual(result["status"], "UNKNOWN")
         self.assertIsNone(result["assignment"])
+
+    def test_solver_keeps_shared_held_provider_and_enforces_peer_range(self):
+        root_react = (".", "dependencies", "react")
+        packages = {
+            "node_modules/react": {"version": "18.3.1"},
+            "node_modules/react-dom": {"version": "18.3.1"},
+        }
+        self.domains[APP_REACT] = WorkspaceDomain("18.3.1", self.domains[APP_REACT].candidates)
+        self.domains[root_react] = self.domains[APP_REACT]
+        result = plan_workspace_from_lock(packages, self.domains)
+        self.assertEqual(result["status"], "SAT_IN_MODELED_DOMAIN")
+        self.assertEqual(set(result["assignment"].values()), {"18.3.1"})
+        self.domains[APP_RENDERER] = WorkspaceDomain(
+            "18.3.1", self.domains[APP_RENDERER].candidates, mutable=True, exact_target="19.0.0",
+        )
+        self.assertEqual(plan_workspace_from_lock(packages, self.domains)["status"], "UNSAT_IN_MODELED_DOMAIN")
+
+    def test_solver_uses_observed_transitive_peer_without_mutating_its_slot(self):
+        packages = {
+            "node_modules/react-dom": {"version": "18.3.1"},
+            "node_modules/react": {"version": "18.3.1", "integrity": "sha512-fixture",
+                                   "resolved": "https://example.invalid/react-18.3.1.tgz"},
+        }
+        domains = {APP_RENDERER: self.domains[APP_RENDERER]}
+        plan = plan_workspace_from_lock(packages, domains, include_constraint_evidence=True)
+        self.assertEqual(plan["status"], "SAT_IN_MODELED_DOMAIN")
+        self.assertEqual(plan["assignment"], {declaration_id(APP_RENDERER): "18.3.1"})
+        self.assertEqual(plan["constraintEvidence"]["rules"][0]["provenance"], "workspace-observed-transitive-peer")
+        domains[APP_RENDERER] = WorkspaceDomain(
+            "18.3.1", self.domains[APP_RENDERER].candidates, mutable=True, exact_target="19.0.0",
+        )
+        self.assertEqual(plan_workspace_from_lock(packages, domains)["status"], "UNSAT_IN_MODELED_DOMAIN")
+        packages["node_modules/react"].pop("integrity")
+        self.assertEqual(plan_workspace_from_lock(packages, domains)["status"], "UNKNOWN")
+
+    def test_lock_distinguishes_absent_optional_peer_from_unreadable_slot(self):
+        packages = {
+            "node_modules/react-dom": {"version": "18.3.1", "peerDependencies": {"react": "^18"},
+                                       "peerDependenciesMeta": {"react": {"optional": True}}},
+        }
+        optional = WorkspaceCandidate("18.3.1", {"react": "^18"}, frozenset({"react"}))
+        domains = {APP_RENDERER: WorkspaceDomain("18.3.1", (optional,))}
+        self.assertEqual(plan_workspace_from_lock(packages, domains)["status"], "SAT_IN_MODELED_DOMAIN")
+        required = WorkspaceCandidate("18.3.1", {"react": "^18"})
+        self.assertEqual(plan_workspace_from_lock(
+            packages, {APP_RENDERER: WorkspaceDomain("18.3.1", (required,))},
+        )["status"], "UNSAT_IN_MODELED_DOMAIN")
+        packages["node_modules/react"] = {"link": True, "resolved": "packages/unproven"}
+        self.assertEqual(plan_workspace_from_lock(packages, domains)["status"], "UNKNOWN")
 
     def test_lock_and_registry_inputs_keep_owner_scope_and_metadata_identity(self):
         declarations = {key: "18.3.1" for key in self.domains}

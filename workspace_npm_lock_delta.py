@@ -1,7 +1,7 @@
 """Bound the npm lock delta to declared targets and authorized placement repair."""
 from __future__ import annotations
 
-from collections import deque
+from collections import defaultdict, deque
 
 from resolution_inventory import npm_lock_resolved_instance
 
@@ -31,6 +31,61 @@ def _instance(packages, declaration):
 
 def _artifact(entry):
     return tuple(entry.get(key) for key in ("version", "resolved", "integrity", "link"))
+
+
+def _relocation_identity(path, entry):
+    if "node_modules" not in path.split("/") or entry.get("link"):
+        return None
+    version, resolved, integrity, _ = _artifact(entry)
+    if not all(isinstance(value, str) and value for value in (version, resolved, integrity)):
+        return None
+    if not resolved.startswith("https://"):
+        return None
+    name = ("/" + path).rsplit("/node_modules/", 1)[-1]
+    return (name, version, resolved, integrity)
+
+
+def _equivalent_relocations(before, after, before_edges, after_edges):
+    """Match only unique unchanged artifacts with unchanged incident edges."""
+    if not (before.keys() - after.keys() and after.keys() - before.keys()):
+        return {}
+    indexes = []
+    for graph in (before, after):
+        locations = defaultdict(list)
+        for path, entry in graph.items():
+            identity = _relocation_identity(path, entry)
+            if identity is not None:
+                locations[identity].append(path)
+        indexes.append(locations)
+    old, new = indexes
+    moves = {}
+    for identity, old_paths in old.items():
+        new_paths = new.get(identity, ())
+        if len(old_paths) == len(new_paths) == 1:
+            left, right = old_paths[0], new_paths[0]
+            if left not in after and right not in before and before[left] == after[right]:
+                moves[right] = left
+    if not moves:
+        return {}
+
+    inverse = {left: right for right, left in moves.items()}
+    for left in before.keys() | (after.keys() - moves.keys()):
+        right = inverse.get(left, left)
+        prior, next_edges = before_edges.get(left, {}), after_edges.get(right, {})
+        moved_consumer = left != right
+        if moved_consumer and any(provider is None for _, provider in prior.values()):
+            return {}
+        for key in prior.keys() | next_edges.keys():
+            old_spec, old_provider = prior.get(key, (None, None))
+            new_spec, new_provider = next_edges.get(key, (None, None))
+            touches_move = (old_provider and old_provider[0] in inverse
+                            or new_provider and new_provider[0] in moves)
+            if moved_consumer or touches_move:
+                if new_provider is not None:
+                    new_provider = (moves.get(new_provider[0], new_provider[0]), new_provider[1])
+                if (old_spec, old_provider) != (new_spec, new_provider):
+                    return {}
+    return moves
 
 
 def check_workspace_lock_delta(
@@ -82,6 +137,10 @@ def check_workspace_lock_delta(
             impacted.update((left[0], right[0]))
 
     nodes = before.keys() | after.keys()
+    before_edges = {path: _edges(before, path) for path in before}
+    after_edges = {path: _edges(after, path) for path in after}
+    moves = _equivalent_relocations(before, after, before_edges, after_edges)
+    relocated = moves.keys() | set(moves.values())
     delta = {path for path in nodes - owners if before.get(path) != after.get(path)}
     for path in sorted(delta):
         if before.get(path, {}).get("link") or after.get(path, {}).get("link"):
@@ -91,7 +150,7 @@ def check_workspace_lock_delta(
         consumer = queue.popleft()
         if consumer in owners:
             continue
-        left, right = (_edges(graph, consumer) for graph in (before, after))
+        left, right = before_edges.get(consumer, {}), after_edges.get(consumer, {})
         for key in left.keys() | right.keys():
             left_spec, left_provider = left.get(key, (None, None))
             right_spec, right_provider = right.get(key, (None, None))
@@ -104,14 +163,17 @@ def check_workspace_lock_delta(
                 if provider is not None and provider[0] not in impacted:
                     impacted.add(provider[0])
                     queue.append(provider[0])
-    outside = sorted(delta - impacted)
+    outside = sorted(delta - impacted - relocated)
     if outside:
         return {"status": "RESOLUTION_FAILED", "code": "LOCK_UNRELATED_NODE_DELTA",
                 "path": outside[0], "unrelatedCount": len(outside)}
 
     edge_changes = 0
-    for consumer in sorted(nodes):
-        left, right = (_edges(graph, consumer) for graph in (before, after))
+    inverse = {old: new for new, old in moves.items()}
+    for consumer in sorted(nodes - moves.keys()):
+        left = before_edges.get(consumer, {})
+        right = {key: (spec, (moves.get(provider[0], provider[0]), provider[1]) if provider else None)
+                 for key, (spec, provider) in after_edges.get(inverse.get(consumer, consumer), {}).items()}
         for key in sorted(left.keys() | right.keys()):
             if left.get(key) == right.get(key):
                 continue
